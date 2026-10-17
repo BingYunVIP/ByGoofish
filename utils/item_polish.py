@@ -149,7 +149,7 @@ async def polish_account_items(
     failed = 0
     details: List[Dict[str, Any]] = []
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(trust_env=False) as session:
         for index, item_id in enumerate(item_ids):
             result = await polish_item(session, cookies_str, item_id)
             cookies_str = result["cookies_str"]

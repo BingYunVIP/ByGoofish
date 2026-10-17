@@ -1,3 +1,4 @@
+import DeliveryReview from './DeliveryReview';
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Order, OrderStatus, Item, AccountDetail } from '../types';
@@ -457,6 +458,7 @@ const OrderList: React.FC = () => {
 
   return (
     <div className="page-stack animate-fade-in">
+      <DeliveryReview />
       <PageHeader
         title="订单管理"
         description="同步闲鱼交易状态，核对买家与商品信息，并处理人工或完整自动发货。"

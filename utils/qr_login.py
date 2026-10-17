@@ -20,6 +20,7 @@ import base64
 import os
 from io import BytesIO
 from utils.user_agents import CHROME_UA
+from utils.direct_network import direct_browser_options
 
 
 def generate_headers():
@@ -56,7 +57,8 @@ class QRLoginSession:
     # 人脸验证需要用户掏手机、扫码、刷脸，二维码原本的 5 分钟往往不够
     VERIFICATION_EXTRA_SECONDS = 300
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, owner_id: int = None):
+        self.owner_id = owner_id
         self.session_id = session_id
         self.status = 'waiting'  # waiting, scanned, success, expired, cancelled, verification_required
         self.qr_code_url = None
@@ -108,10 +110,6 @@ class QRLoginManager:
         self.api_scan_status = f"{self.host}/newlogin/qrcode/query.do"
         self.api_h5_tk = "https://h5api.m.goofish.com/h5/mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get/1.0/"
         
-        # 配置代理（如果需要的话，取消注释并修改代理地址）
-        # self.proxy = "http://127.0.0.1:7890"
-        self.proxy = None
-        
         # 配置超时时间
         self.timeout = httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=60.0)
 
@@ -127,9 +125,10 @@ class QRLoginManager:
         app_key = "34839810"
 
         # 先发一次 GET 请求，获取 cookie 中的 m_h5_tk
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, proxy=self.proxy) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, trust_env=False) as client:
             try:
                 resp = await client.get(self.api_h5_tk, headers=self.headers)
+                resp.raise_for_status()
                 cookies = {k: v for k, v in resp.cookies.items()}
                 session.cookies.update(cookies)
 
@@ -155,7 +154,8 @@ class QRLoginManager:
                 }
 
                 # 发请求正式获取数据，确保 token 有效
-                await client.post(self.api_h5_tk, params=params, headers=self.headers, cookies=session.cookies)
+                token_resp = await client.post(self.api_h5_tk, params=params, headers=self.headers, cookies=session.cookies)
+                token_resp.raise_for_status()
 
                 return cookies
             except httpx.ConnectTimeout:
@@ -184,7 +184,7 @@ class QRLoginManager:
             "rnd": random(),
         }
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=self.proxy) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
             try:
                 resp = await client.get(
                     self.api_mini_login,
@@ -193,6 +193,7 @@ class QRLoginManager:
                     headers=self.headers,
                 )
 
+                resp.raise_for_status()
                 # 正则匹配需要的json数据
                 pattern = r"window\.viewData\s*=\s*(\{.*?\});"
                 match = re.search(pattern, resp.text)
@@ -218,12 +219,12 @@ class QRLoginManager:
                 logger.error("获取登录参数时连接错误")
                 raise
     
-    async def generate_qr_code(self) -> Dict[str, Any]:
+    async def generate_qr_code(self, owner_id: int = None) -> Dict[str, Any]:
         """生成二维码"""
         try:
             # 创建新的会话
             session_id = str(uuid.uuid4())
-            session = QRLoginSession(session_id)
+            session = QRLoginSession(session_id, owner_id=owner_id)
 
             # 1. 获取m_h5_tk
             await self._get_mh5tk(session)
@@ -234,20 +235,18 @@ class QRLoginManager:
             logger.info(f"获取登录参数成功: {session_id}")
 
             # 3. 生成二维码
-            async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=self.proxy) as client:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
                 resp = await client.get(
                     self.api_generate_qr,
                     params=login_params,
                     headers=self.headers
                 )
-                logger.debug(f"[调试] 获取二维码接口原始响应: {resp.text}")
+                resp.raise_for_status()
 
                 try:
                     results = resp.json()
-                    logger.debug(f"[调试] 获取二维码接口解析后: {json.dumps(results, ensure_ascii=False)}")
-                except Exception as e:
-                    logger.exception("二维码接口返回不是JSON")
-                    raise GetLoginQRCodeError(f"二维码接口返回异常: {resp.text}")
+                except ValueError:
+                    raise GetLoginQRCodeError("二维码接口返回异常，请稍后重试") from None
 
                 if results.get("content", {}).get("success") == True:
                     # 更新会话参数
@@ -298,28 +297,34 @@ class QRLoginManager:
                 else:
                     raise GetLoginQRCodeError("获取登录二维码失败")
 
-        except httpx.ConnectTimeout as e:
-            logger.error(f"连接超时: {e}")
-            return {'success': False, 'message': f'连接超时，请检查网络或尝试使用代理'}
-        except httpx.ReadTimeout as e:
-            logger.error(f"读取超时: {e}")
-            return {'success': False, 'message': f'读取超时，服务器响应过慢'}
-        except httpx.ConnectError as e:
-            logger.error(f"连接错误: {e}")
-            return {'success': False, 'message': f'连接错误，请检查网络或代理设置'}
+        except httpx.TimeoutException:
+            logger.warning("二维码生成超时（国内直连）")
+            return {'success': False, 'message': '闲鱼响应超时，请检查国内直连网络后稍后重试'}
+        except httpx.ConnectError:
+            logger.warning("二维码生成连接失败（国内直连）")
+            return {'success': False, 'message': '无法直连闲鱼，请检查国内网络、DNS 和防火墙设置'}
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            logger.warning(f"二维码接口返回 HTTP {status}")
+            return {'success': False, 'message': f'闲鱼接口暂时不可用（HTTP {status}），请稍后重试'}
+        except (GetLoginParamsError, GetLoginQRCodeError) as e:
+            logger.warning(f"二维码生成失败: {e}")
+            return {'success': False, 'message': str(e)}
         except Exception as e:
-            logger.exception("二维码生成过程中发生异常")
-            return {'success': False, 'message': f'生成二维码失败: {str(e)}'}
+            # 不把可能含 Cookie / 登录参数的异常上下文写进日志或发送给浏览器。
+            logger.error(f"二维码生成过程中发生异常: {type(e).__name__}")
+            return {'success': False, 'message': '生成二维码失败，请查看服务端日志中的错误类型'}
     
     async def _poll_qrcode_status(self, session: QRLoginSession) -> httpx.Response:
         """获取二维码扫描状态"""
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=self.proxy) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
             resp = await client.post(
                 self.api_scan_status,
                 data=session.params,
                 cookies=session.cookies,
                 headers=self.headers,
             )
+            resp.raise_for_status()
             return resp
 
     async def _monitor_qr_status(self, session_id: str):
@@ -630,7 +635,9 @@ class QRLoginManager:
             browser = await playwright.chromium.launch(
                 # 有 Xvfb 时用有头模式，降低被识别为自动化的概率
                 headless=not os.getenv('DISPLAY'),
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--lang=zh-CN'],
+                **direct_browser_options({'args': [
+                    '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--lang=zh-CN'
+                ]}),
             )
             context = await browser.new_context(
                 viewport={'width': 960, 'height': 900},

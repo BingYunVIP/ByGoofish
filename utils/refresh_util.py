@@ -59,6 +59,7 @@ class DrissionHandler:
         self.max_y_offset = 8       # 最大垂直偏移限制 ±8像素（原来是±15）
 
         self.co = ChromiumOptions()
+        self.co.set_argument('--no-proxy-server')
 
         # 根据操作系统设置浏览器路径
         import platform
@@ -1735,6 +1736,7 @@ class XianyuApis:
     def __init__(self):
         self.url = 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/'
         self.session = requests.Session()
+        self.session.trust_env = False
         self.session.headers.update({
             'accept': 'application/json',
             'accept-language': 'zh-CN,zh;q=0.9',

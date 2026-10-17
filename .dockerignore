@@ -49,3 +49,10 @@ static/uploads/*
 !static/uploads/images/
 static/uploads/images/*
 !static/uploads/images/.gitkeep
+
+# Runtime credentials and development-only evidence
+browser_data/
+**/*.runtime.lock
+Audit/
+__pycache__/
+*.deploy-tmp

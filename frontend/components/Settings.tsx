@@ -168,7 +168,9 @@ const Settings: React.FC = () => {
         return;
       }
       setPasswordForm({ current: '', next: '', confirm: '' });
-      notify('密码已修改，下次登录请使用新密码');
+      notify('密码已修改，请重新登录', 'success');
+      localStorage.removeItem('auth_token');
+      window.dispatchEvent(new Event('auth:logout'));
     } catch (error) {
       notify(`密码修改失败：${(error as Error).message}`);
     } finally {
@@ -768,7 +770,7 @@ const Settings: React.FC = () => {
                   type={showSmtpPassword ? 'text' : 'password'}
                   value={settings.smtp_password || ''}
                   onChange={(event) => setSettings({ ...settings, smtp_password: event.target.value })}
-                  placeholder="输入密码或授权码"
+                  placeholder={settings.smtp_password_configured ? '已配置，留空保留原授权码' : '输入密码或授权码'}
                   className="ios-input w-full rounded-md px-3 py-2.5 pr-11 text-sm"
                 />
                 <button

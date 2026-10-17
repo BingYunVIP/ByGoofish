@@ -12,6 +12,7 @@ from typing import Dict, Any, Optional
 from loguru import logger
 from utils import browser_limit
 from utils.user_agents import CHROME_UA
+from utils.direct_network import direct_browser_options
 
 # 修复Docker环境中的asyncio事件循环策略问题
 if sys.platform.startswith('linux') or os.getenv('DOCKER_ENV'):
@@ -42,12 +43,13 @@ except ImportError:
 class XianyuSearcher:
     """闲鱼商品搜索器 - 基于 Playwright"""
 
-    def __init__(self):
+    def __init__(self, owner_user_id: int = None):
+        self.owner_user_id = owner_user_id
         self.browser = None
         self.context = None
         self.page = None
         self.api_responses = []
-        self.user_id = "default"  # 默认用户ID
+        self.user_id = f"search-{owner_user_id}"  # 验证会话按管理用户隔离
         # 是否已占用浏览器槽位，避免重复获取或漏还
         self._browser_slot_held = False
 
@@ -76,7 +78,7 @@ class XianyuSearcher:
                 
                 # 创建远程控制会话
                 logger.warning(f"🌐 启动远程控制会话: {session_id}")
-                session_info = await captcha_controller.create_session(session_id, page)
+                session_info = await captcha_controller.create_session(session_id, page, owner_id=self.owner_user_id)
                 
                 # 获取控制页面URL
                 import socket
@@ -638,7 +640,9 @@ class XianyuSearcher:
             from app.db_manager import db_manager
 
             # 获取所有cookies，返回格式是 {id: value}
-            cookies = db_manager.get_all_cookies()
+            if self.owner_user_id is None:
+                raise PermissionError('搜索必须指定当前用户')
+            cookies = db_manager.get_all_cookies(self.owner_user_id)
 
             # 找到第一个有效的cookie（长度大于50的认为是有效的）
             for cookie_id, cookie_value in cookies.items():
@@ -699,7 +703,7 @@ class XianyuSearcher:
             
             # 设置持久化数据目录（保存缓存、cookies等）
             import tempfile
-            user_data_dir = os.path.join(tempfile.gettempdir(), 'xianyu_browser_cache')
+            user_data_dir = os.path.join(tempfile.gettempdir(), f'xianyu_browser_cache_{self.owner_user_id}')
             os.makedirs(user_data_dir, exist_ok=True)
             logger.info(f"使用持久化数据目录（保留缓存）: {user_data_dir}")
             
@@ -732,7 +736,7 @@ class XianyuSearcher:
             self.context = await playwright.chromium.launch_persistent_context(
                 user_data_dir,  # 第一个参数是用户数据目录，用于持久化
                 headless=True,  # 无头模式，后台运行
-                args=browser_args,
+                **direct_browser_options({'args': browser_args}),
                 user_agent=CHROME_UA,
                 viewport={'width': 1280, 'height': 720},
                 locale='zh-CN',  # 设置语言为中文
@@ -1522,7 +1526,7 @@ class XianyuSearcher:
 
 # 搜索器工具函数
 
-async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20, owner_user_id: int = None) -> Dict[str, Any]:
     """
     搜索闲鱼商品的便捷函数，带重试机制
 
@@ -1541,7 +1545,7 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
         searcher = None
         try:
             # 每次搜索都创建新的搜索器实例，避免浏览器状态混乱
-            searcher = XianyuSearcher()
+            searcher = XianyuSearcher(owner_user_id=owner_user_id)
 
             logger.info(f"开始单页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_items(keyword, page, page_size)
@@ -1583,7 +1587,7 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
     }
 
 
-async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Dict[str, Any]:
+async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1, owner_user_id: int = None) -> Dict[str, Any]:
     """
     搜索多页闲鱼商品的便捷函数，带重试机制
 
@@ -1601,7 +1605,7 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
         searcher = None
         try:
             # 每次搜索都创建新的搜索器实例，避免浏览器状态混乱
-            searcher = XianyuSearcher()
+            searcher = XianyuSearcher(owner_user_id=owner_user_id)
 
             logger.info(f"开始多页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_multiple_pages(keyword, total_pages)
@@ -1641,6 +1645,5 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
         'total': 0,
         'error': "未知错误"
     }
-
 
 

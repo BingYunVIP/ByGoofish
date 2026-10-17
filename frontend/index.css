@@ -1,7 +1,8 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@config "./tailwind.config.js";
 
+/* 默认元素样式属于 base；否则 v4 的 CSS 分层会让重置规则覆盖间距工具类。 */
+@layer base {
 * {
   box-sizing: border-box;
   margin: 0;
@@ -197,6 +198,7 @@ select:-webkit-autofill {
   caret-color: var(--text);
   box-shadow: 0 0 0 1000px var(--surface) inset;
   transition: background-color 9999s ease-out 0s;
+}
 }
 
 /* 三态主题选择器：选中态同时使用描边、底色和字重，不只依赖颜色。 */

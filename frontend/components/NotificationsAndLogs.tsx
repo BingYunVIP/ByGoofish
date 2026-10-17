@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   BellRing,
@@ -133,7 +133,7 @@ const CHANNEL_DEFINITIONS: Record<NotificationChannelType, ChannelDefinition> = 
 const PAGE_SIZE = 20;
 
 type NotificationTestState = {
-  status: 'sending' | 'success' | 'error';
+  status: 'sending' | 'success' | 'skipped' | 'error';
   message: string;
   requestId?: string;
   sentAt?: string;
@@ -166,6 +166,8 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
   const [channels, setChannels] = useState<NotificationChannel[]>([]);
   const [bindings, setBindings] = useState<MessageNotification[]>([]);
   const [notificationTestStates, setNotificationTestStates] = useState<Record<string, NotificationTestState>>({});
+  const [testEvents, setTestEvents] = useState<Record<string, string>>({});
+  const testingRules = useRef(new Set<string>());
   const [eventDefinitions, setEventDefinitions] = useState<NotificationEventDefinition[]>([]);
   const [priorityDefinitions, setPriorityDefinitions] = useState<NotificationPriorityDefinition[]>([]);
   const [loadingBase, setLoadingBase] = useState(true);
@@ -301,7 +303,8 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
     eventDefinitions.find((item) => item.id === eventId)?.label || eventId;
 
   const ruleEventSummary = (binding: MessageNotification) => {
-    if (!binding.event_types || binding.event_types.length === 0) return '全部事件';
+    if (binding.event_types == null) return '全部事件';
+    if (binding.event_types.length === 0) return '未订阅任何事件';
     return binding.event_types.map(eventLabel).join('、');
   };
 
@@ -317,7 +320,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
     setRuleAccount(accounts[0]?.id || '');
     setRuleChannel('');
     setRuleName('');
-    setRuleEventTypes([]);
+    setRuleEventTypes(eventDefinitions.map((item) => item.id));
     setRuleEditorOpen(true);
   };
 
@@ -326,7 +329,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
     setRuleAccount(binding.cookie_id);
     setRuleChannel(String(binding.channel_id));
     setRuleName(binding.name || '');
-    setRuleEventTypes(binding.event_types || []);
+    setRuleEventTypes(binding.event_types ?? eventDefinitions.map((item) => item.id));
     setRuleEditorOpen(true);
   };
 
@@ -398,15 +401,40 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
     }
   };
 
-  const testBinding = async (binding: MessageNotification) => {
+  const testBinding = async (binding: MessageNotification, mode: 'event' | 'channel') => {
     const ruleId = String(binding.id);
-    setNotificationTestStates((current) => ({
-      ...current,
-      [ruleId]: { status: 'sending', message: '发送中' },
-    }));
+    if (testingRules.current.has(ruleId)) return;
+    testingRules.current.add(ruleId);
     try {
-      const result = await testMessageNotification(binding.id);
-      const message = `${result.message} · ${result.channel.name}`;
+      if (mode === 'channel' && !await confirmAction(
+        `将向“${binding.channel_name}”发送一封手动测试通知。渠道测试会忽略事件勾选和规则启用状态，关闭“登录/验证成功”也不会阻止这封测试邮件。`,
+        { title: '确认发送渠道测试', confirmLabel: '发送一封测试通知', danger: false },
+      )) return;
+      setNotificationTestStates((current) => ({
+        ...current,
+        [ruleId]: { status: 'sending', message: '检查并发送中' },
+      }));
+      const result = await testMessageNotification(binding.id, {
+        mode,
+        event_type: mode === 'event' ? testEvents[ruleId] || 'login_success' : undefined,
+        confirm_channel_send: mode === 'channel',
+      });
+      if (result?.success !== true) {
+        throw new Error(result?.message?.trim() || '通知测试未成功，请检查渠道配置后重试');
+      }
+      if (result.skipped || result.sent === false) {
+        const message = result.message || '未订阅该事件，未发送任何通知';
+        setNotificationTestStates((current) => ({
+          ...current, [ruleId]: { status: 'skipped', message, requestId: result.request_id },
+        }));
+        notify(message, 'info');
+        return;
+      }
+      const fallback = binding.channel_type === 'email'
+        ? '测试邮件已提交（手动测试，不是账号异常告警），请检查收件箱或垃圾邮件'
+        : '测试通知已提交（手动测试，不是账号异常告警），请检查接收端';
+      const channelName = result.channel?.name?.trim() || binding.channel_name || '通知渠道';
+      const message = `${result.message?.trim() || fallback} · ${channelName}`;
       setNotificationTestStates((current) => ({
         ...current,
         [ruleId]: {
@@ -416,7 +444,8 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
           sentAt: result.sent_at,
         },
       }));
-      notify(`${message}（请求 ID：${result.request_id}）`, 'success');
+      const requestLabel = result.request_id ? `（请求 ID：${result.request_id}）` : '';
+      notify(`${message}${requestLabel}`, 'success');
     } catch (error) {
       const message = getNotificationTestErrorMessage(error);
       setNotificationTestStates((current) => ({
@@ -424,6 +453,8 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
         [ruleId]: { status: 'error', message },
       }));
       notify(`测试发送失败：${message}`, 'error');
+    } finally {
+      testingRules.current.delete(ruleId);
     }
   };
 
@@ -606,7 +637,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
         <section className="section-panel">
           <SectionHeader
             title="账号通知规则"
-            description="同一账号可配置多条规则，按事件类型选择要通知的内容；测试发送会真实触达当前渠道。"
+            description="手动测试只检查通知能否投递，不检测账号是否异常，也不改变“监听中”等状态。测试订阅投递遵守已保存的订阅，未订阅就不发信；渠道测试需另行确认。"
             icon={Link2}
             actions={(
               <button
@@ -660,16 +691,36 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                     </p>
                   </div>
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <select
+                      aria-label={`测试订阅项${binding.name || binding.channel_name}`}
+                      value={testEvents[String(binding.id)] || 'login_success'}
+                      onChange={(event) => setTestEvents((current) => ({ ...current, [binding.id]: event.target.value }))}
+                      disabled={isTesting}
+                      className="ios-input max-w-full rounded-md px-2 py-2 text-xs"
+                    >
+                      {eventDefinitions.map((event) => (
+                        <option key={event.id} value={event.id}>测试订阅项：{event.label}</option>
+                      ))}
+                    </select>
                     <button
                       type="button"
-                      onClick={() => void testBinding(binding)}
+                      onClick={() => void testBinding(binding, 'event')}
                       disabled={isTesting}
-                      aria-label={`测试发送规则${binding.name || binding.channel_name}`}
-                      title={binding.enabled ? '向该渠道真实发送一条测试消息' : '规则已暂停，仅验证渠道配置'}
+                      aria-label={`测试订阅投递${binding.name || binding.channel_name}`}
+                      title="匹配订阅且启用时发送手动测试通知；不会检测或触发账号异常"
                       className="ios-btn-secondary flex min-h-11 items-center gap-1.5 rounded-md px-3 text-xs disabled:cursor-wait disabled:opacity-60"
                     >
                       {isTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-                      {isTesting ? '发送中' : '测试发送'}
+                      {isTesting ? '处理中' : '测试订阅投递'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void testBinding(binding, 'channel')}
+                      disabled={isTesting}
+                      aria-label={`渠道测试${binding.name || binding.channel_name}`}
+                      className="ios-btn-secondary rounded-md px-3 py-2 text-xs"
+                    >
+                      渠道测试
                     </button>
                     <button
                       type="button"
@@ -691,7 +742,8 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                       <span
                         role="status"
                         className={`flex max-w-full items-center gap-1 text-xs ${
-                          testState.status === 'success' ? 'text-emerald-700' : 'text-red-700'
+                          testState.status === 'success' ? 'text-emerald-700'
+                            : testState.status === 'skipped' ? 'text-gray-600' : 'text-red-700'
                         }`}
                         title={testState.requestId ? `请求 ID：${testState.requestId}` : undefined}
                       >
@@ -942,7 +994,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                     <textarea
                       value={String(channelConfig[field.key] ?? '')}
                       onChange={(event) => setChannelConfig({ ...channelConfig, [field.key]: event.target.value })}
-                      placeholder={field.placeholder}
+                      placeholder={editingChannel?.configured_fields?.includes(field.key) ? '已配置，留空保留原值' : field.placeholder}
                       rows={4}
                       className="ios-input mt-2 w-full resize-y rounded-md px-3 py-2.5 font-mono text-sm font-normal"
                     />
@@ -962,7 +1014,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                         ...channelConfig,
                         [field.key]: field.type === 'number' ? Number(event.target.value) : event.target.value,
                       })}
-                      placeholder={field.placeholder}
+                      placeholder={editingChannel?.configured_fields?.includes(field.key) ? '已配置，留空保留原值' : field.placeholder}
                       className="ios-input mt-2 w-full rounded-md px-3 py-2.5 font-normal"
                     />
                   )}
@@ -997,7 +1049,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
             <div className="modal-header flex items-start justify-between gap-4">
               <div>
                 <h3 className="text-lg font-bold text-gray-900">{editingRule ? '编辑通知规则' : '新建通知规则'}</h3>
-                <p className="mt-1 text-sm text-gray-500">选择这条规则要通知的内容，未勾选任何类型表示订阅全部事件。</p>
+                <p className="mt-1 text-sm text-gray-500">只发送已勾选的事件；全部取消后不再接收自动通知。</p>
               </div>
               <button
                 type="button"
@@ -1116,7 +1168,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                     );
                   })}
                 </div>
-                <p className="mt-3 text-xs text-gray-500">未勾选任何类型时接收全部事件；只想收关键提醒可点“仅关键”。</p>
+                <p className="mt-3 text-xs text-gray-500">未勾选任何类型时不发送自动通知；需要全部事件请点“全选”，只想收关键提醒可点“仅关键”。</p>
               </div>
             </div>
             <div className="modal-footer flex justify-end gap-3">

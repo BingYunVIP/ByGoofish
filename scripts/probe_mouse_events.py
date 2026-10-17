@@ -89,6 +89,7 @@ def summarize(name, recs):
 
 async def main():
     from playwright.async_api import async_playwright
+    from utils.direct_network import direct_browser_options
 
     path = os.path.abspath("/tmp/mouse_probe.html")
     with open(path, "w", encoding="utf-8") as f:
@@ -100,6 +101,7 @@ async def main():
             channel="chrome",
             headless=False,
             no_viewport=True,
+            **direct_browser_options(),
         )
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         await page.goto(f"file://{path}")

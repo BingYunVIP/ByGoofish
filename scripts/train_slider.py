@@ -159,6 +159,7 @@ async def main():
         print("⚠️ 实时获取失败，回退到数据库中的历史 URL（可能已过期）")
 
     from playwright.async_api import async_playwright
+    from utils.direct_network import direct_browser_options
 
     # 用系统真实 Chrome + 持久化用户目录。
     # Playwright 自带的 Chromium（Chrome for Testing）指纹会被阿里 nc 识破，
@@ -172,7 +173,7 @@ async def main():
             channel="chrome",  # 系统安装的正式版 Chrome，而非 Chromium
             headless=False,
             no_viewport=True,
-            args=["--disable-blink-features=AutomationControlled", "--start-maximized"],
+            **direct_browser_options({'args': ["--disable-blink-features=AutomationControlled", "--start-maximized"]}),
         )
         await ctx.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"

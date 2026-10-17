@@ -148,20 +148,28 @@ def normalize_event_types(event_types: Any) -> Optional[List[str]]:
         if unknown:
             raise ValueError(f"不支持的通知事件类型: {', '.join(unknown)}")
         ordered = [event_id for event_id in EVENT_IDS if event_id in selected]
-        return ordered or None
+        return ordered
     raise ValueError("通知事件类型必须是数组或 JSON 数组")
 
 
 def parse_event_types(raw: Any) -> Optional[List[str]]:
-    """读取数据库中的订阅列表；数据异常时按订阅全部处理。"""
+    """NULL 兼容旧版全部订阅；空数组及无效数据不订阅事件。"""
     try:
         return normalize_event_types(raw)
     except ValueError:
-        return None
+        return []
 
 
 def serialize_event_types(event_types: Any) -> Optional[str]:
     normalized = normalize_event_types(event_types)
-    if not normalized:
+    if normalized is None:
         return None
     return json.dumps(normalized, ensure_ascii=False)
+
+
+def rule_accepts_event(event_types: Any, event_type: str) -> bool:
+    """正式通知和事件测试使用同一筛选语义，未知事件不投递。"""
+    if event_type not in EVENT_IDS:
+        return False
+    selected = parse_event_types(event_types)
+    return selected is None or event_type in selected

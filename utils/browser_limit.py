@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
 from loguru import logger
+from utils.direct_network import direct_browser_options
 
 # 允许通过环境变量强制指定，方便排查问题或应对推算不准的机器
 _ENV_KEY = 'MAX_CONCURRENT_BROWSERS'
@@ -143,7 +144,7 @@ async def launch_browser(
         )
 
     try:
-        browser = await playwright.chromium.launch(**(launch_options or {}))
+        browser = await playwright.chromium.launch(**direct_browser_options(launch_options))
     except BaseException:
         # 启动失败要立刻归还，否则槽位会被永久占住
         semaphore.release()

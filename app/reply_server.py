@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 import secrets
+import shlex
+import base64
 import time
 import json
 import os
@@ -17,6 +19,10 @@ import sqlite3
 from collections import defaultdict, OrderedDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from app.runtime import acquire_runtime_lock
+acquire_runtime_lock()
+from app.logging_setup import configure_logging
+configure_logging()
 
 from app import cookie_manager
 from app.db_manager import db_manager
@@ -30,6 +36,7 @@ from app.services.notification_channels import (
     validate_notification_channel,
 )
 from app.services.notification_sender import NotificationSender
+from app.services.secret_fields import public_account, public_channel, merge_channel_config, public_settings, secret_setting
 from app.services.notification_test import (
     NotificationTestError,
     NotificationTestService,
@@ -71,7 +78,11 @@ KEYWORDS_FILE = PROJECT_ROOT / "回复关键字.txt"
 # 简单的用户认证配置
 ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
-SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
+from app.auth import (
+    SESSION_TOKENS, security, verify_token, verify_admin_token, require_auth,
+    get_current_user, get_current_user_optional, require_admin,
+    require_owned_account, rotate_account_key, verify_account_key,
+)
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
 
 # 认证防刷（进程内状态，重启清零，与 SESSION_TOKENS 同一取舍）
@@ -83,7 +94,7 @@ from app.auth_validators import (
 )
 
 # HTTP Bearer认证
-security = HTTPBearer(auto_error=False)
+
 
 # 扫码登录检查锁 - 防止并发处理同一个session
 qr_check_locks = defaultdict(lambda: asyncio.Lock())
@@ -230,67 +241,11 @@ def generate_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[Dict[str, Any]]:
-    """验证token并返回用户信息"""
-    if not credentials:
-        return None
-
-    token = credentials.credentials
-    if token not in SESSION_TOKENS:
-        return None
-
-    token_data = SESSION_TOKENS[token]
-
-    # 检查token是否过期
-    if time.time() - token_data['timestamp'] > TOKEN_EXPIRE_TIME:
-        del SESSION_TOKENS[token]
-        return None
-
-    return token_data
-
-
-def verify_admin_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Dict[str, Any]:
-    """验证管理员token"""
-    user_info = verify_token(credentials)
-    if not user_info:
-        raise HTTPException(status_code=401, detail="未授权访问")
-
-    # 检查是否是管理员
-    if user_info['username'] != ADMIN_USERNAME:
-        raise HTTPException(status_code=403, detail="需要管理员权限")
-
-    return user_info
-
-
-def require_auth(user_info: Optional[Dict[str, Any]] = Depends(verify_token)):
-    """需要认证的依赖，返回用户信息"""
-    if not user_info:
-        raise HTTPException(status_code=401, detail="未授权访问")
-    return user_info
-
-
-def get_current_user(user_info: Dict[str, Any] = Depends(require_auth)) -> Dict[str, Any]:
-    """获取当前登录用户信息"""
-    return user_info
-
-
-def get_current_user_optional(user_info: Optional[Dict[str, Any]] = Depends(verify_token)) -> Optional[Dict[str, Any]]:
-    """获取当前用户信息（可选，不强制要求登录）"""
-    return user_info
-
-
 def get_user_log_prefix(user_info: Dict[str, Any] = None) -> str:
     """获取用户日志前缀"""
     if user_info:
         return f"【{user_info['username']}#{user_info['user_id']}】"
     return "【系统】"
-
-
-def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    """要求管理员权限"""
-    if current_user['username'] != 'admin':
-        raise HTTPException(status_code=403, detail="需要管理员权限")
-    return current_user
 
 
 def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
@@ -403,12 +358,19 @@ async def log_requests(request, call_next):
 # 提供前端静态文件
 import os
 from utils.user_agents import CHROME_UA
-static_dir = str(PROJECT_ROOT / 'static')
+static_dir = str(Path(os.getenv('APP_STATIC_DIR', str(PROJECT_ROOT / 'static'))).resolve())
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
 
 # 挂载静态文件目录
-app.mount('/static', StaticFiles(directory=static_dir), name='static')
+class PrivateAwareStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        if Path(path).name.startswith(('face_verify_', 'qr_verify_')):
+            raise HTTPException(404, '文件不存在')
+        return await super().get_response(path, scope)
+
+
+app.mount('/static', PrivateAwareStaticFiles(directory=static_dir), name='static')
 
 # 挂载 /assets 路径，指向 static/assets 目录
 # 这样访问 /assets/xxx.js 时会正确映射到 static_dir/assets/xxx.js
@@ -422,6 +384,21 @@ if not os.path.exists(uploads_dir):
     logger.info(f"创建图片上传目录: {uploads_dir}")
 
 # 健康检查端点
+@app.get('/health/ready')
+def account_readiness(user=Depends(get_current_user)):
+    accounts=db_manager.get_all_cookies(user['user_id'])
+    enabled=[cid for cid in accounts if db_manager.get_cookie_status(cid)]
+    manager=cookie_manager.manager
+    connected=0
+    for cid in enabled:
+        instance=manager.instances.get(cid) if manager else None
+        ws=getattr(instance,'ws',None)
+        if ws and not ws.closed and time.time()-getattr(instance,'last_heartbeat_response',0)<90:
+            connected+=1
+    return {'ready': connected==len(enabled), 'enabled_accounts':len(enabled),
+            'connected_accounts':connected, 'worker_mode':'single', 'session_store':'sqlite'}
+
+
 @app.get('/health')
 async def health_check():
     """健康检查端点，用于Docker健康检查和负载均衡器"""
@@ -750,7 +727,8 @@ async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict
         success = db_manager.update_user_password('admin', request.new_password)
 
         if success:
-            logger.info(f"【admin#{admin_user['user_id']}】管理员密码修改成功")
+            SESSION_TOKENS.revoke_user(admin_user['user_id'])
+            logger.info('管理员密码已修改，既有会话已撤销')
             return {"success": True, "message": "密码修改成功"}
         else:
             return {"success": False, "message": "密码修改失败"}
@@ -785,6 +763,7 @@ async def change_user_password(request: ChangePasswordRequest, current_user: Dic
         success = db_manager.update_user_password(username, request.new_password)
 
         if success:
+            SESSION_TOKENS.revoke_user(user_id)
             logger.info(f"【{username}#{user_id}】用户密码修改成功")
             return {"success": True, "message": "密码修改成功"}
         else:
@@ -813,7 +792,7 @@ async def check_default_password(current_user: Dict[str, Any] = Depends(get_curr
 
         # 检查是否使用默认密码
         using_default = db_manager.verify_user_password('admin', DEFAULT_ADMIN_PASSWORD)
-        logger.info(f"默认密码检查结果: {using_default}, DEFAULT_ADMIN_PASSWORD={DEFAULT_ADMIN_PASSWORD}")
+        logger.info(f"默认密码检查结果: {using_default}")
         
         return {"using_default": using_default}
 
@@ -1236,7 +1215,7 @@ async def register(request: RegisterRequest):
 
 # 固定的API秘钥（生产环境中应该从配置文件或环境变量读取）
 # 注意：现在从系统设置中读取QQ回复消息秘钥
-API_SECRET_KEY = "xianyu_api_secret_2024"  # 保留作为后备
+
 
 class SendMessageRequest(BaseModel):
     api_key: str
@@ -1257,22 +1236,8 @@ class ChatSendMessageRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=2000)
 
 
-def verify_api_key(api_key: str) -> bool:
-    """验证API秘钥"""
-    try:
-        # 从系统设置中获取QQ回复消息秘钥
-        from app.db_manager import db_manager
-        qq_secret_key = db_manager.get_system_setting('qq_reply_secret_key')
-
-        # 如果系统设置中没有配置，使用默认值
-        if not qq_secret_key:
-            qq_secret_key = API_SECRET_KEY
-
-        return api_key == qq_secret_key
-    except Exception as e:
-        logger.error(f"验证API秘钥时发生异常: {e}")
-        # 异常情况下使用默认秘钥验证
-        return api_key == API_SECRET_KEY
+def verify_api_key(api_key: str, cookie_id: str = '') -> bool:
+    return verify_account_key(api_key, cookie_id)
 
 
 def _get_owned_chat_account(cookie_id: str, current_user: Dict[str, Any]) -> str:
@@ -1590,8 +1555,8 @@ async def send_message_api(request: SendMessageRequest):
             )
 
         # 验证API秘钥
-        if not verify_api_key(cleaned_api_key):
-            logger.warning(f"API秘钥验证失败: {cleaned_api_key}")
+        if not verify_api_key(cleaned_api_key, cleaned_cookie_id):
+            logger.warning('账号范围API密钥验证失败')
             return SendMessageResponse(
                 success=False,
                 message="API秘钥验证失败"
@@ -1659,7 +1624,8 @@ async def send_message_api(request: SendMessageRequest):
 
 
 @app.post("/xianyu/reply", response_model=ResponseModel)
-async def xianyu_reply(req: RequestModel):
+async def xianyu_reply(req: RequestModel, current_user: Dict[str, Any] = Depends(get_current_user)):
+    require_owned_account(req.cookie_id, current_user)
     msg_template = match_reply(req.cookie_id, req.send_message)
     is_default_reply = False
 
@@ -1693,13 +1659,7 @@ async def xianyu_reply(req: RequestModel):
         # 如果格式化失败，返回原始内容
         send_msg = msg_template
 
-    # 如果是默认回复且开启了"只回复一次"，记录回复记录
-    if is_default_reply:
-        from app.db_manager import db_manager
-        default_reply_settings = db_manager.get_default_reply(req.cookie_id)
-        if default_reply_settings and default_reply_settings.get('reply_once', False):
-            db_manager.add_default_reply_record(req.cookie_id, req.chat_id)
-
+    # 此接口只预览模板；真实发送完成后由账号运行任务记录一次性状态。
     return {"code": 200, "data": {"send_msg": send_msg}}
 
 # ------------------------- 账号 / 关键字管理接口 -------------------------
@@ -1844,8 +1804,6 @@ def list_cookies(current_user: Dict[str, Any] = Depends(get_current_user)):
 @app.get("/cookies/details")
 def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取所有Cookie的详细信息（包括值和状态）"""
-    if cookie_manager.manager is None:
-        return []
 
     # 获取当前用户的cookies
     user_id = current_user['user_id']
@@ -1854,7 +1812,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
 
     result = []
     for cookie_id, cookie_value in user_cookies.items():
-        cookie_enabled = cookie_manager.manager.get_cookie_status(cookie_id)
+        cookie_enabled = cookie_manager.manager.get_cookie_status(cookie_id) if cookie_manager.manager else db_manager.get_cookie_status(cookie_id)
         auto_confirm = db_manager.get_auto_confirm(cookie_id)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id) or {}
@@ -1862,7 +1820,8 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
 
         result.append({
             'id': cookie_id,
-            'value': cookie_value,
+            'cookie_configured': bool(cookie_value),
+            'cookie_length': len(cookie_value),
             'enabled': cookie_enabled,
             'auto_confirm': auto_confirm,
             'remark': remark,
@@ -1874,12 +1833,12 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'followers': cookie_details.get('followers'),
             'following': cookie_details.get('following'),
             'profile_updated_at': cookie_details.get('profile_updated_at'),
-            'runtime_state': cookie_manager.manager.get_task_state(cookie_id),
+            'runtime_state': cookie_manager.manager.get_task_state(cookie_id) if cookie_manager.manager else 'stopped',
             # 登录信息一并返回。这几个字段本来要前端再逐个请求
             # /cookie/{id}/details 才拿得到，等于对同一份数据做 N+1 查询：
             # 页面上有 7 处组件各自调用，账号一多首屏就被这些重复请求拖慢。
             'username': cookie_details.get('username', ''),
-            'login_password': cookie_details.get('password', '') or cookie_details.get('login_password', ''),
+            'login_password_configured': bool(cookie_details.get('password') or cookie_details.get('login_password')),
             'show_browser': bool(cookie_details.get('show_browser', False)),
         })
     return result
@@ -1986,7 +1945,7 @@ def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, curr
         success = db_manager.update_cookie_account_info(
             cid,
             username=update_data.username,
-            password=update_data.login_password,
+            password=update_data.login_password or None,
             show_browser=update_data.show_browser
         )
 
@@ -2034,6 +1993,12 @@ async def refresh_cookie_profile(
 
 
 # ============ 通用的 /cookies/{cid} 路由 ============
+
+@app.post('/cookies/{cid}/api-key')
+def create_account_api_key(cid: str, user=Depends(get_current_user)):
+    key = rotate_account_key(cid, user)
+    return {'api_key': key, 'message': '密钥仅显示一次，仅能用于此账号；旧密钥已失效'}
+
 
 @app.put('/cookies/{cid}')
 def update_cookie(cid: str, item: CookieIn, current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -2103,7 +2068,7 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
             cid, 
             cookie_value=info.value,
             username=info.username,
-            password=info.password,
+            password=info.password or None,
             show_browser=info.show_browser
         )
         
@@ -2143,7 +2108,7 @@ def get_cookie_account_details(cid: str, current_user: Dict[str, Any] = Depends(
         if not details:
             raise HTTPException(status_code=404, detail="账号不存在")
         
-        return details
+        return public_account(details)
     except HTTPException:
         raise
     except Exception as e:
@@ -2230,7 +2195,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 log_with_user('warning', f"账号实例不存在: {account_id}，尝试从数据库获取通知配置", current_user)
                                 try:
                                     # 尝试从数据库获取通知配置
-                                    notifications = db_manager.get_account_notifications(account_id)
+                                    notifications = db_manager.get_account_notifications(account_id, event_type='captcha_manual')
                                     if notifications:
                                         log_with_user('info', f"找到 {len(notifications)} 个通知配置，但需要账号实例才能发送", current_user)
                                         log_with_user('warning', f"账号实例不存在，无法发送通知: {account_id}。请确保账号已登录并运行中。", current_user)
@@ -2292,7 +2257,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 log_with_user('warning', f"账号实例不存在: {account_id}，尝试从数据库获取通知配置", current_user)
                                 try:
                                     # 尝试从数据库获取通知配置
-                                    notifications = db_manager.get_account_notifications(account_id)
+                                    notifications = db_manager.get_account_notifications(account_id, event_type='captcha_manual')
                                     if notifications:
                                         log_with_user('info', f"找到 {len(notifications)} 个通知配置，但需要账号实例才能发送", current_user)
                                         log_with_user('warning', f"账号实例不存在，无法发送通知: {account_id}。请确保账号已登录并运行中。", current_user)
@@ -2498,6 +2463,9 @@ async def password_login(
         if not account_id or not account or not password:
             return {'success': False, 'message': '账号ID、登录账号和密码不能为空'}
         
+        existing = db_manager.get_cookie_details(account_id)
+        if existing and existing.get('user_id') != current_user['user_id']:
+            raise HTTPException(403, '账号已被其他用户绑定')
         log_with_user('info', f"开始账号密码登录: {account_id}, 账号: {account}", current_user)
         
         # 生成会话ID
@@ -2510,7 +2478,6 @@ async def password_login(
         password_login_sessions[session_id] = {
             'account_id': account_id,
             'account': account,
-            'password': password,
             'show_browser': show_browser,
             'status': 'processing',
             'verification_url': None,
@@ -2535,6 +2502,8 @@ async def password_login(
             'message': '登录任务已启动，请等待...'
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         log_with_user('error', f"账号密码登录异常: {str(e)}", current_user)
         import traceback
@@ -2548,6 +2517,9 @@ async def check_password_login_status(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """检查账号密码登录状态"""
+    session = password_login_sessions.get(session_id)
+    if not session or session.get('user_id') != current_user['user_id']:
+        raise HTTPException(404, '会话不存在或无权限')
     try:
         # 清理过期会话（超过1小时）
         current_time = time.time()
@@ -2699,7 +2671,7 @@ async def get_account_face_verification_screenshot(
         screenshot_info = {
             'filename': filename,
             'account_id': account_id,
-            'path': f'/static/uploads/images/{filename}',
+            'path': 'data:image/jpeg;base64,' + base64.b64encode(Path(latest_file).read_bytes()).decode(),
             'size': stat.st_size,
             'created_time': stat.st_ctime,
             'created_time_str': datetime.fromtimestamp(stat.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
@@ -2775,7 +2747,7 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
     try:
         log_with_user('info', "请求生成扫码登录二维码", current_user)
 
-        result = await qr_login_manager.generate_qr_code()
+        result = await qr_login_manager.generate_qr_code(owner_id=current_user['user_id'])
 
         if result['success']:
             log_with_user('info', f"扫码登录二维码生成成功: {result['session_id']}", current_user)
@@ -2792,6 +2764,11 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
 @app.get("/qr-login/check/{session_id}")
 async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """检查扫码登录状态"""
+    session = qr_login_manager.sessions.get(session_id)
+    record = qr_check_processed.get(session_id) or {}
+    owner = getattr(session, 'owner_id', None) if session else record.get('owner_id')
+    if owner != current_user['user_id']:
+        raise HTTPException(404, '会话不存在或无权限')
     try:
         cleanup_qr_check_records()
 
@@ -2841,6 +2818,7 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                     'message': '已确认，正在准备账号...'
                 }
                 qr_check_processed[session_id] = {
+            'owner_id': current_user['user_id'],
                     'processed': False,
                     'timestamp': time.time(),
                     'result': processing_result
@@ -2888,6 +2866,7 @@ async def _process_qr_login_session(
             'message': '账号已保存，正在后台增强Cookie'
         }
         qr_check_processed[session_id] = {
+            'owner_id': current_user['user_id'],
             'processed': True,
             'timestamp': time.time(),
             'result': result
@@ -2919,6 +2898,7 @@ async def _process_qr_login_session(
             current_user
         )
         qr_check_processed[session_id] = {
+            'owner_id': current_user['user_id'],
             'processed': True,
             'timestamp': time.time(),
             'result': result
@@ -3436,7 +3416,7 @@ def get_notification_channels(current_user: Dict[str, Any] = Depends(get_current
     from app.db_manager import db_manager
     try:
         user_id = current_user['user_id']
-        return db_manager.get_notification_channels(user_id)
+        return [public_channel(item) for item in db_manager.get_notification_channels(user_id)]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3471,7 +3451,7 @@ def get_notification_channel(channel_id: int, current_user: Dict[str, Any] = Dep
         channel = db_manager.get_notification_channel(channel_id, current_user['user_id'])
         if not channel:
             raise HTTPException(status_code=404, detail='通知渠道不存在')
-        return channel
+        return public_channel(channel)
     except HTTPException:
         raise
     except Exception as e:
@@ -3491,7 +3471,7 @@ def update_notification_channel(channel_id: int, channel_data: NotificationChann
         name, _, config = validate_notification_channel(
             channel_data.name if channel_data.name is not None else existing_channel["name"],
             existing_channel["type"],
-            channel_data.config if channel_data.config is not None else existing_channel["config"],
+            merge_channel_config(existing_channel["config"], channel_data.config) if channel_data.config is not None else existing_channel["config"],
         )
         success = db_manager.update_notification_channel(
             channel_id,
@@ -3545,14 +3525,21 @@ def get_all_message_notifications(current_user: Dict[str, Any] = Depends(get_cur
     try:
         # 只返回当前用户的消息通知配置
         user_id = current_user['user_id']
-        return db_manager.get_all_message_notifications(user_id)
+        return {key: [{k:v for k,v in row.items() if k != 'channel_config'} for row in rows] for key,rows in db_manager.get_all_message_notifications(user_id).items()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class NotificationTestIn(BaseModel):
+    mode: str = 'event'
+    event_type: Optional[str] = None
+    confirm_channel_send: bool = False
 
 
 @app.post('/message-notifications/rule/{rule_id}/test')
 async def test_message_notification_rule(
     rule_id: int,
+    payload: NotificationTestIn,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """向一条账号通知规则绑定的渠道发送一条真实测试消息。"""
@@ -3565,6 +3552,9 @@ async def test_message_notification_rule(
             rule_id,
             int(current_user["user_id"]),
             user_info,
+            mode=payload.mode,
+            event_type=payload.event_type,
+            confirm_channel_send=payload.confirm_channel_send,
         )
     except NotificationTestError as exc:
         headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
@@ -3600,7 +3590,7 @@ def get_account_notifications(cid: str, current_user: Dict[str, Any] = Depends(g
         if cid not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
-        return db_manager.get_account_notifications(cid, user_id)
+        return [{k:v for k,v in row.items() if k != 'channel_config'} for row in db_manager.get_account_notifications(cid, user_id)]
     except HTTPException:
         raise
     except Exception as e:
@@ -3978,7 +3968,7 @@ def get_system_settings(current_user: Dict[str, Any] = Depends(require_auth)):
             del settings['admin_password_hash']
         if current_user['username'] != ADMIN_USERNAME:
             settings = {k: v for k, v in settings.items() if k in USER_VISIBLE_KEYS}
-        return settings
+        return public_settings(settings)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3993,6 +3983,10 @@ def update_system_setting(key: str, setting_data: SystemSettingIn,
         if key == 'admin_password_hash':
             raise HTTPException(status_code=400, detail='请使用密码修改接口')
 
+        if key == 'qq_reply_secret_key' or key.endswith('_configured'):
+            raise HTTPException(400, '请使用账号范围API密钥，不可修改展示标记')
+        if secret_setting(key) and not setting_data.value.strip():
+            return {'msg': 'secret unchanged'}
         success = db_manager.set_system_setting(key, setting_data.value, setting_data.description)
         if success:
             return {'msg': 'system setting updated'}
@@ -4009,6 +4003,8 @@ async def send_email_test(data: EmailTestIn, _: Dict[str, Any] = Depends(require
     """用设置页表单当前的 SMTP 配置发一封测试邮件，验证邮件服务可用性。"""
     import re
     from app.db_manager import db_manager
+    if not data.smtp_password:
+        data.smtp_password = db_manager.get_system_setting('smtp_password') or ''
     to = data.to.strip()
     if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', to):
         return {'success': False, 'message': '请输入正确的收件邮箱地址'}
@@ -5327,6 +5323,8 @@ def delete_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current
             raise HTTPException(status_code=404, detail="卡券不存在")
     except HTTPException:
         raise
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5621,13 +5619,22 @@ def export_backup(current_user: Dict[str, Any] = Depends(get_current_user)):
 @app.post("/backup/import")
 def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = Depends(get_current_user)):
     """导入用户备份"""
+    from app import cookie_manager
+    from app.db_manager import db_manager
+    manager=cookie_manager.manager
+    if manager:
+        for cid in db_manager.get_all_cookies(current_user['user_id']):
+            if manager.get_task_state(cid) in ('running','connecting'):
+                raise HTTPException(409, '导入前请先暂停自己的账号任务；当前数据未改变')
     try:
         # 验证文件类型
         if not file.filename.endswith('.json'):
             raise HTTPException(status_code=400, detail="只支持JSON格式的备份文件")
 
         # 读取文件内容
-        content = file.file.read()
+        content = file.file.read(20 * 1024 * 1024 + 1)
+        if len(content) > 20 * 1024 * 1024:
+            raise HTTPException(413, '备份文件不能超过20MB')
         backup_data = json.loads(content.decode('utf-8'))
 
         # 导入备份到当前用户
@@ -6013,18 +6020,18 @@ def save_item_delivery_config(
 # ==================== 商品搜索 API ====================
 
 class ItemSearchRequest(BaseModel):
-    keyword: str
-    page: int = 1
-    page_size: int = 20
+    keyword: str = Field(min_length=1, max_length=100)
+    page: int = Field(default=1, ge=1, le=10)
+    page_size: int = Field(default=20, ge=1, le=50)
 
 class ItemSearchMultipleRequest(BaseModel):
-    keyword: str
-    total_pages: int = 1
+    keyword: str = Field(min_length=1, max_length=100)
+    total_pages: int = Field(default=1, ge=1, le=3)
 
 @app.post("/items/search")
 async def search_items(
     search_request: ItemSearchRequest,
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """搜索闲鱼商品"""
     user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】" if current_user else "【未登录】"
@@ -6033,13 +6040,15 @@ async def search_items(
         logger.info(f"{user_info} 开始单页搜索: 关键词='{search_request.keyword}', 页码={search_request.page}, 每页={search_request.page_size}")
 
         from utils.item_search import search_xianyu_items
+        from app.services.search_guard import run_search
 
         # 执行搜索
-        result = await search_xianyu_items(
+        result = await run_search(current_user['user_id'], lambda: search_xianyu_items(
             keyword=search_request.keyword,
             page=search_request.page,
-            page_size=search_request.page_size
-        )
+            page_size=search_request.page_size,
+            owner_user_id=current_user['user_id']
+        ))
 
         # 检查是否有错误
         has_error = result.get("error")
@@ -6065,6 +6074,8 @@ async def search_items(
 
         return response_data
 
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f"{user_info} 商品搜索失败: {error_msg}")
@@ -6122,7 +6133,7 @@ async def check_valid_cookies(
 @app.post("/items/search_multiple")
 async def search_multiple_pages(
     search_request: ItemSearchMultipleRequest,
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """搜索多页闲鱼商品"""
     user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】" if current_user else "【未登录】"
@@ -6131,12 +6142,14 @@ async def search_multiple_pages(
         logger.info(f"{user_info} 开始多页搜索: 关键词='{search_request.keyword}', 页数={search_request.total_pages}")
 
         from utils.item_search import search_multiple_pages_xianyu
+        from app.services.search_guard import run_search
 
         # 执行多页搜索
-        result = await search_multiple_pages_xianyu(
+        result = await run_search(current_user['user_id'], lambda: search_multiple_pages_xianyu(
             keyword=search_request.keyword,
-            total_pages=search_request.total_pages
-        )
+            total_pages=search_request.total_pages,
+            owner_user_id=current_user['user_id']
+        ))
 
         # 检查是否有错误
         has_error = result.get("error")
@@ -6162,6 +6175,8 @@ async def search_multiple_pages(
 
         return response_data
 
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f"{user_info} 多页商品搜索失败: {error_msg}")
@@ -6860,11 +6875,7 @@ class PasswordResetIn(BaseModel):
 
 
 def _revoke_user_tokens(user_id: int) -> int:
-    """吊销某用户的全部在线会话。禁用账号、重置密码后立即生效，防止旧 token 继续操作。"""
-    revoked = [token for token, data in SESSION_TOKENS.items() if data.get('user_id') == user_id]
-    for token in revoked:
-        SESSION_TOKENS.pop(token, None)
-    return len(revoked)
+    return SESSION_TOKENS.revoke_user(user_id)
 
 
 @app.patch('/admin/users/{user_id}/status')
@@ -6974,6 +6985,9 @@ def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin
 
         log_with_user('info', f"准备删除用户: {user_to_delete['username']} (ID: {user_id})", admin_user)
 
+        if cookie_manager.manager:
+            for cid in list(db_manager.get_all_cookies(user_id)):
+                cookie_manager.manager.remove_cookie(cid)
         # 删除用户及其相关数据
         success = db_manager.delete_user_and_data(user_id)
 
@@ -7071,66 +7085,11 @@ def get_admin_cookies(admin_user: Dict[str, Any] = Depends(require_admin)):
 
 @app.get('/admin/logs')
 def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
-                   lines: int = 100,
-                   level: str = None):
-    """获取系统日志（管理员专用）"""
-    import os
-    import glob
+                    lines: int = 100, level: str = None):
+    collector = get_file_log_collector()
+    return {'success': True, 'logs': collector.get_logs(lines=max(1,min(lines,2000)), level=level),
+            'source': 'application.log'}
 
-    try:
-        log_with_user('info', f"查询系统日志，行数: {lines}, 级别: {level}", admin_user)
-
-        # 查找日志文件
-        log_files = glob.glob("logs/xianyu_*.log")
-        logger.info(f"找到日志文件: {log_files}")
-
-        if not log_files:
-            logger.warning("未找到日志文件")
-            return {"logs": [], "message": "未找到日志文件", "success": False}
-
-        # 获取最新的日志文件
-        latest_log_file = max(log_files, key=os.path.getctime)
-        logger.info(f"使用最新日志文件: {latest_log_file}")
-
-        logs = []
-        try:
-            with open(latest_log_file, 'r', encoding='utf-8') as f:
-                all_lines = f.readlines()
-                logger.info(f"读取到 {len(all_lines)} 行日志")
-
-                # 如果指定了日志级别，进行过滤
-                if level:
-                    filtered_lines = [line for line in all_lines if f"| {level.upper()} |" in line]
-                    logger.info(f"按级别 {level} 过滤后剩余 {len(filtered_lines)} 行")
-                else:
-                    filtered_lines = all_lines
-
-                # 获取最后N行
-                recent_lines = filtered_lines[-lines:] if len(filtered_lines) > lines else filtered_lines
-                logger.info(f"取最后 {len(recent_lines)} 行日志")
-
-                for line in recent_lines:
-                    logs.append(line.strip())
-
-        except Exception as e:
-            logger.error(f"读取日志文件失败: {str(e)}")
-            log_with_user('error', f"读取日志文件失败: {str(e)}", admin_user)
-            return {"logs": [], "message": f"读取日志文件失败: {str(e)}", "success": False}
-
-        log_with_user('info', f"返回日志记录 {len(logs)} 条", admin_user)
-        logger.info(f"成功返回 {len(logs)} 条日志记录")
-
-        return {
-            "logs": logs,
-            "log_file": latest_log_file,
-            "total_lines": len(logs),
-            "success": True
-        }
-
-    except Exception as e:
-        logger.error(f"获取系统日志失败: {str(e)}")
-        log_with_user('error', f"获取系统日志失败: {str(e)}", admin_user)
-        return {"logs": [], "message": f"获取系统日志失败: {str(e)}", "success": False}
 
 @app.get('/admin/log-files')
 def list_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
@@ -7521,150 +7480,45 @@ def get_item_reply(cookie_id: str, item_id: str, current_user: Dict[str, Any] = 
 
 @app.get('/admin/backup/download')
 def download_database_backup(admin_user: Dict[str, Any] = Depends(require_admin)):
-    """下载数据库备份文件（管理员专用）"""
-    import os
+    from app.services.database_snapshot import snapshot
     from fastapi.responses import FileResponse
-    from datetime import datetime
-
+    from starlette.background import BackgroundTask
+    import tempfile
+    descriptor, name = tempfile.mkstemp(prefix='xianyu-export-', suffix='.db')
+    os.close(descriptor)
     try:
-        log_with_user('info', "请求下载数据库备份", admin_user)
+        snapshot(db_manager.db_path, name)
+        return FileResponse(name, filename='xianyu-snapshot.db', media_type='application/octet-stream',
+                            background=BackgroundTask(os.unlink, name))
+    except Exception:
+        Path(name).unlink(missing_ok=True)
+        raise HTTPException(500, '数据库快照创建失败') from None
 
-        # 使用db_manager的实际数据库路径
-        from app.db_manager import db_manager
-        db_file_path = db_manager.db_path
-
-        # 检查数据库文件是否存在
-        if not os.path.exists(db_file_path):
-            log_with_user('error', f"数据库文件不存在: {db_file_path}", admin_user)
-            raise HTTPException(status_code=404, detail="数据库文件不存在")
-
-        # 生成带时间戳的文件名
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        download_filename = f"xianyu_backup_{timestamp}.db"
-
-        log_with_user('info', f"开始下载数据库备份: {download_filename}", admin_user)
-
-        return FileResponse(
-            path=db_file_path,
-            filename=download_filename,
-            media_type='application/octet-stream'
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log_with_user('error', f"下载数据库备份失败: {str(e)}", admin_user)
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post('/admin/backup/upload')
-async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_admin),
-                                backup_file: UploadFile = File(...)):
-    """上传并恢复数据库备份文件（管理员专用）"""
-    import os
-    import shutil
-    import sqlite3
-    from datetime import datetime
-
+async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_admin), backup_file: UploadFile = File(...)):
+    from app.services.database_snapshot import validate_backup
+    if not (backup_file.filename or '').endswith('.db'):
+        raise HTTPException(400, '只支持.db数据库备份')
+    content = await backup_file.read(100 * 1024 * 1024 + 1)
+    if len(content) > 100 * 1024 * 1024:
+        raise HTTPException(413, '备份不能超过100MB')
+    directory = Path(db_manager.db_path).resolve().parent / 'pending_restore'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    path = directory / (secrets.token_hex(12) + '.db')
     try:
-        log_with_user('info', f"开始上传数据库备份: {backup_file.filename}", admin_user)
+        with open(path, 'xb') as output:
+            os.chmod(path, 0o600)
+            output.write(content)
+        validate_backup(path)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise HTTPException(400, '备份无效或结构不兼容') from None
+    return {'success': True, 'requires_restart': True,
+            'message': '备份已校验并暂存。请先停止服务，再运行离线恢复命令；当前数据未改变。',
+            'staged_file': str(path),
+            'restore_command': 'python scripts/restore_database.py --file ' + shlex.quote(str(path))}
 
-        # 验证文件类型
-        if not backup_file.filename.endswith('.db'):
-            log_with_user('warning', f"无效的备份文件类型: {backup_file.filename}", admin_user)
-            raise HTTPException(status_code=400, detail="只支持.db格式的数据库文件")
-
-        # 验证文件大小（限制100MB）
-        content = await backup_file.read()
-        if len(content) > 100 * 1024 * 1024:  # 100MB
-            log_with_user('warning', f"备份文件过大: {len(content)} bytes", admin_user)
-            raise HTTPException(status_code=400, detail="备份文件大小不能超过100MB")
-
-        # 验证是否为有效的SQLite数据库文件
-        temp_file_path = f"temp_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-
-        try:
-            # 保存临时文件
-            with open(temp_file_path, 'wb') as temp_file:
-                temp_file.write(content)
-
-            # 验证数据库文件完整性
-            conn = sqlite3.connect(temp_file_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = cursor.fetchall()
-            conn.close()
-
-            # 检查是否包含必要的表
-            table_names = [table[0] for table in tables]
-            required_tables = ['users', 'cookies']  # 最基本的表
-
-            missing_tables = [table for table in required_tables if table not in table_names]
-            if missing_tables:
-                log_with_user('warning', f"备份文件缺少必要的表: {missing_tables}", admin_user)
-                raise HTTPException(status_code=400, detail=f"备份文件不完整，缺少表: {', '.join(missing_tables)}")
-
-            log_with_user('info', f"备份文件验证通过，包含 {len(table_names)} 个表", admin_user)
-
-        except sqlite3.Error as e:
-            log_with_user('error', f"备份文件验证失败: {str(e)}", admin_user)
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-            raise HTTPException(status_code=400, detail="无效的数据库文件")
-
-        # 备份当前数据库
-        from app.db_manager import db_manager
-        current_db_path = db_manager.db_path
-
-        # 生成备份文件路径（与原数据库在同一目录）
-        db_dir = os.path.dirname(current_db_path)
-        backup_filename = f"xianyu_data_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        backup_current_path = os.path.join(db_dir, backup_filename)
-
-        if os.path.exists(current_db_path):
-            shutil.copy2(current_db_path, backup_current_path)
-            log_with_user('info', f"当前数据库已备份为: {backup_current_path}", admin_user)
-
-        # 关闭当前数据库连接
-        if hasattr(db_manager, 'conn') and db_manager.conn:
-            db_manager.conn.close()
-            log_with_user('info', "已关闭当前数据库连接", admin_user)
-
-        # 替换数据库文件
-        shutil.move(temp_file_path, current_db_path)
-        log_with_user('info', f"数据库文件已替换: {current_db_path}", admin_user)
-
-        # 重新初始化数据库连接（使用原有的db_path）
-        db_manager.__init__(db_manager.db_path)
-        log_with_user('info', "数据库连接已重新初始化", admin_user)
-
-        # 验证新数据库
-        try:
-            test_users = db_manager.get_all_users()
-            log_with_user('info', f"数据库恢复成功，包含 {len(test_users)} 个用户", admin_user)
-        except Exception as e:
-            log_with_user('error', f"数据库恢复后验证失败: {str(e)}", admin_user)
-            # 如果验证失败，尝试恢复原数据库
-            if os.path.exists(backup_current_path):
-                shutil.copy2(backup_current_path, current_db_path)
-                db_manager.__init__()
-                log_with_user('info', "已恢复原数据库", admin_user)
-            raise HTTPException(status_code=500, detail="数据库恢复失败，已回滚到原数据库")
-
-        return {
-            "success": True,
-            "message": "数据库恢复成功",
-            "backup_file": backup_current_path,
-            "user_count": len(test_users)
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log_with_user('error', f"上传数据库备份失败: {str(e)}", admin_user)
-        # 清理临时文件
-        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get('/admin/backup/list')
 def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):
@@ -7676,8 +7530,8 @@ def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):
     try:
         log_with_user('info', "查询备份文件列表", admin_user)
 
-        # 查找备份文件（在data目录中）
-        backup_files = glob.glob("data/xianyu_data_backup_*.db")
+        # 跟随实际数据库目录，兼容 DB_PATH 自定义部署。
+        backup_files = glob.glob(str(Path(db_manager.db_path).resolve().parent / 'xianyu_data_backup_*.db'))
 
         backup_list = []
         for file_path in backup_files:
@@ -7901,6 +7755,40 @@ def update_item_multi_quantity_delivery(cookie_id: str, item_id: str, delivery_d
 
 
 # ==================== 订单管理接口 ====================
+
+@app.get('/delivery-attempts')
+def list_delivery_attempts(user=Depends(get_current_user)):
+    from app.services.delivery_ledger import list_pending
+    return {'data': list_pending(db_manager, user['user_id'])}
+
+
+class DeliveryReviewIn(BaseModel):
+    action: str
+    confirmed: bool = False
+
+
+@app.post('/delivery-attempts/{cookie_id}/{order_id}/review')
+def review_delivery(cookie_id: str, order_id: str, body: DeliveryReviewIn, user=Depends(get_current_user)):
+    from app.services.delivery_ledger import list_pending, finish, release_after_review
+    require_owned_account(cookie_id, user)
+    pending=next((row for row in list_pending(db_manager,user['user_id']) if row['cookie_id']==cookie_id and row['order_id']==order_id),None)
+    if not body.confirmed or not pending or not pending['reviewable']:
+        raise HTTPException(409, '请先核对实际送达情况；执行中的发货不能处理')
+    try:
+        if body.action=='delivered':
+            finish(db_manager,cookie_id,order_id,completed=True)
+        elif body.action=='release':
+            release_after_review(db_manager,cookie_id,order_id)
+            from XianyuAutoAsync import XianyuLive
+            instance = XianyuLive.get_instance(cookie_id)
+            if instance:
+                instance.delivery_blocked_orders.discard(order_id)
+                instance.last_delivery_time.pop(order_id, None)
+        else:raise ValueError('不支持的处理方式')
+    except ValueError as error:
+        raise HTTPException(409,str(error)) from None
+    return {'success': True, 'message': '已记录核查结果，未发送任何消息'}
+
 
 @app.get('/api/orders')
 def get_user_orders(
@@ -8603,6 +8491,8 @@ async def manual_ship_orders(
 
         # 遍历每个订单
         for order_id in order_ids:
+            delivery_context = {}
+            cookie_id = None
             try:
                 # 获取订单信息
                 order = db_manager.get_order_by_id(order_id)
@@ -8657,6 +8547,7 @@ async def manual_ship_orders(
 
                     try:
                         async with aiohttp.ClientSession(
+                            trust_env=False,
                             headers={'cookie': cookies_str},
                             timeout=aiohttp.ClientTimeout(total=30)
                         ) as session:
@@ -8880,6 +8771,8 @@ async def manual_ship_orders(
                                 confirm_error = str(e)
 
                         live_instance.mark_delivery_sent(order_id, update_order_status=platform_confirmed)
+                        from app.services.delivery_ledger import finish
+                        finish(db_manager, cookie_id, order_id, completed=True, token=delivery_context.get('attempt_token'))
                         update_values = {
                             'order_id': order_id,
                             'system_shipped': True
@@ -8936,6 +8829,11 @@ async def manual_ship_orders(
                 })
                 failed_count += 1
                 log_with_user('error', f"发货订单 {order_id} 时发生异常: {str(e)}", current_user)
+
+            finally:
+                if cookie_id and delivery_context.get('attempt_token'):
+                    from app.services.delivery_ledger import finish
+                    finish(db_manager, cookie_id, order_id, token=delivery_context['attempt_token'])
 
         log_with_user('info', f"手动发货完成: 成功{success_count}个, 失败{failed_count}个", current_user)
 
@@ -9509,7 +9407,7 @@ async def get_fresh_captcha_url(
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=False) as session:
             async with session.post(
                 API_ENDPOINTS.get('token'),
                 params=params, data={'data': data_value}, headers=headers,

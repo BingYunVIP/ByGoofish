@@ -78,7 +78,7 @@ export const changePassword = async (currentPassword: string, newPassword: strin
 };
 
 // Accounts
-export const getAccountDetails = async (): Promise<AccountDetail[]> => {
+const fetchAccountDetails = async (): Promise<AccountDetail[]> => {
   // 只发一次请求。原实现拿到账号列表后，再逐个请求 /cookie/{id}/details 补
   // username/password/show_browser —— 而列表接口内部本来就查了同一份详情，
   // 等于对同一份数据做 N+1。页面上有 7 处组件各自调用本函数，账号一多首屏
@@ -87,7 +87,10 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
   return data.map(item => ({
     id: item.id,
     value: item.value,
-    cookie: item.value,
+    cookie: '',
+    cookie_configured: item.cookie_configured,
+    cookie_length: item.cookie_length,
+    login_password_configured: item.login_password_configured,
     enabled: item.enabled,
     auto_confirm: item.auto_confirm,
     remark: item.remark,
@@ -108,11 +111,24 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
   })) as AccountDetail[];
 };
 
+let accountRequest: { token: string | null; promise: Promise<AccountDetail[]> } | undefined;
+export const getAccountDetails = (): Promise<AccountDetail[]> => {
+  const token = localStorage.getItem('auth_token');
+  if (accountRequest?.token === token) return accountRequest.promise;
+  const promise = fetchAccountDetails();
+  accountRequest = { token, promise };
+  void promise.finally(() => { if (accountRequest?.promise === promise) accountRequest = undefined; }).catch(() => {});
+  return promise;
+};
+
+export const rotateAccountApiKey = (cookieId: string): Promise<{ api_key: string; message: string }> =>
+  post(`/cookies/${encodeURIComponent(cookieId)}/api-key`);
+
 export const refreshAccountProfile = async (id: string): Promise<{ success: boolean; profile?: Partial<AccountDetail> }> => {
   return post(`/cookies/${id}/refresh-profile`);
 };
 
-export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string }> => {
+export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string; message?: string }> => {
   return post('/qr-login/generate');
 };
 
@@ -915,7 +931,7 @@ export const getSystemSettings = async (): Promise<SystemSettings> => {
 export const updateSystemSettings = async (settings: Partial<SystemSettings>): Promise<ApiResponse> => {
     // API expects individual PUTs, but we'll loop in the service for convenience or assume bulk endpoint if updated
     // Based on docs 12.2, we iterate.
-    const promises = Object.entries(settings).map(([key, value]) => {
+    const promises = Object.entries(settings).filter(([key]) => !key.endsWith('_configured') && key !== 'qq_reply_secret_key').map(([key, value]) => {
          return put(`/system-settings/${key}`, { value: String(value) });
     });
     await Promise.all(promises);
@@ -991,6 +1007,7 @@ export const getNotificationChannels = async (): Promise<{ success: boolean; dat
       name: item.name,
       type: item.type as NotificationChannelType,
       config: parsedConfig || {},
+      configured_fields: item.configured_fields || [],
       enabled: item.enabled,
       created_at: item.created_at,
       updated_at: item.updated_at,
@@ -1089,21 +1106,27 @@ export const deleteAccountNotifications = async (cookieId: string): Promise<ApiR
 
 export interface NotificationTestResponse {
   success: boolean;
-  message: string;
+  sent?: boolean;
+  skipped?: boolean;
+  mode?: 'event' | 'channel';
+  event_type?: string | null;
+  // 兼容升级前未返回文案、时间的后端，页面必须提供明确的兜底提示。
+  message?: string;
   request_id: string;
   channel: {
     id: number;
     name: string;
     type: NotificationChannelType;
   };
-  sent_at: string;
+  sent_at?: string;
   duration_ms?: number;
 }
 
 export const testMessageNotification = async (
   ruleId: string | number,
+  options: { mode: 'event' | 'channel'; event_type?: string; confirm_channel_send?: boolean },
 ): Promise<NotificationTestResponse> => {
-  return post(`/message-notifications/rule/${ruleId}/test`);
+  return post(`/message-notifications/rule/${ruleId}/test`, options);
 }
 
 export const getRiskControlLogs = async (params: {

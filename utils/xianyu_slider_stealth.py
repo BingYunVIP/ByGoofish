@@ -22,6 +22,7 @@ from loguru import logger
 
 from utils import browser_limit
 from utils.user_agents import CHROME_UA
+from utils.direct_network import direct_browser_options
 
 # 滑块优先用 Patchright —— Playwright 的反检测分支，修掉了 CDP 层面的自动化痕迹。
 # 实测同一份 Chromium：Playwright 下 navigator.webdriver 为 true（最基础也最致命的
@@ -66,6 +67,7 @@ def find_chromium_executable() -> Optional[str]:
 
     # 只认完整版 Chromium：headless shell 缺少滑块页面需要的渲染能力
     candidates = (
+        'chrome-linux64/chrome',
         'chrome-linux/chrome',
         'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
         'chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
@@ -520,7 +522,7 @@ class XianyuSliderStealth:
                     user_data_dir,
                     channel='chrome',  # 系统安装的正式版 Chrome
                     headless=self.headless,
-                    args=launch_args,
+                    **direct_browser_options({'args': launch_args}),
                     **context_options,
                 )
                 self.browser = None  # 持久化模式下无独立 browser 句柄
@@ -547,7 +549,7 @@ class XianyuSliderStealth:
                     self.context = self.playwright.chromium.launch_persistent_context(
                         user_data_dir,
                         headless=self.headless,
-                        args=launch_args,
+                        **direct_browser_options({'args': launch_args}),
                         **fallback_options,
                     )
                     self.browser = None
@@ -563,7 +565,7 @@ class XianyuSliderStealth:
                     }
                     if executable_path:
                         launch_kwargs['executable_path'] = executable_path
-                    self.browser = self.playwright.chromium.launch(**launch_kwargs)
+                    self.browser = self.playwright.chromium.launch(**direct_browser_options(launch_kwargs))
                     if browser_features.get('user_agent'):
                         context_options['user_agent'] = browser_features['user_agent']
                     self.context = self.browser.new_context(**context_options)
@@ -3004,7 +3006,7 @@ class XianyuSliderStealth:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=not show_browser,
-                args=browser_args,
+                **direct_browser_options({'args': browser_args}),
                 viewport={'width': 1980, 'height': 1024},
                 user_agent=CHROME_UA,
                 locale='zh-CN',  # 设置浏览器区域为中文

@@ -44,6 +44,13 @@ class ChromiumDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(found, str(newest))
 
+    def test_finds_current_chrome_for_testing_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = self._make_install(root, "1223", "chrome-linux64/chrome")
+            with patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": str(root)}):
+                self.assertEqual(slider.find_chromium_executable(), str(expected))
+
     def test_ignores_headless_shell_only_install(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -94,7 +101,7 @@ class StealthEngineSelectionTests(unittest.TestCase):
             slider.concurrency_manager.unregister_instance(instance.user_id)
 
     def test_patchright_import_is_declared_in_requirements(self):
-        text = Path("requirements.txt").read_text(encoding="utf-8")
+        text = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")
         self.assertIn("patchright", text)
 
 

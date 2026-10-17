@@ -25,6 +25,7 @@ class ImageUploader:
             connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
             timeout = aiohttp.ClientTimeout(total=30)
             self.session = aiohttp.ClientSession(
+                trust_env=False,
                 connector=connector,
                 timeout=timeout,
                 headers={

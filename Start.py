@@ -9,6 +9,10 @@ import os
 import sys
 import shutil
 from pathlib import Path
+from app.runtime import acquire_runtime_lock
+acquire_runtime_lock()
+from app.logging_setup import configure_logging
+configure_logging()
 
 # 设置标准输出编码为UTF-8（Windows兼容）
 def _setup_console_encoding():
@@ -142,525 +146,45 @@ except Exception as e:
     print(f"{_WARN} 数据库迁移检查失败: {e}")
     # 继续启动，因为可能是首次运行
 
-# ==================== 检查并安装Playwright浏览器 ====================
-def _check_and_install_playwright():
-    """检查Playwright浏览器是否存在，如果不存在则自动安装"""
-    print("检查Playwright浏览器...")
-
-    # 预置 Chromium 下载镜像。官方 CDN 在国内常年连接被重置或超时，
-    # playwright 重试三次后就放弃，用户只会看到一堆 ECONNRESET，
-    # 结果是滑块验证和扫码登录全部不可用。用户已自行设置时不覆盖。
-    if not os.getenv('PLAYWRIGHT_DOWNLOAD_HOST'):
-        os.environ['PLAYWRIGHT_DOWNLOAD_HOST'] = 'https://cdn.npmmirror.com/binaries/playwright'
-    
-    # 检查是否安装了playwright模块
-    try:
-        pass
-    except ImportError:
-        print(f"{_WARN} Playwright模块未安装，跳过浏览器检查")
-        return False
-    
-    # 检查Playwright浏览器是否存在
-    playwright_installed = False
-    possible_paths = []
-    
-    # 如果是打包后的exe，优先检查exe同目录
+# ==================== Playwright 离线环境自检 ====================
+# 依赖安装交给部署阶段：服务启动时不下载、不换镜像、不修改共享缓存。
+# 用本解释器要求的实际浏览器做自检，不能把其他 Node 项目的旧版本误认成可用。
+try:
     if getattr(sys, 'frozen', False):
-        exe_dir = Path(sys.executable).parent
-        playwright_dir = exe_dir / 'playwright'
-        possible_paths.insert(0, playwright_dir)  # 插入到最前面，优先检查
-        
-        # 检查exe同目录的浏览器是否完整
-        if playwright_dir.exists():
-            chromium_dirs = list(playwright_dir.glob('chromium-*'))
-            if chromium_dirs:
-                chromium_dir = chromium_dirs[0]
-                chrome_exe = chromium_dir / 'chrome-win' / 'chrome.exe'
-                if chrome_exe.exists() and chrome_exe.stat().st_size > 0:
-                    print(f"{_OK} 找到已提取的Playwright浏览器: {chrome_exe}")
-                    print(f"{_INFO} 浏览器版本: {chromium_dir.name}")
-                    # 清除可能存在的旧环境变量，使用实际存在的浏览器
-                    if 'PLAYWRIGHT_BROWSERS_PATH' in os.environ:
-                        old_path = os.environ['PLAYWRIGHT_BROWSERS_PATH']
-                        if old_path != str(playwright_dir):
-                            print(f"{_INFO} 清除旧的环境变量: {old_path}")
-                            del os.environ['PLAYWRIGHT_BROWSERS_PATH']
-                    # 确保环境变量已设置
-                    os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(playwright_dir)
-                    print(f"{_INFO} 已设置PLAYWRIGHT_BROWSERS_PATH: {playwright_dir}")
-                    playwright_installed = True
-                    return True
-    
-    # 镜像和自定义安装都靠这个环境变量指定浏览器位置（容器里是 /ms-playwright）。
-    # 不先看它就会一路找不到，最后靠"真的启动一次浏览器"来判断有没有装，
-    # 在低配设备上这一次多余的冷启动就够把内存顶到 OOM。
-    env_browsers_path = os.getenv('PLAYWRIGHT_BROWSERS_PATH')
-    if env_browsers_path and env_browsers_path not in ('0', 'false'):
-        possible_paths.append(Path(env_browsers_path))
-
-    # Windows上的常见位置
-    if sys.platform == 'win32':
-        # 用户缓存目录
-        user_cache = Path.home() / '.cache' / 'ms-playwright'
-        possible_paths.append(user_cache)
-
-        # LocalAppData目录
-        local_appdata = os.getenv('LOCALAPPDATA')
-        if local_appdata:
-            possible_paths.append(Path(local_appdata) / 'ms-playwright')
-
-        # AppData目录
-        appdata = os.getenv('APPDATA')
-        if appdata:
-            possible_paths.append(Path(appdata) / 'ms-playwright')
-    elif sys.platform == 'darwin':
-        possible_paths.append(Path.home() / 'Library' / 'Caches' / 'ms-playwright')
-    else:
-        possible_paths.append(Path.home() / '.cache' / 'ms-playwright')
-
-    # 各平台的浏览器可执行文件相对路径。
-    # 新版 Playwright 在 macOS 上改用 Chrome for Testing，旧版是 Chromium。
-    browser_exe_candidates = (
-        Path('chrome-win') / 'chrome.exe',
-        Path('chrome-mac') / 'Chromium.app' / 'Contents' / 'MacOS' / 'Chromium',
-        Path('chrome-mac-arm64') / 'Chromium.app' / 'Contents' / 'MacOS' / 'Chromium',
-        Path('chrome-mac') / 'Google Chrome for Testing.app' / 'Contents' / 'MacOS' / 'Google Chrome for Testing',
-        Path('chrome-mac-arm64') / 'Google Chrome for Testing.app' / 'Contents' / 'MacOS' / 'Google Chrome for Testing',
-        Path('chrome-linux') / 'chrome',
-    )
-
-    # 检查是否存在chromium浏览器
-    for path in possible_paths:
-        if path.exists():
-            # 查找chromium目录
-            # 同时认 chromium-* 和 chromium_headless_shell-*：两者分开下载，
-            # 只装上其中一个时不该判定为「没装」，否则会误导后续处理。
-            chromium_dirs = list(path.glob('chromium-*')) + list(path.glob('chromium_headless_shell-*'))
-            if chromium_dirs:
-                for chromium_dir in chromium_dirs:
-                    for relative_exe in browser_exe_candidates:
-                        browser_exe = chromium_dir / relative_exe
-                        if browser_exe.exists():
-                            print(f"{_OK} 找到Playwright浏览器: {browser_exe}")
-                            # 设置环境变量
-                            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(path)
-                            playwright_installed = True
-                            break
-                    if playwright_installed:
-                        break
-                if playwright_installed:
-                    break
-    
-    # 如果没找到，尝试使用playwright命令检查
-    if not playwright_installed:
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                try:
-                    browser = p.chromium.launch(headless=True)
-                    browser.close()
-                    print(f"{_OK} Playwright浏览器已安装（通过API检测）")
-                    playwright_installed = True
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    
-    # 如果没找到，先尝试从临时目录提取（如果是打包的exe）
-    if not playwright_installed and getattr(sys, 'frozen', False):
-        try:
-            exe_dir = Path(sys.executable).parent
-            playwright_dir = exe_dir / 'playwright'
-            
-            if hasattr(sys, '_MEIPASS'):
-                temp_dir = Path(sys._MEIPASS)
-                temp_playwright = temp_dir / 'playwright'
-                
-                if temp_playwright.exists():
-                    # 查找所有 chromium 相关目录（包括 chromium-* 和 chromium_headless_shell-*）
-                    temp_chromium_dirs = list(temp_playwright.glob('chromium*'))
-                    if temp_chromium_dirs:
-                        print(f"{_INFO} 检测到打包的浏览器文件，正在提取...")
-                        playwright_dir.mkdir(parents=True, exist_ok=True)
-                        extracted_count = 0
-                        
-                        for temp_chromium_dir in temp_chromium_dirs:
-                            temp_chrome_win = temp_chromium_dir / 'chrome-win'
-                            
-                            # 检查完整版或 headless_shell 版
-                            temp_chrome_exe = temp_chrome_win / 'chrome.exe'
-                            temp_headless_exe = temp_chrome_win / 'headless_shell.exe'
-                            
-                            # 验证文件是否存在
-                            is_valid = False
-                            if temp_chromium_dir.name.startswith('chromium_headless_shell'):
-                                is_valid = temp_headless_exe.exists() and temp_headless_exe.stat().st_size > 0
-                            else:
-                                is_valid = temp_chrome_exe.exists() and temp_chrome_exe.stat().st_size > 0
-                            
-                            if is_valid:
-                                target_chromium_dir = playwright_dir / temp_chromium_dir.name
-                                
-                                if not target_chromium_dir.exists():
-                                    try:
-                                        shutil.copytree(temp_chromium_dir, target_chromium_dir, dirs_exist_ok=True)
-                                        
-                                        # 验证提取的文件
-                                        if temp_chromium_dir.name.startswith('chromium_headless_shell'):
-                                            target_exe = target_chromium_dir / 'chrome-win' / 'headless_shell.exe'
-                                        else:
-                                            target_exe = target_chromium_dir / 'chrome-win' / 'chrome.exe'
-                                        
-                                        if target_exe.exists() and target_exe.stat().st_size > 0:
-                                            print(f"{_OK} 浏览器文件提取成功: {target_exe}")
-                                            print(f"{_INFO} 浏览器版本: {temp_chromium_dir.name}")
-                                            extracted_count += 1
-                                    except Exception as e:
-                                        print(f"{_WARN} 提取 {temp_chromium_dir.name} 失败: {e}")
-                        
-                        if extracted_count > 0:
-                            # 清除可能存在的旧环境变量
-                            if 'PLAYWRIGHT_BROWSERS_PATH' in os.environ:
-                                old_path = os.environ['PLAYWRIGHT_BROWSERS_PATH']
-                                print(f"{_INFO} 清除旧的环境变量: {old_path}")
-                                del os.environ['PLAYWRIGHT_BROWSERS_PATH']
-                            # 设置新的环境变量
-                            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(playwright_dir)
-                            print(f"{_INFO} 已提取 {extracted_count} 个浏览器版本")
-                            print(f"{_INFO} 已设置PLAYWRIGHT_BROWSERS_PATH: {playwright_dir}")
-                            playwright_installed = True
-                            return True
-        except Exception as e:
-            print(f"{_WARN} 提取浏览器文件时出错: {e}")
-
-    # 运行时支持通过 executable_path 回退到系统浏览器，无需阻塞启动下载 Chromium。
-    if not playwright_installed and sys.platform == 'win32':
-        system_browser_candidates = [
-            Path(os.environ.get('PROGRAMFILES', r'C:\Program Files')) / 'Google/Chrome/Application/chrome.exe',
-            Path(os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)')) / 'Google/Chrome/Application/chrome.exe',
-            Path(os.environ.get('PROGRAMFILES', r'C:\Program Files')) / 'Microsoft/Edge/Application/msedge.exe',
-            Path(os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)')) / 'Microsoft/Edge/Application/msedge.exe',
-        ]
-        for browser_path in system_browser_candidates:
-            if browser_path.is_file():
-                print(f"{_OK} Playwright Chromium未安装，将使用系统浏览器: {browser_path}")
-                return True
-    
-    # 如果没找到，尝试安装
-    if not playwright_installed:
-        print(f"{_WARN} 未找到Playwright浏览器，正在自动安装...")
-        print("   这可能需要几分钟时间，请耐心等待...")
-        
-        try:
-            # 方法1: 尝试使用playwright的Python API安装（推荐，适用于打包后的exe）
-            try:
-                # 直接调用playwright的安装函数
-                from playwright._impl._driver import install_driver, install_browsers
-                print("   正在安装Playwright驱动...")
-                install_driver()
-                print("   正在安装Chromium浏览器...")
-                install_browsers(['chromium'])
-                print(f"{_OK} Playwright浏览器安装成功（通过API）")
-                playwright_installed = True
-            except ImportError:
-                # 如果API不可用，使用命令行方式
-                print("   使用命令行方式安装...")
-                import subprocess
-                
-                # 尝试使用playwright的安装命令
-                # 对于打包后的exe，playwright模块应该已经包含
-                creation_flags = 0
-                if sys.platform == 'win32' and hasattr(subprocess, 'CREATE_NO_WINDOW'):
-                    creation_flags = subprocess.CREATE_NO_WINDOW
-                
-                result = subprocess.run(
-                    [sys.executable, '-m', 'playwright', 'install', 'chromium'],
-                    capture_output=True,
-                    text=True,
-                    timeout=600,  # 10分钟超时
-                    creationflags=creation_flags
-                )
-                
-                if result.returncode == 0:
-                    print(f"{_OK} Playwright浏览器安装成功")
-                    playwright_installed = True
-                else:
-                    print(f"{_WARN} Playwright浏览器安装失败")
-                    if result.stdout:
-                        print(f"   输出: {result.stdout[-500:]}")  # 只显示最后500字符
-                    if result.stderr:
-                        print(f"   错误: {result.stderr[-500:]}")
-                    print("   您可以稍后手动运行: playwright install chromium")
-                    return False
-            except Exception as api_error:
-                # API安装失败，尝试命令行方式
-                print(f"   API安装失败，尝试命令行方式: {api_error}")
-                import subprocess
-                
-                creation_flags = 0
-                if sys.platform == 'win32' and hasattr(subprocess, 'CREATE_NO_WINDOW'):
-                    creation_flags = subprocess.CREATE_NO_WINDOW
-                
-                result = subprocess.run(
-                    [sys.executable, '-m', 'playwright', 'install', 'chromium'],
-                    capture_output=True,
-                    text=True,
-                    timeout=600,
-                    creationflags=creation_flags
-                )
-                
-                if result.returncode == 0:
-                    print(f"{_OK} Playwright浏览器安装成功（通过命令行）")
-                    playwright_installed = True
-                else:
-                    print(f"{_WARN} Playwright浏览器安装失败")
-                    if result.stdout:
-                        print(f"   输出: {result.stdout[-500:]}")
-                    if result.stderr:
-                        print(f"   错误: {result.stderr[-500:]}")
-                    print("   您可以稍后手动运行: playwright install chromium")
-                    return False
-            except ImportError:
-                # 如果playwright模块不可用，尝试使用subprocess
-                import subprocess
-                result = subprocess.run(
-                    [sys.executable, '-m', 'playwright', 'install', 'chromium'],
-                    capture_output=True,
-                    text=True,
-                    timeout=600,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' and hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-                )
-                
-                if result.returncode == 0:
-                    print(f"{_OK} Playwright浏览器安装成功")
-                    playwright_installed = True
-                else:
-                    print(f"{_WARN} Playwright浏览器安装失败")
-                    if result.stdout:
-                        print(f"   输出: {result.stdout}")
-                    if result.stderr:
-                        print(f"   错误: {result.stderr}")
-                    print("   您可以稍后手动运行: playwright install chromium")
-                    return False
-                
-        except subprocess.TimeoutExpired:
-            print(f"{_WARN} Playwright浏览器安装超时（超过10分钟）")
-            print("   您可以稍后手动运行: playwright install chromium")
-            return False
-        except Exception as e:
-            print(f"{_WARN} Playwright浏览器安装失败: {e}")
-            import traceback
-            print(f"   详细错误: {traceback.format_exc()}")
-            print("   您可以稍后手动运行: playwright install chromium")
-            return False
-    
-    return playwright_installed
-
-# 检查并安装Playwright浏览器
-try:
-    _check_and_install_playwright()
+        bundled_browsers = Path(sys.executable).parent / 'playwright'
+        if bundled_browsers.is_dir():
+            os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', str(bundled_browsers))
+    from utils.playwright_runtime import check_runtime, print_report
+    browser_report = check_runtime()
+    print_report(browser_report)
+    if browser_report['errors']:
+        print(f"{_WARN} 浏览器相关功能尚未就绪；二维码生成本身使用 HTTP API。")
 except Exception as e:
-    print(f"{_WARN} Playwright浏览器检查失败: {e}")
-    print("   程序将继续启动，但Playwright功能可能不可用")
-    # 继续启动，不影响主程序运行
+    print(f"{_WARN} 浏览器自检异常: {type(e).__name__}；请运行 scripts/playwright_doctor.py")
+
+# ==================== 验证已构建前端 ====================
+def _verify_frontend():
+    """启动只验证发布产物；构建和验收必须在部署前完成。"""
+    import re
+    static_dir = Path(os.getenv('APP_STATIC_DIR', 'static')).resolve()
+    index = static_dir / 'index.html'
+    if not index.is_file():
+        raise RuntimeError('缺少 static/index.html；请先在 frontend 执行 npm ci、npm run typecheck、npm run build')
+    refs = re.findall(r'(?:src|href)=[\"\']([^\"\']+)[\"\']', index.read_text(encoding='utf-8'))
+    assets = [ref for ref in refs if '/assets/' in ref and not ref.startswith(('http:', 'https:', '//'))]
+    if not assets:
+        raise RuntimeError('前端入口未引用构建资源，请重新构建并验收')
+    for ref in assets:
+        relative = ref.split('?', 1)[0].lstrip('/')
+        if relative.startswith('static/'):
+            relative = relative[len('static/'):]
+        target = (static_dir / relative).resolve()
+        if not target.is_relative_to(static_dir) or not target.is_file():
+            raise RuntimeError('前端构建资源不完整，请重新构建并验收')
+    print(f"{_OK} 已构建前端资源检查通过")
 
 
-def _verify_browser_launchable():
-    """启动时实际拉起一次浏览器，确认版本匹配。
-
-    仅检查目录存在是不够的：playwright 与 Chromium revision 强绑定，
-    版本不匹配时 launch 会报 "Executable doesn't exist"。此时滑块验证、
-    扫码登录、账号资料抓取会全部静默失效 —— 滑块处理在 0.3 秒内就崩掉，
-    看日志只会看到"验证失败"，很难联想到是浏览器问题。
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        print(f"{_WARN} 未安装 playwright，滑块验证与扫码登录将不可用")
-        _print_playwright_install_help()
-        return False
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            browser.close()
-        print(f"{_OK} 浏览器自检通过，滑块验证与扫码登录可用")
-        return True
-    except Exception as exc:
-        detail = str(exc)
-        print(f"{_ERROR} 浏览器无法启动，滑块验证与扫码登录将失效！")
-        if "Executable doesn't exist" in detail:
-            print("   原因：playwright 版本与已安装的 Chromium 不匹配")
-        else:
-            print(f"   详情：{detail[:200]}")
-        _print_playwright_install_help()
-        print("   注意：验证码处理失效会导致 Token 刷新持续失败并加剧平台风控")
-        return False
-
-
-def _print_playwright_install_help():
-    """打印安装命令，并带上国内镜像源。
-
-    Chromium 默认从 cdn.playwright.dev 下载，国内经常连接被重置或超时，
-    playwright 重试三次后就放弃，不会自己续传。直接给出换源后的命令，
-    省得用户对着一堆 ECONNRESET 无从下手。
-    """
-    mirror = 'https://cdn.npmmirror.com/binaries/playwright'
-    print("   安装浏览器（国内网络请连同第一行一起执行）：")
-    if sys.platform == 'win32':
-        print(f"     set PLAYWRIGHT_DOWNLOAD_HOST={mirror}")
-    else:
-        print(f"     export PLAYWRIGHT_DOWNLOAD_HOST={mirror}")
-    print("     python -m playwright install chromium")
-    print("   下载中断可重复执行，已下载的部分会保留。")
-
-
-try:
-    _verify_browser_launchable()
-except Exception as e:
-    print(f"{_WARN} 浏览器自检异常: {e}")
-
-# ==================== 自动构建前端 ====================
-def _build_frontend():
-    """自动安装依赖并构建前端"""
-    frontend_dir = Path("frontend")
-    static_dir = Path("static")
-
-    # 容器镜像在构建阶段就已经把前端产物放进 static/，运行时既没有 npm 也没有
-    # node_modules。这里再走一遍只会白等一次 npm 失败，低配设备上还要多花几十秒，
-    # 所以直接跳过。
-    if os.getenv('DOCKER_ENV', '').lower() in ('1', 'true', 'yes'):
-        print(f"{_INFO} 容器环境，前端已在镜像构建阶段生成，跳过构建")
-        return True
-
-    if not frontend_dir.exists():
-        print(f"{_WARN} frontend 目录不存在，跳过前端构建")
-        return False
-
-    build_dir = frontend_dir
-    print(f"{_INFO} 使用 frontend 目录作为前端源")
-    print("检查前端构建状态...")
-
-    need_build = False
-    index_html = static_dir / "index.html"
-
-    if not index_html.exists():
-        need_build = True
-        print(f"{_INFO} static/index.html 不存在，需要构建前端")
-    else:
-        # 必须在进入目录前剪枝：node_modules 动辄几万个文件，rglob 会先把它们
-        # 全部走一遍再过滤，在 NAS 的机械盘或 overlay 文件系统上能卡住好几分钟，
-        # 看起来就像"启动卡死、资源打满"。
-        ignored_dirs = {"node_modules", "dist", ".vite"}
-        latest_source_mtime = 0.0
-        for root, dirs, files in os.walk(build_dir):
-            dirs[:] = [d for d in dirs if d not in ignored_dirs]
-            for name in files:
-                try:
-                    mtime = os.stat(os.path.join(root, name)).st_mtime
-                except OSError:
-                    continue
-                if mtime > latest_source_mtime:
-                    latest_source_mtime = mtime
-
-        if latest_source_mtime > index_html.stat().st_mtime:
-            need_build = True
-            print(f"{_INFO} 前端源码比构建产物新，需要重新构建")
-        else:
-            print(f"{_OK} 前端构建产物是最新的，跳过")
-
-    # 如果不需要构建，直接返回
-    if not need_build:
-        return True
-
-    # 开始构建前端
-    print(f"{_INFO} 开始构建前端...")
-    print(f"   源目录: {build_dir}")
-    print(f"   1. 安装 npm 依赖...")
-
-    try:
-        import subprocess
-
-        # 设置 Windows 下的 subprocess 参数
-        creation_flags = 0
-        if sys.platform == 'win32' and hasattr(subprocess, 'CREATE_NO_WINDOW'):
-            creation_flags = subprocess.CREATE_NO_WINDOW
-
-        install_command = ['npm', 'ci'] if (build_dir / 'package-lock.json').exists() else ['npm', 'install']
-        install_label = ' '.join(install_command)
-
-        try:
-            result = subprocess.run(
-                install_command,
-                cwd=str(build_dir),
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5分钟超时
-                creationflags=creation_flags
-            )
-
-            if result.returncode == 0:
-                print(f"{_OK} npm 依赖安装成功")
-            else:
-                print(f"{_WARN} {install_label} 失败")
-                if result.stdout:
-                    print(f"   输出: {result.stdout[-500:]}")
-                if result.stderr:
-                    print(f"   错误: {result.stderr[-500:]}")
-                return False
-        except subprocess.TimeoutExpired:
-            print(f"{_WARN} {install_label} 超时（超过5分钟）")
-            return False
-        except FileNotFoundError:
-            print(f"{_WARN} 未找到 npm，请确保已安装 Node.js 和 npm")
-            print(f"   你可以手动运行: cd {build_dir} && npm install && npm run build")
-            return False
-        except Exception as e:
-            print(f"{_WARN} {install_label} 失败: {e}")
-            return False
-
-        # 2. npm run build
-        print(f"   2. 构建前端...")
-        try:
-            result = subprocess.run(
-                ['npm', 'run', 'build'],
-                cwd=str(build_dir),
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5分钟超时
-                creationflags=creation_flags
-            )
-
-            if result.returncode == 0:
-                print(f"{_OK} 前端构建成功")
-                return True
-            else:
-                print(f"{_WARN} npm run build 失败")
-                if result.stdout:
-                    print(f"   输出: {result.stdout[-500:]}")
-                if result.stderr:
-                    print(f"   错误: {result.stderr[-500:]}")
-                return False
-        except subprocess.TimeoutExpired:
-            print(f"{_WARN} npm run build 超时（超过5分钟）")
-            return False
-        except Exception as e:
-            print(f"{_WARN} npm run build 失败: {e}")
-            return False
-
-    except Exception as e:
-        print(f"{_WARN} 前端构建过程出错: {e}")
-        return False
-
-
-# 尝试构建前端
-try:
-    build_success = _build_frontend()
-    if not build_success:
-        print(f"{_WARN} 前端构建失败，程序将继续启动但前端可能不可用")
-except Exception as e:
-    print(f"{_WARN} 前端构建检查失败: {e}")
-    print("   程序将继续启动，但前端可能不可用")
+_verify_frontend()
 
 # ==================== 现在可以安全地导入其他模块 ====================
 import asyncio
@@ -720,8 +244,8 @@ def _start_api_server():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(server.serve())
-    except Exception as e:
-        logger.error(f"uvicorn服务器启动失败: {e}")
+    except BaseException as e:
+        logger.error(f"uvicorn服务器退出: {type(e).__name__}: {e}")
     finally:
         if loop is not None:
             if loop.is_running():
@@ -806,7 +330,8 @@ async def main():
 
     # 启动 API 服务线程
     print("启动 API 服务线程...")
-    threading.Thread(target=_start_api_server, daemon=True).start()
+    api_thread = threading.Thread(target=_start_api_server, daemon=True)
+    api_thread.start()
     print("API 服务线程已启动")
 
     # 启动数据库自动备份：全局一份，不随账号数量重复
@@ -815,7 +340,9 @@ async def main():
 
     # 阻塞保持运行
     print("主程序启动完成，保持运行...")
-    await asyncio.Event().wait()
+    while api_thread.is_alive():
+        await asyncio.sleep(1)
+    raise RuntimeError("API 服务线程已退出，停止账号任务并交由服务管理器处理")
 
 
 async def _db_backup_loop():

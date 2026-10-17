@@ -1,5 +1,12 @@
 #!/bin/sh
 set -eu
+umask 077
+for runtime_dir in /app/data /app/logs /app/static/uploads; do
+    if [ ! -w "$runtime_dir" ]; then
+        echo "[entrypoint] $runtime_dir 不可写。请在宿主机将挂载目录交给 UID/GID 10001，勿使用 chmod 777。"
+        exit 1
+    fi
+done
 
 # 滑块验证必须以有头模式跑：无头 Chrome 的 WebGL 渲染器、字体列表、
 # navigator.plugins 与屏幕参数和有头差异巨大，会被阿里 nc 直接识破

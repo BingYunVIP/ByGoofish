@@ -153,28 +153,9 @@ def log_captcha_event(cookie_id: str, event_type: str, success: bool = None, det
     except Exception as e:
         logger.error(f"记录滑块验证日志失败: {e}")
 
-# 日志配置
-log_dir = 'logs'
-os.makedirs(log_dir, exist_ok=True)
-log_path = os.path.join(log_dir, f"xianyu_{time.strftime('%Y-%m-%d')}.log")
-logger.remove()
-logger.configure(patcher=redact_log_record)
-logger.add(
-    log_path,
-    rotation=LOG_CONFIG.get('rotation', '1 day'),
-    retention=LOG_CONFIG.get('retention', '7 days'),
-    compression=LOG_CONFIG.get('compression', 'zip'),
-    level=LOG_CONFIG.get('level', 'DEBUG'),
-    format=LOG_CONFIG.get('format', '<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>'),
-    encoding='utf-8',
-    enqueue=True
-)
-logger.add(
-    sys.stdout,
-    level=LOG_CONFIG.get('level', 'DEBUG'),
-    format=LOG_CONFIG.get('format', '<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>'),
-    enqueue=True
-)
+# 日志由统一启动配置管理，不移除实时日志收集器。
+from app.logging_setup import configure_logging
+configure_logging()
 
 class XianyuLive:
     # 类级别的锁字典，为每个order_id维护一个锁（用于自动发货）
@@ -798,7 +779,7 @@ class XianyuLive:
 
         # Cookie刷新定时任务
         self.cookie_refresh_task = None
-        self.cookie_refresh_interval = 1200  # 1小时 = 3600秒
+        self.cookie_refresh_interval = 1200  # 20分钟
         self.last_cookie_refresh_time = 0
         self.cookie_refresh_lock = asyncio.Lock()  # 使用Lock防止重复执行Cookie刷新
         self.cookie_refresh_enabled = True  # 是否启用Cookie刷新功能
@@ -1215,6 +1196,10 @@ class XianyuLive:
 
     def can_auto_delivery(self, order_id: str) -> bool:
         """检查是否可以进行自动发货（防重复发货）- 基于订单ID"""
+        from app.db_manager import db_manager
+        from app.services.delivery_ledger import is_blocked
+        if order_id and is_blocked(db_manager, self.cookie_id, order_id):
+            return False
         if not order_id:
             # 如果没有订单ID，则不进行冷却检查，允许发货
             return True
@@ -1718,6 +1703,8 @@ class XianyuLive:
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
                                    item_id: str, chat_id: str, msg_time: str):
         """统一处理自动发货逻辑"""
+        delivery_context = {}
+        order_id = None
         try:
             # 检查商品是否属于当前cookies
             if item_id and item_id != "未知商品":
@@ -2002,6 +1989,8 @@ class XianyuLive:
 
                             # 卡券全部发送后才记录系统已发货；订单状态只在闲鱼确认成功后推进。
                             self.mark_delivery_sent(order_id, update_order_status=platform_confirmed)
+                            from app.services.delivery_ledger import finish
+                            finish(db_manager, self.cookie_id, order_id, completed=True, token=delivery_context.get('attempt_token'))
                             try:
                                 db_manager.insert_or_update_order(
                                     order_id=order_id,
@@ -2018,7 +2007,7 @@ class XianyuLive:
                                     send_user_id,
                                     item_id,
                                     f"订单命中“{protection_result['rule_name']}”并已关闭，仅发送卡券成功",
-                                    chat_id
+                                    chat_id, event_type='delivery_success'
                                 )
                             elif confirm_required and not platform_confirmed:
                                 await self.send_delivery_failure_notification(
@@ -2026,12 +2015,12 @@ class XianyuLive:
                                     send_user_id,
                                     item_id,
                                     f"卡券已全部发送，但闲鱼确认发货失败，请手动确认：{confirm_error}",
-                                    chat_id
+                                    chat_id, event_type='delivery_confirm_failed'
                                 )
                             elif len(delivery_contents) > 1:
-                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {sent_count} 个卡券", chat_id)
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {sent_count} 个卡券", chat_id, event_type='delivery_success')
                             else:
-                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id, event_type='delivery_success')
                         else:
                             # 内容可能已从批量卡池取出，自动重试可能重复消耗或重复发送，转人工处理。
                             self.delivery_blocked_orders.add(order_id)
@@ -2060,11 +2049,18 @@ class XianyuLive:
                     # 发送自动发货异常通知
                     await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"自动发货处理异常: {str(e)}", chat_id)
 
+                from app.services.delivery_ledger import finish
+                if delivery_context.get('attempt_token'):
+                    finish(db_manager, self.cookie_id, order_id, token=delivery_context['attempt_token'])
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】订单锁释放: {lock_key}，自动发货处理完成')
 
         except Exception as e:
             logger.error(f"统一自动发货处理异常: {self._safe_str(e)}")
-
+        finally:
+            if order_id and delivery_context.get('attempt_token'):
+                from app.services.delivery_ledger import finish
+                from app.db_manager import db_manager
+                finish(db_manager, self.cookie_id, order_id, token=delivery_context['attempt_token'])
 
 
     async def refresh_token(self, captcha_retry_count: int = 0):
@@ -2215,7 +2211,7 @@ class XianyuLive:
                 f"payload_length={len(data_val)}"
             )
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=False) as session:
                 async with session.post(
                     api_url,
                     params=params,
@@ -4378,6 +4374,12 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"调试消息结构时发生错误: {self._safe_str(e)}")
 
+    def _record_default_reply_sent(self, chat_id):
+        from app.db_manager import db_manager
+        settings = db_manager.get_default_reply(self.cookie_id) or {}
+        if chat_id and settings.get('reply_once'):
+            db_manager.add_default_reply_record(self.cookie_id, chat_id)
+
     async def get_default_reply(self, send_user_name: str, send_user_id: str, send_message: str, chat_id: str, item_id: str = None) -> dict:
         """获取默认回复内容，支持指定商品回复、变量替换、只回复一次功能和图片发送
         
@@ -4448,11 +4450,6 @@ class XianyuLive:
 
                 if item_replay:
                     formatted_reply = item_replay.get('reply_content', '')
-
-                # 如果开启了"只回复一次"功能，记录这次回复
-                if default_reply_settings.get('reply_once', False) and chat_id:
-                    db_manager.add_default_reply_record(self.cookie_id, chat_id)
-                    logger.info(f"【{self.cookie_id}】记录默认回复: chat_id={chat_id}")
 
                 logger.info(f"【{self.cookie_id}】使用默认回复: 文字={formatted_reply}, 图片={reply_image_url}")
                 return {'text': formatted_reply, 'image_url': reply_image_url if reply_image_url and reply_image_url.strip() else None}
@@ -4651,7 +4648,7 @@ class XianyuLive:
                 'Referer': 'https://www.goofish.com/',
             }
             
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=False) as session:
                 async with session.get(image_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
                     if response.status == 200:
                         image_data = await response.read()
@@ -4767,8 +4764,8 @@ class XianyuLive:
         except:
             return 0.0
 
-    async def send_system_notification(self, message: str) -> int:
-        """把系统级消息推送到该账号绑定的全部通知渠道。
+    async def send_system_notification(self, message: str, event_type: str = 'delivery_timeout') -> int:
+        """把系统级消息推送到订阅了指定事件的通知渠道。
 
         与 :meth:`send_notification` 的区别是不依赖买家消息上下文，
         供发货超时告警这类主动通知使用。
@@ -4782,7 +4779,7 @@ class XianyuLive:
         try:
             from app.db_manager import db_manager
 
-            notifications = db_manager.get_account_notifications(self.cookie_id) or []
+            notifications = db_manager.get_account_notifications(self.cookie_id, event_type=event_type) or []
         except Exception as e:
             logger.error(f"📱 读取通知渠道失败: {self._safe_str(e)}")
             return 0
@@ -4870,7 +4867,7 @@ class XianyuLive:
             logger.info(f"📱 开始发送消息通知 - 账号: {self.cookie_id}, 买家: {send_user_name}")
 
             # 获取当前账号的通知配置
-            notifications = db_manager.get_account_notifications(self.cookie_id)
+            notifications = db_manager.get_account_notifications(self.cookie_id, event_type='buyer_message')
 
             if not notifications:
                 logger.warning(f"📱 账号 {self.cookie_id} 未配置消息通知，跳过通知发送")
@@ -4984,7 +4981,7 @@ class XianyuLive:
                 }
             }
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=False) as session:
                 async with session.post(webhook_url, json=data, timeout=10) as response:
                     if response.status == 200:
                         logger.info(f"钉钉通知发送成功")
@@ -5046,7 +5043,7 @@ class XianyuLive:
             logger.info(f"📱 飞书通知 - 请求数据构建完成")
 
             # 发送POST请求
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=False) as session:
                 async with session.post(webhook_url, json=data, timeout=10) as response:
                     response_text = await response.text()
                     logger.info(f"📱 飞书通知 - 响应状态: {response.status}")
@@ -5119,7 +5116,7 @@ class XianyuLive:
             logger.info(f"📱 Bark通知 - 请求数据构建完成")
 
             # 发送POST请求
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=False) as session:
                 async with session.post(api_url, json=data, timeout=10) as response:
                     response_text = await response.text()
                     logger.info(f"📱 Bark通知 - 响应状态: {response.status}")
@@ -5147,137 +5144,30 @@ class XianyuLive:
             logger.error(f"📱 Bark通知异常详情: {traceback.format_exc()}")
 
     async def _send_email_notification(self, config_data: dict, message: str, attachment_path: str = None):
-        """发送邮件通知（支持附件）
-        
-        Args:
-            config_data: 邮件配置
-            message: 邮件正文
-            attachment_path: 附件文件路径（可选）
-        """
+        from email.message import EmailMessage
+        from app.services.smtp_delivery import send_message, DeliveryUncertain
+        from pathlib import Path
+        email = EmailMessage()
+        email['Subject'] = '闲鱼账号通知'
+        email['From'] = config_data['email_user']
+        email['To'] = config_data['recipient_email']
+        email.set_content(message)
+        if attachment_path and Path(attachment_path).is_file():
+            attachment = Path(attachment_path)
+            email.add_attachment(attachment.read_bytes(), maintype='application', subtype='octet-stream', filename=attachment.name)
         try:
-            import smtplib
-            from email.mime.text import MIMEText
-            from email.mime.multipart import MIMEMultipart
-            from email.mime.image import MIMEImage
-            import os
-
-            # 解析配置
-            smtp_server = config_data.get('smtp_server', '')
-            smtp_port = int(config_data.get('smtp_port', 587))
-            email_user = config_data.get('email_user', '')
-            email_password = config_data.get('email_password', '')
-            recipient_email = config_data.get('recipient_email', '')
-            smtp_use_tls = config_data.get('smtp_use_tls', smtp_port == 587)  # 修复：添加变量定义
-
-            if not all([smtp_server, email_user, email_password, recipient_email]):
-                logger.warning("邮件通知配置不完整")
-                return
-
-            # 创建邮件
-            msg = MIMEMultipart()
-            msg['From'] = email_user
-            msg['To'] = recipient_email
-            msg['Subject'] = "闲鱼自动回复通知"
-
-            # 添加邮件正文
-            msg.attach(MIMEText(message, 'plain', 'utf-8'))
-
-            # 添加附件（如果有）
-            if attachment_path and os.path.exists(attachment_path):
-                try:
-                    with open(attachment_path, 'rb') as f:
-                        img_data = f.read()
-                    
-                    # 根据文件扩展名判断MIME类型
-                    filename = os.path.basename(attachment_path)
-                    if attachment_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                        img = MIMEImage(img_data)
-                        img.add_header('Content-Disposition', 'attachment', filename=filename)
-                        msg.attach(img)
-                        logger.info(f"已添加图片附件: {filename}")
-                    else:
-                        from email.mime.application import MIMEApplication
-                        attach = MIMEApplication(img_data)
-                        attach.add_header('Content-Disposition', 'attachment', filename=filename)
-                        msg.attach(attach)
-                        logger.info(f"已添加附件: {filename}")
-                except Exception as attach_error:
-                    logger.error(f"添加邮件附件失败: {self._safe_str(attach_error)}")
-
-            # 发送邮件
-            server = None
-            try:
-                if smtp_port == 465:
-                    # 使用SSL连接（端口465）
-                    server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
-                else:
-                    # 使用普通连接，然后升级到TLS（端口587）
-                    server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
-                    if smtp_use_tls:
-                        server.starttls()
-                
-                # 尝试登录
-                try:
-                    server.login(email_user, email_password)
-                except smtplib.SMTPAuthenticationError as auth_error:
-                    error_code = auth_error.smtp_code if hasattr(auth_error, 'smtp_code') else None
-                    error_msg = str(auth_error)
-                    
-                    # 提供详细的错误提示
-                    logger.error(f"邮件SMTP认证失败 (错误码: {error_code})")
-                    logger.error(f"邮箱地址: {email_user}")
-                    logger.error(f"SMTP服务器: {smtp_server}:{smtp_port}")
-                    logger.error(f"错误详情: {error_msg}")
-                    
-                    # 根据常见错误提供解决建议
-                    suggestions = []
-                    if 'qq.com' in email_user.lower() or 'qq' in smtp_server.lower():
-                        suggestions.append("QQ邮箱需要使用授权码而不是登录密码")
-                        suggestions.append("请到QQ邮箱设置 -> 账户 -> 开启SMTP服务 -> 生成授权码")
-                    elif 'gmail.com' in email_user.lower() or 'gmail' in smtp_server.lower():
-                        suggestions.append("Gmail需要使用应用专用密码")
-                        suggestions.append("请到Google账户 -> 安全性 -> 两步验证 -> 应用专用密码")
-                        suggestions.append("或启用'允许不够安全的应用访问'（不推荐）")
-                    elif '163.com' in email_user.lower() or '126.com' in email_user.lower() or 'yeah.net' in email_user.lower():
-                        suggestions.append("网易邮箱需要使用授权码")
-                        suggestions.append("请到邮箱设置 -> POP3/SMTP/IMAP -> 开启SMTP服务 -> 生成授权码")
-                    else:
-                        suggestions.append("请检查邮箱密码/授权码是否正确")
-                        suggestions.append("某些邮箱服务商需要使用授权码而不是登录密码")
-                        suggestions.append("请查看邮箱服务商的SMTP设置说明")
-                    
-                    if suggestions:
-                        logger.error("解决建议:")
-                        for i, suggestion in enumerate(suggestions, 1):
-                            logger.error(f"  {i}. {suggestion}")
-                    
-                    raise  # 重新抛出异常
-                
-                server.send_message(msg)
-                logger.info(f"邮件通知发送成功: {recipient_email}")
-
-            finally:
-                # 确保关闭连接
-                if server:
-                    try:
-                        server.quit()
-                    except:
-                        try:
-                            server.close()
-                        except:
-                            pass
-
-        except smtplib.SMTPAuthenticationError:
-            # 认证错误已在上面处理，这里不再重复记录
-            pass
-        except smtplib.SMTPException as smtp_error:
-            logger.error(f"SMTP协议错误: {self._safe_str(smtp_error)}")
-            logger.error(f"SMTP服务器: {smtp_server}:{smtp_port}")
-            logger.error(f"请检查SMTP服务器地址和端口配置是否正确")
-        except Exception as e:
-            logger.error(f"发送邮件通知异常: {self._safe_str(e)}")
-            import traceback
-            logger.error(f"邮件发送详细错误: {traceback.format_exc()}")
+            await asyncio.to_thread(send_message, email, config_data['smtp_server'], int(config_data['smtp_port']),
+                                    config_data['email_user'], config_data['email_password'],
+                                    use_tls=bool(config_data.get('smtp_use_tls', True)),
+                                    use_ssl=bool(config_data.get('smtp_use_ssl', False)), timeout=30)
+            logger.info('邮件通知已提交')
+            return True
+        except DeliveryUncertain:
+            logger.warning('邮件提交结果不确定，请先查收；本次不自动补发')
+            return False
+        except Exception as error:
+            logger.warning(f'邮件通知失败：{type(error).__name__}')
+            return False
 
     async def _send_webhook_notification(self, config_data: dict, message: str):
         """发送Webhook通知"""
@@ -5311,7 +5201,7 @@ class XianyuLive:
                 'source': 'xianyu-auto-reply'
             }
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=False) as session:
                 if http_method == 'POST':
                     async with session.post(webhook_url, json=data, headers=headers, timeout=10) as response:
                         if response.status == 200:
@@ -5349,7 +5239,7 @@ class XianyuLive:
                 }
             }
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=False) as session:
                 async with session.post(webhook_url, json=data, timeout=10) as response:
                     if response.status == 200:
                         logger.info(f"微信通知发送成功")
@@ -5381,7 +5271,7 @@ class XianyuLive:
                 'parse_mode': 'HTML'
             }
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=False) as session:
                 async with session.post(api_url, json=data, timeout=10) as response:
                     if response.status == 200:
                         logger.info(f"Telegram通知发送成功")
@@ -5437,8 +5327,11 @@ class XianyuLive:
 
             from app.db_manager import db_manager
 
-            # 获取当前账号的通知配置
-            notifications = db_manager.get_account_notifications(self.cookie_id)
+            # 登录成功、人工验证及 Cookie 异常分别按用户勾选的事件投递。
+            from app.notification_events import resolve_event_type
+            notifications = db_manager.get_account_notifications(
+                self.cookie_id, event_type=resolve_event_type(notification_type)
+            )
 
             if not notifications:
                 logger.warning("未配置消息通知，跳过Token刷新通知")
@@ -5597,13 +5490,13 @@ class XianyuLive:
 
         return False
 
-    async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str, item_id: str, error_message: str, chat_id: str = None):
-        """发送自动发货失败通知"""
+    async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str, item_id: str, error_message: str, chat_id: str = None, *, event_type: str = 'delivery_failed'):
+        """按实际发货结果事件投递通知。"""
         try:
             from app.db_manager import db_manager
 
             # 获取当前账号的通知配置
-            notifications = db_manager.get_account_notifications(self.cookie_id)
+            notifications = db_manager.get_account_notifications(self.cookie_id, event_type=event_type)
 
             if not notifications:
                 logger.warning("未配置消息通知，跳过自动发货通知")
@@ -5681,6 +5574,7 @@ class XianyuLive:
                 headers = DEFAULT_HEADERS.copy()
                 headers['cookie'] = self.cookies_str
                 temp_session = aiohttp.ClientSession(
+                    trust_env=False,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30),
                 )
@@ -5916,6 +5810,16 @@ class XianyuLive:
         requested_item_quantity: int = 1,
     ):
         """匹配并取得发货内容；批量库存会在首次调用时按整单需求原子扣减。"""
+        from app.services import delivery_ledger
+        from app.db_manager import db_manager
+        if delivery_context is None:
+            delivery_context = {}
+        if not delivery_context.get('attempt_token'):
+            token = delivery_ledger.claim(db_manager, self.cookie_id, order_id, send_user_id, item_id)
+            if not token:
+                logger.warning('订单已有发货记录或待人工核查，禁止重复获取库存')
+                return None
+            delivery_context['attempt_token'] = token
         try:
             from app.db_manager import db_manager
 
@@ -6273,9 +6177,8 @@ class XianyuLive:
                                 int(delivery_context.get("delivery_count") or 1),
                             )
                             required_count = item_quantity * delivery_count
-                            batch_queue = db_manager.consume_batch_data_batch(
-                                rule['card_id'],
-                                required_count,
+                            batch_queue = delivery_ledger.reserve(
+                                db_manager, delivery_context['attempt_token'], rule['card_id'], required_count
                             )
                             if not batch_queue:
                                 logger.warning(
@@ -6293,7 +6196,8 @@ class XianyuLive:
                             return None
                         delivery_content = batch_queue.pop(0)
                     else:
-                        delivery_content = db_manager.consume_batch_data(rule['card_id'])
+                        reserved = delivery_ledger.reserve(db_manager, delivery_context['attempt_token'], rule['card_id'], 1)
+                        delivery_content = reserved[0] if reserved else None
 
                 elif rule['card_type'] == 'image':
                     # 图片类型：返回图片发送标记，包含卡券ID
@@ -6918,7 +6822,7 @@ class XianyuLive:
         try:
             await asyncio.wait_for(ws.send(json.dumps(msg)), timeout=2.0)
             self.last_heartbeat_time = time.time()
-            logger.warning(f"【{self.cookie_id}】心跳包已发送")
+            logger.debug(f"【{self.cookie_id}】心跳包已发送")
         except asyncio.TimeoutError:
             raise ConnectionError("心跳发送超时，WebSocket可能已断开")
         except asyncio.CancelledError:
@@ -6981,7 +6885,7 @@ class XianyuLive:
         try:
             if message_data.get("code") == 200:
                 self.last_heartbeat_response = time.time()
-                logger.warning("心跳响应正常")
+                logger.debug("心跳响应正常")
                 return True
         except Exception as e:
             logger.error(f"处理心跳响应出错: {self._safe_str(e)}")
@@ -7220,7 +7124,7 @@ class XianyuLive:
                     enabled_str = db_manager.get_system_setting('order_sync_enabled')
                     interval_str = db_manager.get_system_setting('order_sync_interval')
 
-                    # 默认开启，间隔 30 分钟
+                    # 默认开启，间隔2小时；最短允许30分钟。
                     enabled = enabled_str != 'false'
                     try:
                         interval = int(interval_str) if interval_str else 7200
@@ -9176,6 +9080,7 @@ class XianyuLive:
             headers['cookie'] = self.cookies_str
 
             self.session = aiohttp.ClientSession(
+                trust_env=False,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30)
             )
@@ -9205,6 +9110,13 @@ class XianyuLive:
                 "send_message": send_message,
                 "chat_id": chat_id
             }
+
+            from urllib.parse import urlsplit
+            target = urlsplit(api_config.get('url', 'http://localhost:8080/xianyu/reply'))
+            if target.hostname in ('localhost','127.0.0.1','::1','0.0.0.0') and target.path == '/xianyu/reply':
+                from app.reply_server import xianyu_reply, RequestModel
+                result = await xianyu_reply(RequestModel(**payload), current_user={'user_id':self.user_id})
+                return result.get('data', {}).get('send_msg')
 
             async with self.session.post(
                 api_config.get('url', 'http://localhost:8080/xianyu/reply'),
@@ -9725,6 +9637,8 @@ class XianyuLive:
                             else:
                                 # 只有图片没有文字，已经发送完毕
                                 if default_image_url:
+                                    if not reply_send_failed:
+                                        self._record_default_reply_sent(chat_id)
                                     return
                                 reply = None
                         else:
@@ -9779,6 +9693,8 @@ class XianyuLive:
                     # 普通文本消息
                     await self.send_msg(websocket, chat_id, send_user_id, reply)
                     if not reply_send_failed:
+                        if reply_strategy == 'default':
+                            self._record_default_reply_sent(chat_id)
                         self._update_reply_decision_log(
                             log_id,
                             decision_reason="reply_sent",

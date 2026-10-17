@@ -6,7 +6,8 @@ import ThemeToggle from './components/ThemeToggle';
 import CaptchaInput from './components/CaptchaInput';
 import { useCaptcha } from './lib/useCaptcha';
 import { validateEmail, validatePassword, validateUsername } from './lib/authValidation';
-import { login, verifyToken, getPublicSettings, register, sendVerificationCode } from './services/api';
+import { login, logout, verifyToken, getPublicSettings, register, sendVerificationCode } from './services/api';
+import { notify } from './services/feedback';
 import { ShieldCheck, ArrowRight, Loader2, User, Lock, Menu, Mail, KeyRound, CheckCircle2 } from 'lucide-react';
 
 const Dashboard = lazy(() => import('./components/Dashboard'));
@@ -540,10 +541,16 @@ const App: React.FC = () => {
         mobileOpen={mobileMenuOpen}
         onMobileClose={() => setMobileMenuOpen(false)}
         isAdmin={isAdmin}
-        onLogout={() => {
+        onLogout={async () => {
+          try {
+            await logout();
             localStorage.removeItem('auth_token');
+            setPassword('');
             setIsAdmin(false);
             setIsLoggedIn(false);
+          } catch {
+            notify('退出未完成，请检查本地服务连接后重试', 'error');
+          }
         }} 
       />
       
@@ -570,57 +577,53 @@ const App: React.FC = () => {
             ? 'h-[calc(100vh-3.5rem)] lg:h-screen overflow-hidden'
             : 'mx-auto max-w-[1320px] p-4 pb-10 sm:p-6 lg:p-8'
         }>
-          <section hidden={activeTab !== 'dashboard'}>
+          {activeTab === 'dashboard' && (<section>
             <Suspense fallback={activeTab === 'dashboard' ? <PageLoader /> : null}><Dashboard /></Suspense>
-          </section>
-          <section hidden={activeTab !== 'accounts'}>
+          </section>)}
+          {activeTab === 'accounts' && (<section>
             <Suspense fallback={activeTab === 'accounts' ? <PageLoader /> : null}><AccountList /></Suspense>
-          </section>
-          <section hidden={activeTab !== 'items'}>
+          </section>)}
+          {activeTab === 'items' && (<section>
             <Suspense fallback={activeTab === 'items' ? <PageLoader /> : null}><ItemList /></Suspense>
-          </section>
-          <section hidden={activeTab !== 'product-automation'}>
+          </section>)}
+          {activeTab === 'product-automation' && (<section>
             <Suspense fallback={activeTab === 'product-automation' ? <PageLoader /> : null}><ProductAutomation /></Suspense>
-          </section>
-          <section hidden={activeTab !== 'orders'}>
+          </section>)}
+          {activeTab === 'orders' && (<section>
             <Suspense fallback={activeTab === 'orders' ? <PageLoader /> : null}><OrderList /></Suspense>
-          </section>
-          <section hidden={activeTab !== 'cards'}>
+          </section>)}
+          {activeTab === 'cards' && (<section>
             <Suspense fallback={activeTab === 'cards' ? <PageLoader /> : null}><CardList /></Suspense>
-          </section>
-          <section hidden={activeTab !== 'auto-reply'}>
+          </section>)}
+          {activeTab === 'auto-reply' && (<section>
             <Suspense fallback={activeTab === 'auto-reply' ? <PageLoader /> : null}><Keywords mode="reply" /></Suspense>
-          </section>
-          <section hidden={activeTab !== 'ai-reply'}>
+          </section>)}
+          {activeTab === 'ai-reply' && (<section>
             <Suspense fallback={activeTab === 'ai-reply' ? <PageLoader /> : null}><AIReply /></Suspense>
-          </section>
-          <section hidden={activeTab !== 'messages'} className="h-full min-h-0">
+          </section>)}
+          {activeTab === 'messages' && (<section className="h-full min-h-0">
             <Suspense fallback={activeTab === 'messages' ? <PageLoader /> : null}>
               <MessageManagement isActive={activeTab === 'messages'} />
             </Suspense>
-          </section>
-          <section hidden={activeTab !== 'notifications'}>
+          </section>)}
+          {activeTab === 'notifications' && (<section>
             <Suspense fallback={activeTab === 'notifications' ? <PageLoader /> : null}>
               <NotificationsAndLogs isAdmin={isAdmin} />
             </Suspense>
-          </section>
-          {isAdmin && (
-            <section hidden={activeTab !== 'users'}>
+          </section>)}
+          {isAdmin && activeTab === 'users' && (<section>
               <Suspense fallback={activeTab === 'users' ? <PageLoader /> : null}><UserManagement /></Suspense>
-            </section>
-          )}
+            </section>)}
           {/* 系统设置页面含 SMTP/注册开关等系统级配置，普通用户不挂载（后端接口同样只放行业务白名单） */}
-          {isAdmin && (
-            <section hidden={activeTab !== 'settings'}>
+          {isAdmin && activeTab === 'settings' && (<section>
               <Suspense fallback={activeTab === 'settings' ? <PageLoader /> : null}><Settings /></Suspense>
-            </section>
-          )}
-          <section hidden={activeTab !== 'buyer-interaction'}>
+            </section>)}
+          {activeTab === 'buyer-interaction' && (<section>
             <Suspense fallback={activeTab === 'buyer-interaction' ? <PageLoader /> : null}><BuyerInteraction /></Suspense>
-          </section>
-          <section hidden={activeTab !== 'about'}>
+          </section>)}
+          {activeTab === 'about' && (<section>
             <Suspense fallback={activeTab === 'about' ? <PageLoader /> : null}><About /></Suspense>
-          </section>
+          </section>)}
         </div>
       </main>
     </div>

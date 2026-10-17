@@ -29,6 +29,7 @@ async def main():
         return 1
 
     from playwright.async_api import async_playwright
+    from utils.direct_network import direct_browser_options
 
     async with async_playwright() as p:
         ctx = await p.chromium.launch_persistent_context(
@@ -36,6 +37,7 @@ async def main():
             channel="chrome",
             headless=False,
             no_viewport=True,
+            **direct_browser_options(),
         )
         await ctx.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"

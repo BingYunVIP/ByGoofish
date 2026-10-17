@@ -7,6 +7,7 @@
 
 import asyncio
 import unittest
+from unittest.mock import AsyncMock
 
 from utils.qr_login import QRLoginManager, QRLoginSession
 
@@ -49,6 +50,8 @@ class QrVerificationResumeTests(unittest.IsolatedAsyncioTestCase):
                 return FakeResponse("CONFIRMED", cookies=LOGGED_IN)
 
         manager._poll_qrcode_status = fake_poll
+        # 本测试验证状态机，不应真的打开闲鱼验证页或遗留浏览器进程。
+        manager._run_verification_page = AsyncMock()
 
         task = asyncio.create_task(manager._monitor_qr_status("s1"))
         for _ in range(300):

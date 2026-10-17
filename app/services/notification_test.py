@@ -1,22 +1,26 @@
 """账号通知规则的测试发送服务。
 
-向一条规则绑定的渠道发送真实测试消息，用于排查通知链路连通性。
-刻意不做"发送前必须启用"的校验：停用的规则/渠道也要能测，
-否则用户改完配置只能先启用才能验证，反而更容易漏报。
+事件测试遵守订阅及启用状态；只有明确确认的渠道测试可以绕过订阅。
 """
 
 from __future__ import annotations
 
 import secrets
 import time
+import math
+import threading
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
+from app.notification_events import EVENT_DEFINITIONS, EVENT_IDS
 
 from app.services.notification_channels import NotificationChannelConfigError
 from app.services.notification_sender import (
     NotificationNetworkError,
     NotificationProviderRejected,
     NotificationSendTimeout,
+    NotificationDeliveryUncertain,
+    NotificationSendError,
 )
 
 
@@ -41,37 +45,50 @@ class NotificationTestError(Exception):
 
 
 class NotificationTestRateLimiter:
-    """按 (rule_id, user_id) 维度的滑动窗口限流，防止测试端点被刷。"""
+    """按 (channel_id, user_id) 限流，多个规则共用渠道时不能绕过限制。"""
 
     def __init__(self, limit: int = 10, window_seconds: int = 60) -> None:
         self.limit = max(1, int(limit))
         self.window_seconds = max(1, int(window_seconds))
         self._hits: Dict[tuple, deque] = defaultdict(deque)
+        self._lock = threading.Lock()
 
     def acquire(self, key: tuple) -> Optional[int]:
         """尝试占用一个名额；被限流时返回建议的重试等待秒数。"""
-        now = time.monotonic()
-        hits = self._hits[key]
-        while hits and now - hits[0] >= self.window_seconds:
-            hits.popleft()
-        if len(hits) >= self.limit:
-            return self.window_seconds
-        hits.append(now)
-        return None
+        with self._lock:
+            now = time.monotonic()
+            hits = self._hits[key]
+            while hits and now - hits[0] >= self.window_seconds:
+                hits.popleft()
+            if len(hits) >= self.limit:
+                return max(1, math.ceil(self.window_seconds - (now - hits[0])))
+            hits.append(now)
+            return None
 
 
-def build_test_message(cookie_id: str) -> str:
+def build_test_message(cookie_id: str, event_type: str | None = None) -> str:
     """构造测试消息模板，{request_id} 由服务层填充以便追踪。"""
+    event_label = next((item['label'] for item in EVENT_DEFINITIONS if item['id'] == event_type), '')
+    purpose = (
+        f"测试订阅项：{event_label}（仅用于检查是否允许投递）\n"
+        "订阅检查已通过，本次只验证通知投递。"
+        if event_type else
+        "测试方式：手动渠道测试，仅检查通知投递；本次已确认忽略事件订阅。"
+    )
     return (
-        "【闲鱼超级管家】通知测试\n"
+        "【手动测试 · 无需处理】闲鱼超级管家\n"
+        "这是一封手动触发的测试通知，不是账号异常告警。\n"
+        "本次没有检测Cookie是否失效，也不会改变账号的监听状态。\n"
         f"账号：{cookie_id}\n"
         "追踪 ID：{request_id}\n"
-        "收到本消息说明该渠道通知链路畅通。"
+        f"{purpose}\n"
+        "账号当前状态请查看管家“账号管理”；收到本邮件不需要重新登录闲鱼。\n"
+        "收到本消息说明通知投递成功，无需反复点击测试。"
     )
 
 
-# 进程级共享限流器：测试端点对所有用户共用同一配额池
-notification_test_rate_limiter = NotificationTestRateLimiter(limit=10, window_seconds=60)
+# 每个用户的同一渠道每分钟最多尝试发送一次；被过滤的事件不占发信配额。
+notification_test_rate_limiter = NotificationTestRateLimiter(limit=1, window_seconds=60)
 
 
 class NotificationTestService:
@@ -108,6 +125,10 @@ class NotificationTestService:
         rule_id: int,
         user_id: int,
         operator: Optional[Dict[str, Any]] = None,
+        *,
+        mode: str = 'event',
+        event_type: str | None = None,
+        confirm_channel_send: bool = False,
     ) -> Dict[str, Any]:
         target = self.db.get_notification_test_target(rule_id, user_id)
         if not target:
@@ -117,8 +138,30 @@ class NotificationTestService:
                 status_code=404,
             )
 
+        if mode not in ('event', 'channel') or (mode == 'event' and event_type not in EVENT_IDS):
+            raise NotificationTestError('notification_test_mode_invalid', '请选择要测试的通知事件', 400)
+        if mode == 'channel' and not confirm_channel_send:
+            raise NotificationTestError('notification_test_confirmation_required', '渠道测试会真实发信且忽略事件勾选，请先确认', 400)
+
+        request_id = secrets.token_hex(6)
+        if mode == 'event':
+            # 与正式发送共用数据库选择器，读取当前已保存的订阅，不依赖页面缓存。
+            matching = self.db.get_account_notifications(target['cookie_id'], user_id, event_type=event_type)
+            accepted = target.get('channel_enabled') and any(
+                row['id'] == rule_id and row['enabled'] for row in matching
+            )
+            if not accepted:
+                self._log_safe('info', f'source=notification_test rule_id={rule_id} request_id={request_id} '
+                               f'mode=event event_type={event_type} result=skipped user_id={user_id}', operator)
+                return {
+                    'success': True, 'sent': False, 'skipped': True, 'mode': mode, 'event_type': event_type,
+                    'message': '该事件未订阅或规则/渠道已停用，未发送任何通知',
+                    'request_id': request_id,
+                    'channel': {'id': target['channel_id'], 'name': target['channel_name'], 'type': target['channel_type']},
+                }
+
         if self.limiter is not None:
-            retry_after = self.limiter.acquire((int(rule_id), int(user_id)))
+            retry_after = self.limiter.acquire((int(target['channel_id']), int(user_id)))
             if retry_after is not None:
                 raise NotificationTestError(
                     "notification_rate_limited",
@@ -127,12 +170,13 @@ class NotificationTestService:
                     retry_after=retry_after,
                 )
 
-        request_id = secrets.token_hex(6)
-        message = build_test_message(target["cookie_id"]).format(request_id=request_id)
+        started_at = time.monotonic()
+        message = build_test_message(target["cookie_id"], event_type if mode == 'event' else None).format(request_id=request_id)
 
         self._log_safe(
             "info",
-            f"source=notification_test rule_id={rule_id} request_id={request_id} result=started",
+            f"source=notification_test rule_id={rule_id} request_id={request_id} mode={mode} "
+            f"event_type={event_type if mode == 'event' else 'none'} user_id={user_id} result=started",
             operator,
         )
 
@@ -160,6 +204,9 @@ class NotificationTestService:
                 "通知渠道配置不完整，请先补全再测试",
                 status_code=400,
             )
+        except NotificationDeliveryUncertain:
+            self._log_safe('warning', f'source=notification_test request_id={request_id} result=uncertain', operator)
+            raise NotificationTestError('notification_delivery_unknown', '邮件提交结果不确定，请先查收邮箱，不要立即重复发送', 504) from None
         except NotificationSendTimeout:
             raise NotificationTestError(
                 "notification_send_timeout",
@@ -181,6 +228,8 @@ class NotificationTestService:
             )
         except NotificationTestError:
             raise
+        except NotificationSendError as exc:
+            raise NotificationTestError(exc.code, exc.public_message, exc.status_code or 502) from None
         except Exception:
             # 未知异常的消息可能包含敏感值，不回显给前端，只给稳定文案
             raise NotificationTestError(
@@ -192,13 +241,25 @@ class NotificationTestService:
         self._log_safe(
             "info",
             f"source=notification_test rule_id={rule_id} request_id={request_id} "
-            f"channel_id={target['channel_id']} result=success",
+            f"channel_id={target['channel_id']} mode={mode} result=success",
             operator,
         )
 
         return {
             "success": True,
+            "sent": True,
+            "skipped": False,
+            "mode": mode,
+            "event_type": event_type if mode == 'event' else None,
+            # 发送器返回只代表渠道已接受提交，不代表已经进入用户收件箱。
+            "message": (
+                "测试邮件已提交（手动测试，不是账号异常告警），请检查收件箱或垃圾邮件"
+                if target["channel_type"] == "email"
+                else "测试通知已提交（手动测试，不是账号异常告警），请检查接收端"
+            ),
             "request_id": request_id,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "duration_ms": round((time.monotonic() - started_at) * 1000),
             "channel": {
                 "id": target["channel_id"],
                 "name": target["channel_name"],

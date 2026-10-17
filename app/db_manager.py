@@ -58,18 +58,20 @@ class DBManager:
         self.lock = threading.RLock()  # 使用可重入锁保护数据库操作
 
         # SQL日志配置 - 默认启用
-        self.sql_log_enabled = True  # 默认启用SQL日志
+        self.sql_log_enabled = False  # 凭证与用户数据默认不记录 SQL 参数
         self.sql_log_level = 'INFO'  # 默认使用INFO级别
 
         # 允许通过环境变量覆盖默认设置
         if os.getenv('SQL_LOG_ENABLED'):
-            self.sql_log_enabled = os.getenv('SQL_LOG_ENABLED', 'true').lower() == 'true'
+            self.sql_log_enabled = os.getenv('SQL_LOG_ENABLED', 'false').lower() == 'true'
         if os.getenv('SQL_LOG_LEVEL'):
             self.sql_log_level = os.getenv('SQL_LOG_LEVEL', 'INFO').upper()
 
-        logger.info(f"SQL日志已启用，日志级别: {self.sql_log_level}")
+        logger.info(f"SQL日志状态: {self.sql_log_enabled}，级别: {self.sql_log_level}")
 
         self.init_db()
+        from app.services.delivery_ledger import initialize
+        initialize(self)
     
     def init_db(self):
         """初始化数据库表结构"""
@@ -978,7 +980,7 @@ class DBManager:
             ('smtp_from', '', '发件人显示名（留空则使用用户名）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
-            ('qq_reply_secret_key', 'xianyu_qq_reply_2024', 'QQ回复消息API秘钥'),
+            ('qq_reply_secret_key', '', '旧全局密钥已禁用；使用账号范围接口密钥'),
             ('item_sync_enabled', 'true', '是否启用定时自动同步商品'),
             ('item_sync_interval', '600', '商品同步间隔时间（秒）'),
             ('item_sync_max_pages', '5', '每次最多同步的页数')
@@ -2137,11 +2139,18 @@ class DBManager:
                         admin_user = cursor.fetchone()
                         user_id = admin_user[0] if admin_user else 1
 
+                if not cursor.execute('SELECT 1 FROM users WHERE id=?', (user_id,)).fetchone():
+                    return False
                 self._execute_sql(cursor,
-                    "INSERT OR REPLACE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
+                    "INSERT INTO cookies (id, value, user_id) VALUES (?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET value=excluded.value "
+                    "WHERE cookies.user_id=excluded.user_id",
                     (cookie_id, cookie_value, user_id)
                 )
 
+                if cursor.rowcount == 0:
+                    self.conn.rollback()
+                    return False
                 self.conn.commit()
                 logger.info(f"Cookie保存成功: {cookie_id} (用户ID: {user_id})")
 
@@ -2160,22 +2169,18 @@ class DBManager:
 
     
     def delete_cookie(self, cookie_id: str) -> bool:
-        """从数据库删除Cookie及其关键字"""
+        from app.services.user_backup import delete_account_data
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                # 删除关联的关键字
-                self._execute_sql(cursor, "DELETE FROM keywords WHERE cookie_id = ?", (cookie_id,))
-                # 删除Cookie
-                self._execute_sql(cursor, "DELETE FROM cookies WHERE id = ?", (cookie_id,))
+                self.conn.execute('BEGIN IMMEDIATE')
+                delete_account_data(self.conn, cookie_id)
                 self.conn.commit()
-                logger.debug(f"Cookie删除成功: {cookie_id}")
                 return True
-            except Exception as e:
-                logger.error(f"Cookie删除失败: {e}")
+            except Exception:
                 self.conn.rollback()
+                logger.warning('账号删除失败，数据已保留；请先核查未完成发货')
                 return False
-    
+
     def get_cookie(self, cookie_id: str) -> Optional[str]:
         """获取指定Cookie值"""
         with self.lock:
@@ -3454,7 +3459,7 @@ class DBManager:
     def get_account_notifications(self, cookie_id: str, user_id: int = None,
                                   event_type: str = None) -> List[Dict[str, any]]:
         """获取账号的通知规则，可按事件类型过滤"""
-        from app.notification_events import parse_event_types
+        from app.notification_events import parse_event_types, rule_accepts_event
 
         with self.lock:
             try:
@@ -3479,7 +3484,7 @@ class DBManager:
                 notifications = []
                 for row in cursor.fetchall():
                     rule_event_types = parse_event_types(row[7])
-                    if event_type and rule_event_types and event_type not in rule_event_types:
+                    if event_type is not None and not rule_accepts_event(row[7], event_type):
                         continue
                     notifications.append({
                         'id': row[0],
@@ -3831,169 +3836,22 @@ class DBManager:
 
     # -------------------- 备份和恢复操作 --------------------
     def export_backup(self, user_id: int = None) -> Dict[str, any]:
-        """导出系统备份数据（支持用户隔离）"""
+        from app.services.user_backup import export_user
+        if user_id is None:
+            raise ValueError('系统完整备份请使用 SQLite 快照接口')
         with self.lock:
-            try:
-                cursor = self.conn.cursor()
-                backup_data = {
-                    'version': '1.0',
-                    'timestamp': time.time(),
-                    'user_id': user_id,
-                    'data': {}
-                }
-
-                if user_id is not None:
-                    # 用户级备份：只备份该用户的数据
-                    # 备份用户的cookies
-                    self._execute_sql(cursor, "SELECT * FROM cookies WHERE user_id = ?", (user_id,))
-                    columns = [description[0] for description in cursor.description]
-                    rows = cursor.fetchall()
-                    backup_data['data']['cookies'] = {
-                        'columns': columns,
-                        'rows': [list(row) for row in rows]
-                    }
-
-                    # 备份用户cookies相关的其他数据
-                    user_cookie_ids = [row[0] for row in rows]  # 获取用户的cookie_id列表
-
-                    if user_cookie_ids:
-                        placeholders = ','.join(['?' for _ in user_cookie_ids])
-
-                        # 备份关键字
-                        cursor.execute(f"SELECT * FROM keywords WHERE cookie_id IN ({placeholders})", user_cookie_ids)
-                        columns = [description[0] for description in cursor.description]
-                        rows = cursor.fetchall()
-                        backup_data['data']['keywords'] = {
-                            'columns': columns,
-                            'rows': [list(row) for row in rows]
-                        }
-
-                        # 备份其他相关表
-                        related_tables = ['cookie_status', 'default_replies', 'message_notifications',
-                                        'item_info', 'ai_reply_settings', 'ai_conversations']
-
-                        for table in related_tables:
-                            cursor.execute(f"SELECT * FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
-                            columns = [description[0] for description in cursor.description]
-                            rows = cursor.fetchall()
-                            backup_data['data'][table] = {
-                                'columns': columns,
-                                'rows': [list(row) for row in rows]
-                            }
-                else:
-                    # 系统级备份：备份所有数据
-                    tables = [
-                        'cookies', 'keywords', 'cookie_status', 'cards',
-                        'delivery_rules', 'default_replies', 'notification_channels',
-                        'message_notifications', 'system_settings', 'item_info',
-                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache'
-                    ]
-
-                    for table in tables:
-                        cursor.execute(f"SELECT * FROM {table}")
-                        columns = [description[0] for description in cursor.description]
-                        rows = cursor.fetchall()
-
-                        backup_data['data'][table] = {
-                            'columns': columns,
-                            'rows': [list(row) for row in rows]
-                        }
-
-                logger.info(f"导出备份成功，用户ID: {user_id}")
-                return backup_data
-
-            except Exception as e:
-                logger.error(f"导出备份失败: {e}")
-                raise
+            return export_user(self.conn, user_id)
 
     def import_backup(self, backup_data: Dict[str, any], user_id: int = None) -> bool:
-        """导入系统备份数据（支持用户隔离）"""
+        from app.services.user_backup import import_user
+        if user_id is None:
+            return False
         with self.lock:
             try:
-                # 验证备份数据格式
-                if not isinstance(backup_data, dict) or 'data' not in backup_data:
-                    raise ValueError("备份数据格式无效")
-
-                # 开始事务
-                cursor = self.conn.cursor()
-                self._execute_sql(cursor, "BEGIN TRANSACTION")
-
-                if user_id is not None:
-                    # 用户级导入：只清空该用户的数据
-                    # 获取用户的cookie_id列表
-                    self._execute_sql(cursor, "SELECT id FROM cookies WHERE user_id = ?", (user_id,))
-                    user_cookie_ids = [row[0] for row in cursor.fetchall()]
-
-                    if user_cookie_ids:
-                        placeholders = ','.join(['?' for _ in user_cookie_ids])
-
-                        # 删除用户相关数据
-                        related_tables = ['message_notifications', 'default_replies', 'item_info',
-                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings']
-
-                        for table in related_tables:
-                            cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
-
-                        # 删除用户的cookies
-                        self._execute_sql(cursor, "DELETE FROM cookies WHERE user_id = ?", (user_id,))
-                else:
-                    # 系统级导入：清空所有数据（除了用户和管理员密码）
-                    tables = [
-                        'message_notifications', 'notification_channels', 'default_replies',
-                        'delivery_rules', 'cards', 'item_info', 'cookie_status', 'keywords',
-                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'cookies'
-                    ]
-
-                    for table in tables:
-                        cursor.execute(f"DELETE FROM {table}")
-
-                    # 清空系统设置（保留管理员密码）
-                    self._execute_sql(cursor, "DELETE FROM system_settings WHERE key != 'admin_password_hash'")
-
-                # 导入数据
-                data = backup_data['data']
-                for table_name, table_data in data.items():
-                    if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
-                                        'delivery_rules', 'default_replies', 'notification_channels',
-                                        'message_notifications', 'system_settings', 'item_info',
-                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache']:
-                        continue
-
-                    columns = table_data['columns']
-                    rows = table_data['rows']
-
-                    if not rows:
-                        continue
-
-                    # 如果是用户级导入，需要确保cookies表的user_id正确
-                    if user_id is not None and table_name == 'cookies':
-                        # 更新所有导入的cookies的user_id
-                        updated_rows = []
-                        for row in rows:
-                            row_dict = dict(zip(columns, row))
-                            row_dict['user_id'] = user_id
-                            updated_rows.append([row_dict[col] for col in columns])
-                        rows = updated_rows
-
-                    # 构建插入语句
-                    placeholders = ','.join(['?' for _ in columns])
-
-                    if table_name == 'system_settings':
-                        # 系统设置需要特殊处理，避免覆盖管理员密码
-                        for row in rows:
-                            if len(row) >= 1 and row[0] != 'admin_password_hash':
-                                cursor.execute(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", row)
-                    else:
-                        cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
-
-                # 提交事务
-                self.conn.commit()
-                logger.info("导入备份成功")
-                return True
-
-            except Exception as e:
-                logger.error(f"导入备份失败: {e}")
+                return import_user(self.conn, backup_data, user_id)
+            except (ValueError, sqlite3.Error, TypeError, KeyError):
                 self.conn.rollback()
+                logger.warning('用户备份导入被拒绝：格式、所有权或关联校验未通过')
                 return False
 
     # -------------------- 系统设置操作 --------------------
@@ -4476,49 +4334,24 @@ class DBManager:
                                  smtp_server: str, smtp_port: int, smtp_user: str,
                                  smtp_password: str, smtp_from: str, smtp_use_tls: bool, smtp_use_ssl: bool,
                                  raise_errors: bool = False) -> bool:
-        """使用SMTP方式发送邮件；raise_errors=True 时不吞异常，供调用方翻译成用户可读的原因"""
-        try:
-            import smtplib
-            from email.mime.text import MIMEText
-            from email.mime.multipart import MIMEMultipart
-
-            msg = MIMEMultipart()
-            msg['Subject'] = subject
-            msg['From'] = smtp_from
-            msg['To'] = email
-
-            msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
-
-            # 不设超时的 SMTP 连接可能无限挂起，连带拖住发码请求
-            if smtp_use_ssl:
-                server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
-            else:
-                server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
-
-            server.ehlo()
-            if smtp_use_tls and not smtp_use_ssl:
-                server.starttls()
-                server.ehlo()
-
-            server.login(smtp_user, smtp_password)
-            server.sendmail(smtp_user, [email], msg.as_string())
-            server.quit()
-
-            logger.info(f"验证码邮件发送成功(SMTP): {email}")
-            return True
-        except Exception as e:
-            logger.error(f"SMTP发送验证码邮件失败: {e}")
-            if raise_errors:
-                raise
-            # 自己的 SMTP 发不出去时，同样不改用站外接口代发：
-            # 那会把收件人邮箱交给第三方，且部署方无从察觉。
-            return False
+        import asyncio
+        from email.message import EmailMessage
+        from app.services.smtp_delivery import send_message
+        msg = EmailMessage()
+        msg['Subject'] = subject
+        msg['From'] = smtp_from
+        msg['To'] = email
+        msg.set_content(text_content)
+        await asyncio.to_thread(send_message, msg, smtp_server, smtp_port, smtp_user, smtp_password,
+                                use_ssl=smtp_use_ssl, use_tls=smtp_use_tls, timeout=30)
+        return True
 
     async def send_test_email(self, email_to: str, smtp_server: str, smtp_port: int,
                               smtp_user: str, smtp_password: str, smtp_from: str,
                               smtp_use_tls: bool, smtp_use_ssl: bool) -> tuple:
         """发送一封测试邮件，返回 (是否成功, 面向用户的中文原因)。"""
         import smtplib
+        from app.services.smtp_delivery import DeliveryUncertain
         subject = "闲鱼超级管家 - SMTP 测试邮件"
         text_content = (
             "这是一封测试邮件。\n\n"
@@ -4533,6 +4366,8 @@ class DBManager:
                                                  smtp_password, smtp_from, smtp_use_tls,
                                                  smtp_use_ssl, raise_errors=True)
             return ok, f"测试邮件已发送至 {email_to}，请查收（记得看一眼垃圾箱）"
+        except DeliveryUncertain:
+            return False, '邮件提交结果不确定，请先查收邮箱，不要立即重复发送'
         except smtplib.SMTPAuthenticationError:
             return False, "SMTP 认证失败：请核对发件邮箱与密码/授权码（QQ 邮箱等须用授权码，不是登录密码）"
         except (TimeoutError, ConnectionError, OSError):
@@ -5401,6 +5236,13 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                self.conn.execute('BEGIN IMMEDIATE')
+                pending = cursor.execute(
+                    "SELECT 1 FROM delivery_stock WHERE card_id=? AND status='reserved' "
+                    "AND (? IS NULL OR user_id=?) LIMIT 1", (card_id, user_id, user_id)
+                ).fetchone()
+                if pending:
+                    raise ValueError('该卡券存在待核查的预留库存，请先处理发货核查')
                 if user_id is not None:
                     self._execute_sql(cursor, "DELETE FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
                 else:
@@ -5411,6 +5253,7 @@ class DBManager:
                     logger.info(f"删除卡券成功: ID {card_id}")
                     return True
                 else:
+                    self.conn.rollback()
                     return False  # 没有找到对应的记录
 
             except Exception as e:
@@ -7087,55 +6930,16 @@ class DBManager:
                 return None
 
     def delete_user_and_data(self, user_id: int):
-        """删除用户及其所有相关数据"""
+        from app.services.user_backup import delete_user_data
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-
-                # 开始事务
-                cursor.execute('BEGIN TRANSACTION')
-
-                # 删除用户相关的所有数据
-                # 1. 删除用户设置
-                cursor.execute('DELETE FROM user_settings WHERE user_id = ?', (user_id,))
-
-                # 2. 删除用户的卡券
-                cursor.execute('DELETE FROM cards WHERE user_id = ?', (user_id,))
-
-                # 3. 删除用户的发货规则
-                cursor.execute('DELETE FROM delivery_rules WHERE user_id = ?', (user_id,))
-
-                # 4. 删除用户的通知渠道
-                cursor.execute('DELETE FROM notification_channels WHERE user_id = ?', (user_id,))
-
-                # 5. 删除用户的Cookie
-                cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
-
-                # 6. 删除用户的关键字
-                cursor.execute('DELETE FROM keywords WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 7. 删除用户的默认回复
-                cursor.execute('DELETE FROM default_replies WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 8. 删除用户的AI回复设置
-                cursor.execute('DELETE FROM ai_reply_settings WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 9. 删除用户的消息通知
-                cursor.execute('DELETE FROM message_notifications WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 10. 最后删除用户本身
-                cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
-
-                # 提交事务
-                cursor.execute('COMMIT')
-
-                logger.info(f"用户及相关数据删除成功: user_id={user_id}")
+                self.conn.execute('BEGIN IMMEDIATE')
+                delete_user_data(self.conn, user_id)
+                self.conn.commit()
                 return True
-
-            except Exception as e:
-                # 回滚事务
-                cursor.execute('ROLLBACK')
-                logger.error(f"删除用户及相关数据失败: {e}")
+            except Exception:
+                self.conn.rollback()
+                logger.error('删除用户数据失败，已回滚')
                 return False
 
     def get_table_data(self, table_name: str):

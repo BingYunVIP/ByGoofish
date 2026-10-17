@@ -81,7 +81,7 @@ class XianyuSellerAPI:
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(trust_env=False)
             self._owns_session = True
         return self._session
 

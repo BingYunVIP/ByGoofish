@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from utils.direct_network import direct_browser_options
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mock_captcha.html"
 FIXTURE_URL = FIXTURE.resolve().as_uri()
@@ -34,7 +35,7 @@ async def _run_flow():
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        **direct_browser_options({'args': ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]}),
     )
     try:
         context = await browser.new_context(viewport={"width": 800, "height": 600})

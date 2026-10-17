@@ -21,6 +21,8 @@ import {
   requestFreshCaptchaUrl,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
+import { useDialogFocus } from '../lib/useDialogFocus';
+import { rotateAccountApiKey } from '../services/api';
 import {Power, Edit2, Trash2, QrCode, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
 import { EmptyState, PageHeader, PageLoading } from './ui';
 
@@ -47,6 +49,9 @@ const AccountList: React.FC = () => {
   const qrPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const qrSessionRef = useRef<string>('');
   const [activeModal, setActiveModal] = useState<ModalType>(null);
+  const [oneTimeApiKey, setOneTimeApiKey] = useState('');
+  useEffect(() => { if (activeModal !== 'edit') setOneTimeApiKey(''); }, [activeModal]);
+  const editDialog = useDialogFocus(activeModal === 'edit', () => { setActiveModal(null); setOneTimeApiKey(''); });
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
   const [refreshingProfileId, setRefreshingProfileId] = useState<string | null>(null);
   // 正在取新验证链接的账号
@@ -251,7 +256,8 @@ const AccountList: React.FC = () => {
       if (closed) return;
       const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
       const ws = new WebSocket(
-        `${scheme}://${location.host}/api/captcha/ws/${encodeURIComponent(captchaAccount.id)}`
+        `${scheme}://${location.host}/api/captcha/ws/${encodeURIComponent(captchaAccount.id)}`,
+        ['xianyu-auth', localStorage.getItem('auth_token') || '']
       );
       captchaWsRef.current = ws;
 
@@ -320,6 +326,7 @@ const AccountList: React.FC = () => {
   };
 
   const openEditModal = (account: AccountDetail) => {
+    setOneTimeApiKey('');
     setEditingAccount(account);
     setEditForm({
       remark: account.remark || account.note || '',
@@ -335,6 +342,7 @@ const AccountList: React.FC = () => {
   };
 
   const openAIModal = async (account: AccountDetail) => {
+    setOneTimeApiKey('');
     setEditingAccount(account);
     setSaving(true);
     try {
@@ -513,7 +521,7 @@ const AccountList: React.FC = () => {
         qrPollTimerRef.current = setTimeout(pollStatus, 300);
       } else {
         setQrStatus('error');
-        setQrMessage('二维码生成失败，请重试');
+        setQrMessage(res.message || '二维码生成失败，请重试');
       }
     } catch (e) {
       setQrStatus('error');
@@ -599,6 +607,9 @@ const AccountList: React.FC = () => {
 
       <p className="text-xs leading-5 text-gray-400">
         提示：挂 VPN、代理或部署在海外服务器时，闲鱼风控会明显收紧，滑块和人脸验证的通过率大幅下降，建议使用国内网络环境登录与运行。
+      </p>
+      <p className="text-xs leading-5 text-gray-500">
+        监听状态显示后台任务的最近检查结果。标有“手动测试”的通知只用于验证投递，不表示账号发生异常，也不会改变这里的状态。
       </p>
 
       {/* Account Grid */}
@@ -852,7 +863,7 @@ const AccountList: React.FC = () => {
                               )}
                           </div>
 
-                          <p className="mt-4 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-500">
+                          <p role="status" aria-live="polite" className="mt-4 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-500">
                             {qrMessage || '二维码有效期为5分钟，请尽快扫码。'}
                           </p>
                       </div>
@@ -865,7 +876,7 @@ const AccountList: React.FC = () => {
       {/* 编辑账号弹窗 */}
       {activeModal === 'edit' && editingAccount && createPortal(
         <div className="modal-overlay">
-          <div className="modal-container" style={{maxWidth: '600px'}}>
+          <div ref={editDialog} role="dialog" aria-modal="true" aria-label="编辑账号" tabIndex={-1} className="modal-container" style={{maxWidth: '600px'}}>
             <div className="modal-header flex items-start justify-between gap-4">
               <div>
                 <h3 className="text-lg font-bold text-gray-900">编辑账号</h3>
@@ -905,26 +916,35 @@ const AccountList: React.FC = () => {
                 />
               </div>
 
+              <div className="space-y-2 rounded-md border border-gray-200 p-3">
+                <p className="text-sm">接口密钥仅限此账号，重新生成会撤销旧密钥。</p>
+                <button type="button" className="ios-btn-secondary rounded-md px-3 py-2 text-sm" onClick={async () => {
+                  if (!await confirmAction('生成新密钥后旧密钥立即失效，是否继续？')) return;
+                  try { const result = await rotateAccountApiKey(editingAccount.id); setOneTimeApiKey(result.api_key); }
+                  catch { notify('生成密钥失败，请稍后重试', 'error'); }
+                }}>生成账号接口密钥</button>
+                {oneTimeApiKey && <label className="block text-xs">密钥仅显示本次，请安全保存<input readOnly type="password" value={oneTimeApiKey} className="ios-input w-full font-mono" onFocus={event => event.target.select()} /></label>}
+              </div>
               {/* Cookie */}
               <div>
                 <label className="block text-sm font-bold text-gray-700 mb-2">Cookie</label>
                 <textarea
                   value={editForm.cookie}
                   onChange={(e) => setEditForm({ ...editForm, cookie: e.target.value })}
-                  placeholder="更新账号Cookie"
+                  placeholder="留空保留当前 Cookie；填写新的值才会替换"
                   className="ios-input h-28 w-full resize-y rounded-md px-3 py-2.5 font-mono text-xs"
                 />
-                <p className="text-xs text-gray-500 mt-1">当前Cookie长度: {editForm.cookie.length} 字符</p>
+                <p className="text-xs text-gray-500 mt-1">{editingAccount.cookie_configured ? `当前已配置 Cookie（${editingAccount.cookie_length || 0} 字符）；留空不会修改` : '尚未配置 Cookie'}</p>
               </div>
 
-              {/* 自动确认收货 */}
+              {/* 自动确认发货 */}
               <div className="flex items-center justify-between gap-4 rounded-md border border-gray-200 bg-gray-50 p-4">
                 <div>
                   <div className="font-bold text-gray-900 flex items-center gap-2">
                     <Check className="w-4 h-4 text-green-500" />
-                    自动确认收货
+                    自动确认发货
                   </div>
-                  <div className="text-xs text-gray-500">自动点击确认收货按钮</div>
+                  <div className="text-xs text-gray-500">卡券发送完成后确认卖家发货；请按业务需要开启</div>
                 </div>
                 <button
                   type="button"
@@ -956,7 +976,7 @@ const AccountList: React.FC = () => {
                   max="1440"
                   className="ios-input w-full rounded-md px-3 py-2.5"
                 />
-                <p className="text-xs text-gray-500 mt-1">设置后会暂停处理该账号的订单，到时间后自动恢复</p>
+                <p className="text-xs text-gray-500 mt-1">手动回复后暂停自动回复相应分钟，不会暂停订单任务</p>
               </div>
 
               {/* 登录信息 */}
@@ -983,7 +1003,7 @@ const AccountList: React.FC = () => {
                         type={editForm.showLoginPassword ? 'text' : 'password'}
                         value={editForm.login_password}
                         onChange={(e) => setEditForm({ ...editForm, login_password: e.target.value })}
-                        placeholder="用于自动登录"
+                        placeholder={editingAccount.login_password_configured ? '已保存，留空保留原密码' : '用于自动登录'}
                         className="ios-input w-full rounded-md px-3 py-2.5 pr-11"
                       />
                       <button

@@ -1,0 +1,29 @@
+[Unit]
+Description=Xianyu local service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/xianyu-super-butler
+ExecStart=/opt/xianyu-super-butler/.venv/bin/python -u Start.py
+Environment=API_HOST=127.0.0.1
+Environment=API_PORT=8080
+Environment=WEB_CONCURRENCY=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=SQL_LOG_ENABLED=false
+EnvironmentFile=-/etc/xianyu.env
+User=xianyu
+Group=xianyu
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGINT
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

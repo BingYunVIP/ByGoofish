@@ -31,6 +31,9 @@ export interface LoginResponse {
 
 // Accounts
 export interface AccountDetail {
+  cookie_configured?: boolean;
+  cookie_length?: number;
+  login_password_configured?: boolean;
   id: string;
   value?: string; // cookie value from backend
   cookie?: string; // alias for value
@@ -363,6 +366,7 @@ export type NotificationChannelType =
   | 'telegram';
 
 export interface NotificationChannel {
+  configured_fields?: string[];
   id: string;
   name: string;
   type: NotificationChannelType;
@@ -547,6 +551,7 @@ export interface OrderAnalytics {
 
 // Settings
 export interface SystemSettings {
+  smtp_password_configured?: boolean;
   ai_model?: string;
   ai_api_key?: string;
   ai_base_url?: string;

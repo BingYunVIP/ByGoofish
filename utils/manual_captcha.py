@@ -116,7 +116,7 @@ async def _fetch_live_verification_url(cookie_id: str, cookies_str: str) -> Opti
             "cookie": cookies_str,
         }
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=False) as session:
             async with session.post(
                 API_ENDPOINTS.get("token"),
                 params=params,

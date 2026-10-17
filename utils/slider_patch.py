@@ -8,9 +8,10 @@ from utils import browser_limit
 import time
 import random
 from utils.user_agents import CHROME_UA
+from utils.direct_network import direct_browser_options
 
 
-def send_notification(user_id: str, title: str, message: str, notification_type: str = "info"):
+def send_notification(user_id: str, title: str, message: str, notification_type: str = "info", *, event_type: str = 'captcha_manual'):
     """
     发送通知的公共方法（支持多种通知渠道）
     
@@ -37,7 +38,7 @@ def send_notification(user_id: str, title: str, message: str, notification_type:
         # 获取账号的通知配置
         try:
             from app.db_manager import db_manager
-            notifications = db_manager.get_account_notifications(user_id)
+            notifications = db_manager.get_account_notifications(user_id, event_type=event_type)
             
             if not notifications:
                 logger.debug(f"【{user_id}】未配置消息通知，跳过发送")
@@ -113,20 +114,10 @@ def send_notification(user_id: str, title: str, message: str, notification_type:
                             
                             # 定义同步发送邮件的函数
                             def send_email_sync():
-                                # 根据配置选择SSL或TLS连接方式
-                                if smtp_use_ssl:
-                                    # 使用SSL连接（端口465）
-                                    server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
-                                else:
-                                    # 使用普通连接，然后升级到TLS（端口587）
-                                    server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
-                                    if smtp_use_tls:
-                                        server.starttls()
-                                
-                                server.login(email_user, email_password)
-                                server.sendmail(email_user, [recipient_email], msg.as_string())
-                                server.quit()
-                            
+                                from app.services.smtp_delivery import send_message
+                                send_message(msg, smtp_server, smtp_port, email_user, email_password,
+                                             use_ssl=smtp_use_ssl, use_tls=smtp_use_tls, timeout=30)
+
                             # 在线程池中执行同步邮件发送
                             loop = asyncio.get_event_loop()
                             await loop.run_in_executor(None, send_email_sync)
@@ -134,7 +125,7 @@ def send_notification(user_id: str, title: str, message: str, notification_type:
                             logger.info(f"【{user_id}】邮件通知发送成功 ({channel_name}) - {'SSL' if smtp_use_ssl else 'TLS' if smtp_use_tls else 'Plain'}")
                             notification_sent = True
                         except Exception as email_error:
-                            logger.error(f"【{user_id}】邮件通知发送失败: {email_error}")
+                            logger.error(f"【{user_id}】邮件通知发送失败: {type(email_error).__name__}")
                     else:
                         logger.warning(f"【{user_id}】邮件通知配置不完整")
                 
@@ -1743,7 +1734,7 @@ def patch_login_with_password_headful():
                     context = playwright.chromium.launch_persistent_context(
                         user_data_dir,  # 第一个参数就是用户数据目录
                         headless=not show_browser,
-                        args=browser_args,
+                        **direct_browser_options({'args': browser_args}),
                         viewport={'width': 1980, 'height': 1024},
                         user_agent=CHROME_UA,
                         accept_downloads=True,
@@ -2002,7 +1993,7 @@ def patch_login_with_password_headful():
                                             f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                                             f"请检查账号和密码是否正确，然后重新配置。"
                                         )
-                                        send_notification(user_id, notification_title, notification_message, "error")
+                                        send_notification(user_id, notification_title, notification_message, "error", event_type='login_failed')
                                     except Exception as notify_err:
                                         logger.warning(f"【{user_id}】发送账密错误通知失败: {notify_err}")
                                     

@@ -126,7 +126,7 @@ class GeetestLib:
         url = f"{GeetestConfig.API_URL}{GeetestConfig.REGISTER_URL}"
         
         try:
-            async with httpx.AsyncClient(timeout=GeetestConfig.TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=GeetestConfig.TIMEOUT, trust_env=False) as client:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 data = response.json()
@@ -251,7 +251,7 @@ class GeetestLib:
         url = f"{GeetestConfig.API_URL}{GeetestConfig.VALIDATE_URL}"
         
         try:
-            async with httpx.AsyncClient(timeout=GeetestConfig.TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=GeetestConfig.TIMEOUT, trust_env=False) as client:
                 response = await client.post(url, data=params)
                 response.raise_for_status()
                 data = response.json()

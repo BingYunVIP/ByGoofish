@@ -226,7 +226,7 @@ class NotificationTestServiceTests(unittest.TestCase):
             log_fn=lambda level, message, user: logs.append((level, message, user)),
         )
 
-        result = self.run_async(service.send_rule_test(7, 42, {"user_id": 42, "username": "seller"}))
+        result = self.run_async(service.send_rule_test(7, 42, {"user_id": 42, "username": "seller"}, mode="channel", confirm_channel_send=True))
 
         self.assertTrue(result["success"])
         self.assertEqual(result["channel"]["id"], 11)
@@ -249,7 +249,7 @@ class NotificationTestServiceTests(unittest.TestCase):
             sender=_RecordingSender(result=False),
         )
         with self.assertRaises(NotificationTestError) as raised:
-            self.run_async(service.send_rule_test(7, 42))
+            self.run_async(service.send_rule_test(7, 42, mode="channel", confirm_channel_send=True))
         self.assertEqual(raised.exception.code, "notification_send_failed")
 
     def test_failures_map_to_stable_codes_and_rate_limit(self):
@@ -263,7 +263,7 @@ class NotificationTestServiceTests(unittest.TestCase):
         for error, code, status in cases:
             service = NotificationTestService(_TargetDB(_target()), sender=_RecordingSender(error=error))
             with self.assertRaises(NotificationTestError) as raised:
-                self.run_async(service.send_rule_test(7, 42))
+                self.run_async(service.send_rule_test(7, 42, mode="channel", confirm_channel_send=True))
             self.assertEqual(raised.exception.code, code)
             self.assertEqual(raised.exception.status_code, status)
 
@@ -274,9 +274,9 @@ class NotificationTestServiceTests(unittest.TestCase):
             limiter=NotificationTestRateLimiter(limit=3),
         )
         for _ in range(3):
-            self.run_async(service.send_rule_test(7, 42))
+            self.run_async(service.send_rule_test(7, 42, mode="channel", confirm_channel_send=True))
         with self.assertRaises(NotificationTestError) as raised:
-            self.run_async(service.send_rule_test(7, 42))
+            self.run_async(service.send_rule_test(7, 42, mode="channel", confirm_channel_send=True))
         self.assertEqual(raised.exception.status_code, 429)
         self.assertEqual(len(sender.calls), 3)
 

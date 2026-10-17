@@ -28,59 +28,30 @@ class FileLogCollector:
     
     def setup_file_monitoring(self):
         """设置文件监控"""
-        # 查找日志文件
-        possible_files = [
-            "xianyu.log",
-            "app.log", 
-            "system.log",
-            "logs/xianyu.log",
-            "logs/app.log"
-        ]
-        
-        for file_path in possible_files:
-            if os.path.exists(file_path):
-                self.log_file = file_path
-                break
-        
-        if not self.log_file:
-            # 如果没有找到现有文件，创建一个新的
-            self.log_file = "realtime.log"
-            
-        # 设置loguru输出到文件
-        self.setup_loguru_file_output()
-        
+        from app.logging_setup import LOG_PATH, configure_logging
+        configure_logging()
+        self.log_file = str(LOG_PATH)
+        self._inode = None
+
         # 启动文件监控线程
         self.monitor_thread = threading.Thread(target=self.monitor_file, daemon=True)
         self.monitor_thread.start()
     
     def setup_loguru_file_output(self):
-        """设置loguru输出到文件"""
-        try:
-            from loguru import logger
-            
-            # 添加文件输出
-            logger.add(
-                self.log_file,
-                format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {name}:{function}:{line} - {message}",
-                level="INFO",  # 从DEBUG改为INFO，减少日志量
-                rotation="10 MB",
-                retention="3 days",  # 从7天改为3天，减少磁盘占用
-                enqueue=False,  # 改为False，避免队列延迟
-                buffering=1     # 行缓冲，立即写入
-            )
-            
-            logger.info("文件日志收集器已启动")
-            
-        except ImportError:
-            pass
-    
+        from app.logging_setup import configure_logging
+        configure_logging()
+
     def monitor_file(self):
         """监控日志文件变化"""
         while True:
             try:
                 if os.path.exists(self.log_file):
                     # 获取文件大小
-                    file_size = os.path.getsize(self.log_file)
+                    stat = os.stat(self.log_file)
+                    file_size = stat.st_size
+                    if self._inode != stat.st_ino or file_size < self.last_position:
+                        self.last_position = 0
+                        self._inode = stat.st_ino
                     
                     if file_size > self.last_position:
                         # 读取新增内容
@@ -106,7 +77,7 @@ class FileLogCollector:
         try:
             # 解析loguru格式的日志
             # 格式: 2025-07-23 15:46:03.430 | INFO | __main__:debug_collector:70 - 消息
-            pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) \| (\w+) \| ([^:]+):([^:]+):(\d+) - (.*)'
+            pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) \|\s*(\w+)\s*\| ([^:]+):([^:]+):(\d+) - (.*)'
             match = re.match(pattern, line)
             
             if match:

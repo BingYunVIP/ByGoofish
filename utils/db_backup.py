@@ -9,16 +9,17 @@
 
 import glob
 import os
-import sqlite3
+from pathlib import Path
+from datetime import datetime
 import time
 from typing import Any, Dict, List
 
 from loguru import logger
 
 
-BACKUP_DIR = "data"
+DB_PATH = os.getenv('DB_PATH', os.path.join('data', 'xianyu_data.db'))
+BACKUP_DIR = str(Path(DB_PATH).resolve().parent)
 BACKUP_PREFIX = "xianyu_data_backup_"
-DB_PATH = os.path.join("data", "xianyu_data.db")
 
 
 def create_backup(keep: int = 7) -> Dict[str, Any]:
@@ -43,20 +44,12 @@ def create_backup(keep: int = 7) -> Dict[str, Any]:
         }
 
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     target = os.path.join(BACKUP_DIR, f"{BACKUP_PREFIX}{stamp}.db")
 
     try:
-        source = sqlite3.connect(DB_PATH)
-        try:
-            dest = sqlite3.connect(target)
-            try:
-                # 在线备份，写入中也能拿到一致快照
-                source.backup(dest)
-            finally:
-                dest.close()
-        finally:
-            source.close()
+        from app.services.database_snapshot import snapshot
+        snapshot(DB_PATH, target)
     except Exception as e:
         logger.error(f"数据库备份失败: {e}")
         # 失败时清掉可能产生的半成品

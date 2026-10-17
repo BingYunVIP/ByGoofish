@@ -17,7 +17,7 @@ class CaptchaRemoteController:
         self.active_sessions: Dict[str, Dict[str, Any]] = {}
         self.websocket_connections: Dict[str, Any] = {}
     
-    async def create_session(self, session_id: str, page: Page) -> Dict[str, str]:
+    async def create_session(self, session_id: str, page: Page, owner_id: int = None) -> Dict[str, str]:
         """
         创建远程控制会话
         
@@ -28,6 +28,12 @@ class CaptchaRemoteController:
         Returns:
             包含会话信息的字典
         """
+        if owner_id is None:
+            from app.db_manager import db_manager
+            account = db_manager.get_cookie_details(session_id)
+            owner_id = account.get('user_id') if account else None
+        if owner_id is None:
+            raise ValueError('验证会话必须绑定所有者')
         # 获取滑块元素位置
         captcha_info = await self._get_captcha_info(page)
         
@@ -46,6 +52,7 @@ class CaptchaRemoteController:
         
         # 存储会话
         self.active_sessions[session_id] = {
+            'owner_id': int(owner_id),
             'page': page,
             'screenshot': screenshot_base64,
             'captcha_info': captcha_info,

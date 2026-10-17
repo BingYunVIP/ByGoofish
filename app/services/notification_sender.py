@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
+from .smtp_delivery import send_message as send_smtp_message, DeliveryUncertain, TLSVerificationFailed
 
 from .notification_channels import (
     NotificationChannelConfigError,
@@ -79,6 +80,14 @@ class NotificationNetworkError(NotificationSendError):
         super().__init__("通知渠道发送失败，请检查网络或服务配置")
 
 
+class NotificationDeliveryUncertain(NotificationSendError):
+    code = 'notification_delivery_unknown'
+    category = 'uncertain'
+
+    def __init__(self):
+        super().__init__('邮件提交结果不确定，请先查收邮箱，不要立即重复发送',status_code=504)
+
+
 @dataclass(frozen=True)
 class NotificationSendReceipt:
     channel_type: str
@@ -88,7 +97,7 @@ class NotificationSendReceipt:
 
 _MAX_TIMEOUT_SECONDS = 30.0
 _DEFAULT_TIMEOUT_SECONDS = 10.0
-_EMAIL_SUBJECT = "闲鱼超级管家测试通知"
+_EMAIL_SUBJECT = "【手动测试·无需处理】闲鱼超级管家通知投递验证"
 
 
 def _safe_url(url: Any) -> str:
@@ -302,10 +311,12 @@ class NotificationSender:
     ) -> NotificationSendReceipt:
         sender = self.email_sender or self._send_email_sync
         try:
-            await asyncio.wait_for(
-                self._run_email_sender(sender, config, message),
-                timeout=self.timeout_seconds,
-            )
+            # SMTP工作线程自身执行截止时间；不取消等待并遗留继续发信的线程。
+            await self._run_email_sender(sender, {**config, '_timeout_seconds': self.timeout_seconds}, message)
+        except DeliveryUncertain as exc:
+            raise NotificationDeliveryUncertain() from exc
+        except TLSVerificationFailed as exc:
+            raise NotificationSendError(str(exc), code='notification_tls_invalid', category='tls', status_code=502) from None
         except asyncio.TimeoutError as exc:
             raise NotificationSendTimeout() from exc
         except smtplib.SMTPAuthenticationError as exc:
@@ -340,28 +351,11 @@ class NotificationSender:
         email["To"] = str(config["recipient_email"])
         email.set_content(message)
 
-        smtp_server = str(config["smtp_server"])
-        smtp_port = int(config["smtp_port"])
-        use_tls = bool(config.get("smtp_use_tls", smtp_port == 587))
-        server: Any = None
-        try:
-            if smtp_port == 465:
-                server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=_MAX_TIMEOUT_SECONDS)
-            else:
-                server = smtplib.SMTP(smtp_server, smtp_port, timeout=_MAX_TIMEOUT_SECONDS)
-                if use_tls:
-                    server.starttls()
-            server.login(str(config["email_user"]), str(config["email_password"]))
-            server.send_message(email)
-        finally:
-            if server is not None:
-                try:
-                    server.quit()
-                except Exception:
-                    try:
-                        server.close()
-                    except Exception:
-                        pass
+        send_smtp_message(email, str(config['smtp_server']), int(config['smtp_port']),
+                          str(config['email_user']), str(config['email_password']),
+                          use_tls=bool(config.get('smtp_use_tls',True)),
+                          use_ssl=bool(config.get('smtp_use_ssl',False)),
+                          timeout=config.get('_timeout_seconds',_DEFAULT_TIMEOUT_SECONDS))
 
     async def _send_webhook(
         self, config: dict[str, Any], message: str, *, request_id: str | None = None

@@ -8,7 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-FROM node:20-alpine AS frontend-builder
+FROM node:22-alpine AS frontend-builder
 
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
@@ -23,13 +23,13 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 RUN python -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir --upgrade pip
+    /opt/venv/bin/pip install --no-cache-dir pip==26.2.1
 
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
 
 COPY . .
 COPY --from=frontend-builder /frontend/dist ./static
@@ -58,16 +58,21 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /app /app
+RUN groupadd --gid 10001 xianyu && useradd --uid 10001 --gid xianyu --create-home xianyu
+COPY --from=builder --chown=10001:10001 /app /app
 
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 RUN playwright install-deps chromium && \
     playwright install chromium && \
-    mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
-    chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images && \
+    mkdir -p /app/logs /app/data /app/backups /app/browser_data /app/static/uploads/images && \
+    chown -R 10001:10001 /app/logs /app/data /app/backups /app/browser_data /app/static/uploads && \
+    chmod 700 /app/logs /app/data /app/backups /app/browser_data /app/static/uploads /app/static/uploads/images && \
     chmod +x /app/entrypoint.sh
+
+USER 10001:10001
+ENV WEB_CONCURRENCY=1 SQL_LOG_ENABLED=false
 
 EXPOSE 8080
 
