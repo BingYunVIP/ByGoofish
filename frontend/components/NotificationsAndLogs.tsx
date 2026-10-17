@@ -42,11 +42,13 @@ import {
   getRiskControlLogs,
   getSystemLogs,
   setMessageNotification,
+  testEmailChannel,
   testMessageNotification,
   updateMessageNotificationRule,
   updateNotificationChannel,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
+import { describeApiError } from '../lib/errorMessage';
 import { EmptyState, PageHeader, PageTabs, SectionHeader } from './ui';
 
 type PageTab = 'channels' | 'bindings' | 'risk' | 'system';
@@ -64,9 +66,12 @@ interface ChannelDefinition {
     type?: 'text' | 'password' | 'number' | 'textarea' | 'select';
     options?: string[];
     optional?: boolean;
+    maxLength?: number;
   }>;
   defaults: Record<string, unknown>;
 }
+
+type ChannelField = ChannelDefinition['fields'][number];
 
 const CHANNEL_DEFINITIONS: Record<NotificationChannelType, ChannelDefinition> = {
   dingtalk: {
@@ -96,13 +101,15 @@ const CHANNEL_DEFINITIONS: Record<NotificationChannelType, ChannelDefinition> = 
   email: {
     label: '邮件',
     fields: [
-      { key: 'smtp_server', label: 'SMTP 服务器', placeholder: 'smtp.example.com' },
+      { key: 'smtp_server', label: 'SMTP 服务器', placeholder: 'smtp.qq.com' },
       { key: 'smtp_port', label: 'SMTP 端口', type: 'number' },
       { key: 'email_user', label: '发件邮箱' },
       { key: 'email_password', label: '邮箱密码或授权码', type: 'password' },
       { key: 'recipient_email', label: '接收邮箱' },
+      { key: 'smtp_from', label: '发件人显示名', placeholder: '留空则只显示发件邮箱', maxLength: 80 },
     ],
-    defaults: { smtp_port: 587 },
+    // QQ 邮箱：smtp.qq.com，465 端口（SSL）
+    defaults: { smtp_server: 'smtp.qq.com', smtp_port: 465 },
   },
   webhook: {
     label: 'Webhook',
@@ -177,6 +184,9 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
   const [channelName, setChannelName] = useState('');
   const [channelConfig, setChannelConfig] = useState<Record<string, unknown>>({});
   const [savingChannel, setSavingChannel] = useState(false);
+  const [emailTesting, setEmailTesting] = useState(false);
+  const emailTestingRef = useRef(false);
+  const [emailTestStatus, setEmailTestStatus] = useState<{ tone: 'success' | 'error'; text: string } | null>(null);
   const [ruleEditorOpen, setRuleEditorOpen] = useState(false);
   const [editingRule, setEditingRule] = useState<MessageNotification | null>(null);
   const [ruleAccount, setRuleAccount] = useState('');
@@ -232,6 +242,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
     setChannelType(type);
     setChannelName('');
     setChannelConfig({ ...CHANNEL_DEFINITIONS[type].defaults });
+    setEmailTestStatus(null);
     setEditorOpen(true);
   };
 
@@ -240,13 +251,78 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
     setChannelType(channel.type);
     setChannelName(channel.name);
     setChannelConfig({ ...CHANNEL_DEFINITIONS[channel.type].defaults, ...channel.config });
+    setEmailTestStatus(null);
     setEditorOpen(true);
   };
 
   const changeChannelType = (type: NotificationChannelType) => {
     setChannelType(type);
     setChannelConfig({ ...CHANNEL_DEFINITIONS[type].defaults });
+    setEmailTestStatus(null);
   };
+
+  // 用编辑窗口里当前填写的内容发一封测试邮件，不用先保存；授权码留空则沿用已保存的
+  const runEmailTest = async () => {
+    if (emailTestingRef.current) return;
+    emailTestingRef.current = true;
+    setEmailTesting(true);
+    setEmailTestStatus(null);
+    try {
+      const result = await testEmailChannel({
+        channel_id: editingChannel ? Number(editingChannel.id) : undefined,
+        smtp_server: String(channelConfig.smtp_server ?? ''),
+        smtp_port: Number(channelConfig.smtp_port) || 0,
+        email_user: String(channelConfig.email_user ?? ''),
+        email_password: String(channelConfig.email_password ?? ''),
+        smtp_from: String(channelConfig.smtp_from ?? ''),
+        recipient_email: String(channelConfig.recipient_email ?? ''),
+      });
+      setEmailTestStatus({
+        tone: 'success',
+        text: `${result.message}${result.request_id ? `（追踪 ID：${result.request_id}）` : ''}`,
+      });
+    } catch (error) {
+      setEmailTestStatus({ tone: 'error', text: describeApiError(error, '测试发信失败，请稍后重试') });
+    } finally {
+      emailTestingRef.current = false;
+      setEmailTesting(false);
+    }
+  };
+
+  const renderChannelField = (field: ChannelField, className = '') => (
+    <label key={field.key} className={`block text-sm font-bold text-gray-700 ${className}`}>
+      {field.label}{field.optional ? '（可选）' : ''}
+      {field.type === 'textarea' ? (
+        <textarea
+          value={String(channelConfig[field.key] ?? '')}
+          onChange={(event) => setChannelConfig({ ...channelConfig, [field.key]: event.target.value })}
+          placeholder={editingChannel?.configured_fields?.includes(field.key) ? '已配置，留空保留原值' : field.placeholder}
+          rows={4}
+          className="ios-input mt-2 w-full resize-y rounded-md px-3 py-2.5 font-mono text-sm font-normal"
+        />
+      ) : field.type === 'select' ? (
+        <select
+          value={String(channelConfig[field.key] ?? '')}
+          onChange={(event) => setChannelConfig({ ...channelConfig, [field.key]: event.target.value })}
+          className="ios-input mt-2 w-full rounded-md px-3 py-2.5 font-normal"
+        >
+          {field.options?.map((option) => <option key={option}>{option}</option>)}
+        </select>
+      ) : (
+        <input
+          type={field.type || 'text'}
+          value={String(channelConfig[field.key] ?? '')}
+          maxLength={field.maxLength}
+          onChange={(event) => setChannelConfig({
+            ...channelConfig,
+            [field.key]: field.type === 'number' ? Number(event.target.value) : event.target.value,
+          })}
+          placeholder={editingChannel?.configured_fields?.includes(field.key) ? '已配置，留空保留原值' : field.placeholder}
+          className="ios-input mt-2 w-full rounded-md px-3 py-2.5 font-normal"
+        />
+      )}
+    </label>
+  );
 
   const saveChannel = async () => {
     setSavingChannel(true);
@@ -949,7 +1025,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
 
       {editorOpen && (
         <div className="modal-overlay">
-          <div className="modal-container max-w-xl">
+          <div className={`modal-container ${channelType === 'email' ? 'max-w-2xl' : 'max-w-xl'}`}>
             <div className="modal-header flex items-start justify-between gap-4">
               <div>
                 <h3 className="text-lg font-bold text-gray-900">{editingChannel ? '编辑通知渠道' : '新建通知渠道'}</h3>
@@ -987,39 +1063,40 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                   ))}
                 </select>
               </label>
-              {CHANNEL_DEFINITIONS[channelType].fields.map((field) => (
-                <label key={field.key} className="block text-sm font-bold text-gray-700">
-                  {field.label}{field.optional ? '（可选）' : ''}
-                  {field.type === 'textarea' ? (
-                    <textarea
-                      value={String(channelConfig[field.key] ?? '')}
-                      onChange={(event) => setChannelConfig({ ...channelConfig, [field.key]: event.target.value })}
-                      placeholder={editingChannel?.configured_fields?.includes(field.key) ? '已配置，留空保留原值' : field.placeholder}
-                      rows={4}
-                      className="ios-input mt-2 w-full resize-y rounded-md px-3 py-2.5 font-mono text-sm font-normal"
-                    />
-                  ) : field.type === 'select' ? (
-                    <select
-                      value={String(channelConfig[field.key] ?? '')}
-                      onChange={(event) => setChannelConfig({ ...channelConfig, [field.key]: event.target.value })}
-                      className="ios-input mt-2 w-full rounded-md px-3 py-2.5 font-normal"
+              {channelType === 'email' ? (
+                <div className="grid gap-4 sm:grid-cols-2">
+                  {CHANNEL_DEFINITIONS.email.fields
+                    .filter((field) => field.key !== 'smtp_from')
+                    .map((field) => renderChannelField(field, field.key === 'recipient_email' ? 'sm:col-span-2' : ''))}
+                  {/* 发件人显示名与测试发信放在同一行 */}
+                  <div className="flex flex-wrap items-end gap-3 sm:col-span-2">
+                    {renderChannelField(
+                      CHANNEL_DEFINITIONS.email.fields.find((field) => field.key === 'smtp_from') as ChannelField,
+                      'min-w-[12rem] flex-1',
+                    )}
+                    <div>
+                      <span className="block text-sm font-bold text-gray-700">测试发信</span>
+                      <button
+                        type="button"
+                        onClick={() => void runEmailTest()}
+                        disabled={emailTesting}
+                        className="ios-btn-secondary mt-2 flex items-center gap-2 whitespace-nowrap rounded-md px-4 py-2.5 text-sm disabled:opacity-50"
+                      >
+                        {emailTesting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                        {emailTesting ? '发送中' : '发送测试邮件'}
+                      </button>
+                    </div>
+                  </div>
+                  {emailTestStatus && (
+                    <p
+                      role={emailTestStatus.tone === 'error' ? 'alert' : 'status'}
+                      className={`text-xs leading-5 sm:col-span-2 ${emailTestStatus.tone === 'error' ? 'text-red-600' : 'text-emerald-700'}`}
                     >
-                      {field.options?.map((option) => <option key={option}>{option}</option>)}
-                    </select>
-                  ) : (
-                    <input
-                      type={field.type || 'text'}
-                      value={String(channelConfig[field.key] ?? '')}
-                      onChange={(event) => setChannelConfig({
-                        ...channelConfig,
-                        [field.key]: field.type === 'number' ? Number(event.target.value) : event.target.value,
-                      })}
-                      placeholder={editingChannel?.configured_fields?.includes(field.key) ? '已配置，留空保留原值' : field.placeholder}
-                      className="ios-input mt-2 w-full rounded-md px-3 py-2.5 font-normal"
-                    />
+                      {emailTestStatus.text}
+                    </p>
                   )}
-                </label>
-              ))}
+                </div>
+              ) : CHANNEL_DEFINITIONS[channelType].fields.map((field) => renderChannelField(field))}
             </div>
             <div className="modal-footer flex justify-end gap-3">
               <button

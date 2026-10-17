@@ -52,10 +52,10 @@ class AIReplyEngineTests(unittest.TestCase):
             patch.object(self.engine, "get_bargain_count", return_value=0),
             patch.object(self.engine, "_is_dashscope_api", return_value=False),
             patch.object(self.engine, "_is_gemini_api", return_value=False),
-            patch.object(self.engine, "_create_openai_client", return_value=Mock()),
+            patch.object(self.engine, "_create_ai_client", return_value=Mock()),
             patch.object(
                 self.engine,
-                "_call_openai_api",
+                "_call_ai_api",
                 return_value='  "有货，可以直接拍。"  ',
             ) as call_openai,
             patch("app.ai_reply_engine.db_manager.get_ai_reply_settings", return_value=settings),
@@ -112,8 +112,8 @@ class AIReplyEngineTests(unittest.TestCase):
             patch.object(self.engine, "get_bargain_count", return_value=0),
             patch.object(self.engine, "_is_dashscope_api", return_value=False),
             patch.object(self.engine, "_is_gemini_api", return_value=False),
-            patch.object(self.engine, "_create_openai_client", return_value=Mock()),
-            patch.object(self.engine, "_call_openai_api", return_value="按说明激活即可。") as call_openai,
+            patch.object(self.engine, "_create_ai_client", return_value=Mock()),
+            patch.object(self.engine, "_call_ai_api", return_value="按说明激活即可。") as call_openai,
             patch("app.ai_reply_engine.db_manager.get_ai_reply_settings", return_value=settings),
         ):
             self.engine.generate_reply(
@@ -159,8 +159,8 @@ class AIReplyEngineTests(unittest.TestCase):
             patch.object(self.engine, "get_bargain_count", return_value=0),
             patch.object(self.engine, "_is_dashscope_api", return_value=False),
             patch.object(self.engine, "_is_gemini_api", return_value=False),
-            patch.object(self.engine, "_create_openai_client", return_value=Mock()),
-            patch.object(self.engine, "_call_openai_api", return_value="你好"),
+            patch.object(self.engine, "_create_ai_client", return_value=Mock()),
+            patch.object(self.engine, "_call_ai_api", return_value="你好"),
             patch("app.ai_reply_engine.db_manager.get_ai_reply_settings", return_value=settings),
         ):
             self.engine.generate_reply("你好", {}, "chat", "account", "buyer", "item", True)

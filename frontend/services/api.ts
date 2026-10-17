@@ -10,9 +10,9 @@ import {
   MessageFilter, MessageFilterType, AutoReplyLog
   , ChatAccount, ChatConversation, ChatMessage, ProductMaterial,
   ProductFilterRule, ProductDeleteRule, AutomationTaskRun,
-  ProductAutomationResult, ProductDeletePreview, QuickPhrase,
-  AnnouncementPayload
+  ProductAutomationResult, ProductDeletePreview, QuickPhrase
 } from '../types';
+import { DEFAULT_AI_BASE_URL } from '../lib/aiEndpoint';
 
 // Auth
 export const login = async (data: {
@@ -938,17 +938,48 @@ export const updateSystemSettings = async (settings: Partial<SystemSettings>): P
     return { success: true, message: 'Settings saved' };
 };
 
-export interface EmailTestPayload {
-    to: string;
-    smtp_server: string;
-    smtp_port: number;
-    smtp_user: string;
-    smtp_password: string;
-    smtp_from: string;
+export interface AIModelsRequest {
+    base_url: string;
+    /** 留空表示沿用已保存的密钥（仅当接口地址没有变化时有效） */
+    api_key?: string;
+    user_agent?: string;
+    scope: 'account' | 'system';
+    cookie_id?: string;
 }
 
-export const sendTestEmail = async (payload: EmailTestPayload): Promise<{ success: boolean; message: string }> => {
-    return post('/system-settings/email-test', payload);
+export interface AIModelsResult {
+    success: boolean;
+    /** 后端规范化后的接口地址（已补 /v1） */
+    base_url: string;
+    models: string[];
+    count: number;
+}
+
+/** 用表单里当前的接口地址和密钥读取中转站可用的模型，无需先保存。 */
+export const fetchAIModels = async (payload: AIModelsRequest): Promise<AIModelsResult> => {
+    return post('/ai-models', payload, { timeout: 40000 });
+};
+
+export interface EmailChannelTestPayload {
+    /** 编辑已有渠道时带上：授权码留空则沿用该渠道已保存的授权码 */
+    channel_id?: number;
+    smtp_server: string;
+    smtp_port: number;
+    email_user: string;
+    email_password: string;
+    smtp_from: string;
+    recipient_email: string;
+}
+
+export interface EmailChannelTestResult {
+    success: boolean;
+    message: string;
+    request_id?: string;
+}
+
+/** 用编辑窗口里当前填写的邮件配置发一封手动测试邮件，无需先保存渠道。 */
+export const testEmailChannel = async (payload: EmailChannelTestPayload): Promise<EmailChannelTestResult> => {
+    return post('/notification-channels/email-test', payload, { timeout: 45000 });
 };
 
 export const getAccountAISettings = async (cookieId: string): Promise<AIReplySettings> => {
@@ -960,7 +991,9 @@ export const updateAccountAISettings = async (cookieId: string, settings: Partia
     ai_enabled: settings.ai_enabled ?? false,
     model_name: settings.model_name ?? 'qwen-plus',
     api_key: settings.api_key ?? '',
-    base_url: settings.base_url ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    base_url: settings.base_url || DEFAULT_AI_BASE_URL,
+    // PUT 是整行覆盖保存：漏掉 user_agent 会让后端把它静默重置为空
+    user_agent: settings.user_agent ?? '',
     max_discount_percent: settings.max_discount_percent ?? 10,
     max_discount_amount: settings.max_discount_amount ?? 100,
     max_bargain_rounds: settings.max_bargain_rounds ?? 3,
@@ -984,6 +1017,8 @@ export const testAIConnection = async (
   const result = await post<{ success?: boolean; message?: string; reply?: string }>(
     `/ai-reply-test/${cookieId}`,
     { message: '你好，这是一条测试消息', ...payload },
+    // 后端在总时限 50 秒内会先试首选协议、再降级，默认的 30 秒会先把请求掐断
+    { timeout: 70000 },
   );
   return {
     success: result.success ?? true,
@@ -1294,11 +1329,6 @@ export const deleteDefaultReply = async (cookieId: string): Promise<ApiResponse>
 
 export const clearDefaultReplyRecords = async (cookieId: string): Promise<ApiResponse> => {
   return post(`/default-replies/${cookieId}/clear-records`, {});
-};
-
-// 全局公告与版本检查：后端代拉公网 JSON 并缓存，force 用于「立即检查更新」
-export const getAnnouncement = async (force = false): Promise<AnnouncementPayload> => {
-  return get('/api/announcement', force ? { force: true } : undefined);
 };
 
 // 物流报价表解析（识别结果持久化，支持多份报价表）

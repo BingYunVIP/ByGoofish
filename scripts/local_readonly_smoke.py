@@ -48,7 +48,7 @@ def main():
             result['notification_passwords_absent'] = all(
                 not json.loads(row['config']).get('email_password') for row in channels if row['type'] == 'email')
             names = ['总览', '账号管理', '商品与发货', '订单管理', '买家互动', '卡密库存',
-                     '消息中心', '自动回复', 'AI 回复', '商品自动化', '用户管理', '通知与日志', '系统设置', '关于']
+                     '消息中心', '自动回复', 'AI 回复', '商品自动化', '用户管理', '通知与日志', '系统设置']
             for name in names:
                 page.get_by_role('button', name=name, exact=True).first.click()
                 page.wait_for_load_state('networkidle')

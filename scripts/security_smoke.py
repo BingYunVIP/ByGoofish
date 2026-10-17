@@ -63,6 +63,7 @@ def main():
         work=Path(directory);password=secrets.token_urlsafe(24);admin_password=secrets.token_urlsafe(24)
         (work/'local_app.py').write_text(BOOTSTRAP)
         with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+        with socket.socket() as sock:sock.bind(('127.0.0.1',0));dead_port=sock.getsockname()[1]  # 释放后无人监听：连接立即被拒绝
         env={**os.environ,'PYTHONPATH':f'{work}:{ROOT}','DB_PATH':str(work/'local.db'),
              'AUDIT_PASSWORD':password,'ADMIN_PASSWORD':admin_password,'SQL_LOG_ENABLED':'false','PYTHONDONTWRITEBYTECODE':'1'}
         if args.frontend_dir:env['APP_STATIC_DIR']=str(args.frontend_dir.resolve())
@@ -145,20 +146,78 @@ def main():
                 r=client.put(f'/notification-channels/{webhook}',headers=owner,json={'config':public_webhook['config']})
                 with sqlite3.connect(work/'local.db') as d:stored_webhook=json.loads(d.execute('SELECT config FROM notification_channels WHERE id=?',(webhook,)).fetchone()[0])
                 check('blank webhook fields preserve credentials',r.status_code==200 and stored_webhook['headers']==webhook_config['headers'] and stored_webhook['webhook_url']==webhook_config['webhook_url'])
+                # —— 精简与整合：公告更新、系统级邮件设置已移除；AI 与邮件测试接口只接受登录用户 ——
+                check('announcement endpoint removed',client.get('/api/announcement',headers=owner).status_code==404)
+                check('system email test endpoint removed',client.post('/system-settings/email-test',headers=admin,json={}).status_code in (404,405))
+                all_settings=client.get('/system-settings',headers=admin).json();all_settings=all_settings.get('data',all_settings)
+                check('no stale announcement or system SMTP settings',not any(k.startswith(('announcement_','smtp_')) for k in all_settings))
+                check('AI model list requires login',client.post('/ai-models',json={}).status_code==401)
+                check('email channel test requires login',client.post('/notification-channels/email-test',json={}).status_code==401)
+                # 邮件渠道测试的目标限制与参数校验（都在发信之前拒绝，不会发出任何邮件）
+                email_form={'smtp_server':'smtp.qq.com','smtp_port':465,'email_user':'a@qq.com','email_password':'x','recipient_email':'a@qq.com'}
+                r=client.post('/notification-channels/email-test',headers=owner,json={**email_form,'email_password':''})
+                check('email test needs a password when none is saved',r.status_code==400)
+                for host in ('127.0.0.1','169.254.169.254'):
+                    r=client.post('/notification-channels/email-test',headers=owner,json={**email_form,'smtp_server':host})
+                    check('email test refuses internal target '+host,r.status_code==400 and r.json()['detail']['code']=='notification_target_forbidden')
+                r=client.post('/notification-channels/email-test',headers=owner,json={**email_form,'recipient_email':'not-an-email'})
+                check('email test validates addresses',r.status_code==400)
+                # AI 接口地址：自动补 /v1，非管理员不能指向本机或内网，公网必须 https
+                ai_url=client.get('/ai-reply-settings/test-owned',headers=owner).json()['base_url']
+                check('AI default address is the configured relay',ai_url=='https://api.bingyun.vip/v1')
+                body={'ai_enabled':False,'model_name':'m','api_key':'sk-fixture-key-0123456789','base_url':'api.bingyun.vip','user_agent':'ua-from-form/1.0'}
+                r=client.put('/ai-reply-settings/test-owned',headers=owner,json=body)
+                saved=client.get('/ai-reply-settings/test-owned',headers=owner).json()
+                check('AI address gets /v1 appended and user agent is kept',r.status_code==200 and saved['base_url']=='https://api.bingyun.vip/v1' and saved['user_agent']=='ua-from-form/1.0')
+                check('AI key never returned',saved['api_key']=='' and saved['api_key_configured'] is True)
+                for bad in ('http://127.0.0.1:9/v1','http://169.254.169.254/v1','http://api.bingyun.vip/v1','ftp://x.com','https://user:pw@x.com/v1'):
+                    r=client.put('/ai-reply-settings/test-owned',headers=owner,json={**body,'api_key':'','base_url':bad})
+                    check('AI address rejected: '+bad,r.status_code==400)
+                check('rejected address left saved value unchanged',client.get('/ai-reply-settings/test-owned',headers=owner).json()['base_url']=='https://api.bingyun.vip/v1')
+                check('system AI address validated for admin',client.put('/system-settings/ai_api_url',headers=admin,json={'value':'http://api.bingyun.vip/v1'}).status_code==400)
+                check('system AI address normalized',client.put('/system-settings/ai_api_url',headers=admin,json={'value':'api.bingyun.vip'}).status_code==200
+                      and client.get('/system-settings',headers=admin).json().get('ai_api_url')=='https://api.bingyun.vip/v1')
+                # 模型列表接口：先在联网前拒绝的情形（不依赖任何外部服务）
+                def models(headers,payload):
+                    time.sleep(2.2)  # 该接口两次请求至少间隔 2 秒
+                    return client.post('/ai-models',headers=headers,json=payload)
+                check('models: missing key is rejected',models(owner,{'base_url':'https://api.bingyun.vip/v1'}).status_code==400)
+                check('models: saved key is not reused for a different address',
+                      'API Key' in models(owner,{'base_url':'https://other.example.invalid/v1','cookie_id':'test-owned'}).json()['detail'])
+                check('models: other users cannot use my account key',models(other,{'base_url':'https://api.bingyun.vip/v1','cookie_id':'test-owned'}).status_code==404)
+                check('models: system scope is admin only',models(owner,{'base_url':'https://api.bingyun.vip/v1','scope':'system'}).status_code==403)
+                internal={'base_url':'http://127.0.0.1:9/v1','api_key':'sk-x-0123456789012345'}
+                check('models: non-admin cannot target internal hosts',models(owner,internal).status_code==400)
+                check('models: rapid repeat by the same user is rate limited',client.post('/ai-models',headers=owner,json=internal).status_code==429)
+                check('models: metadata address refused even for admin',models(admin,{'base_url':'http://169.254.169.254/v1','api_key':'sk-x-0123456789012345'}).status_code==400)
+                # 旧版遗留设置在服务重启时被清理；填写过的系统 SMTP 不会被静默销毁
+                with sqlite3.connect(work/'local.db') as d:
+                    d.executemany('INSERT OR REPLACE INTO system_settings(key,value,description) VALUES(?,?,?)',
+                                  [('announcement_enabled','true',''),('announcement_source_url','https://example.invalid/a.json',''),
+                                   ('smtp_server','',''),('smtp_password','',''),('smtp_port','587','')])
                 # 已取得的真实会话与真实静态构建做前端验收，不替换任何API响应。
+                def same_row(left,right):
+                    # right 在 left 的右侧，且垂直方向在同一行
+                    return abs((left['y']+left['height']/2)-(right['y']+right['height']/2))<12 and right['x']>=left['x']+left['width']-2
                 if args.frontend_dir:
                     from playwright.sync_api import sync_playwright,expect
                     from utils.direct_network import direct_browser_options
                     with sync_playwright() as pw:
                         with pw.chromium.launch(**direct_browser_options({'headless':True})) as browser:
                             page=browser.new_page(viewport={'width':1440,'height':1000})
-                            errors=[];fetches=[]
+                            errors=[];fetches=[];requested=[]
                             page.on('pageerror',lambda e:errors.append(str(e)))
+                            page.on('request',lambda r:requested.append(r.url))
                             page.on('request',lambda r:fetches.append(r.url) if r.url.endswith('/cookies/details') else None)
                             page.goto(f'http://127.0.0.1:{port}/',wait_until='networkidle')
+                            page.evaluate("localStorage.setItem('active_page','about')")  # 旧版本留下的、已删除的页面
+                            page.reload(wait_until='networkidle')
                             page.get_by_placeholder('请输入账号').fill('owner')
                             page.get_by_placeholder('请输入密码').fill(password)
                             page.get_by_role('button',name='登录',exact=True).click()
+                            page.get_by_role('button',name='账号管理',exact=True).wait_for()
+                            check('removed page in storage falls back to dashboard',
+                                  page.evaluate("localStorage.getItem('active_page')")=='dashboard')
                             page.get_by_role('button',name='账号管理',exact=True).click()
                             page.wait_for_load_state('networkidle')
                             check('inactive pages are not mounted',page.locator('section[hidden]').count()==0)
@@ -180,6 +239,41 @@ def main():
                             page.keyboard.press('Escape')
                             expect(dialog).to_be_hidden()
                             check('dialog restores trigger focus',page.evaluate("document.activeElement.title==='编辑账号'"))
+                            # —— 精简后的界面（owner 是普通用户）——
+                            check('sidebar has no About entry',page.get_by_role('button',name='关于',exact=True).count()==0)
+                            check('no announcement request is made',not any('/api/announcement' in url for url in requested))
+                            page.get_by_role('button',name='AI 回复',exact=True).click()
+                            page.get_by_label('接口地址').wait_for()
+                            url_box=page.get_by_label('接口地址')
+                            expect(url_box).to_have_value('https://api.bingyun.vip/v1')
+                            url_box.fill('api.example.com');url_box.blur()
+                            check('AI address gets /v1 on blur',url_box.input_value()=='https://api.example.com/v1')
+                            url_box.fill('https://api.example.com/v1/chat/completions');url_box.blur()
+                            check('pasted endpoint path is trimmed',url_box.input_value()=='https://api.example.com/v1')
+                            for text in ('免费领取 token','没有 API Key？每天可免费领取额度','兼容 OpenAI 协议的服务根地址','AI 不够用','跳转到我的中转站'):
+                                check('AI page has no ad/help text: '+text,page.get_by_text(text).count()==0)
+                            model_box=page.get_by_label('模型名称');fetch_button=page.get_by_role('button',name='获取模型')
+                            check('model fetch button sits right of the model name',fetch_button.count()==1 and same_row(model_box.bounding_box(),fetch_button.bounding_box()))
+                            url_box.fill('http://127.0.0.1:9/v1');url_box.blur()
+                            page.get_by_placeholder('输入新密钥以替换').fill('sk-fixture-key-0123456789')
+                            page.wait_for_timeout(2300)
+                            fetch_button.click()
+                            expect(page.get_by_text('目标地址指向本机或内网，仅管理员可以使用')).to_be_visible()
+                            check('model fetch shows the backend reason inline',True)
+                            page.get_by_role('button',name='通知与日志',exact=True).click()
+                            page.get_by_role('button',name='新建渠道').click()
+                            page.get_by_label('渠道类型').select_option('email')
+                            expect(page.get_by_label('SMTP 服务器')).to_have_value('smtp.qq.com')
+                            expect(page.get_by_label('SMTP 端口')).to_have_value('465')
+                            check('QQ mail defaults are smtp.qq.com and 465',True)
+                            name_box=page.get_by_label('发件人显示名');test_button=page.get_by_role('button',name='发送测试邮件')
+                            check('display name and test send share one row',same_row(name_box.bounding_box(),test_button.bounding_box()))
+                            for text in ('使用上方表单当前填写的配置直接发送','QQ 邮箱等服务通常要求填写授权码'):
+                                check('mail form has no help text: '+text,page.get_by_text(text).count()==0)
+                            test_button.click()
+                            expect(page.get_by_text('请先完整填写 SMTP 服务器')).to_be_visible()
+                            check('mail test reports missing fields without sending',True)
+                            page.get_by_role('button',name='取消',exact=True).click()
                             page.set_viewport_size({'width':390,'height':844})
                             page.wait_for_timeout(300)
                             check('closed mobile sidebar does not cover content',page.locator('aside').bounding_box()['x']<=-247)
@@ -190,6 +284,32 @@ def main():
                             page.get_by_role('button',name='退出登录',exact=True).click()
                             expect(page.get_by_placeholder('请输入账号')).to_be_visible()
                             check('logout button revokes server session',not client.get('/verify',headers={'Authorization':'Bearer '+browser_token}).json()['authenticated'])
+                            # —— 管理员的系统设置页 ——
+                            page.get_by_placeholder('请输入账号').fill('admin')
+                            page.get_by_placeholder('请输入密码').fill(admin_password)
+                            page.get_by_role('button',name='登录',exact=True).click()
+                            page.get_by_role('button',name='系统设置',exact=True).click()
+                            page.get_by_role('tab',name='账号与同步',exact=True).wait_for()
+                            check('admin sidebar has no About entry',page.get_by_role('button',name='关于',exact=True).count()==0)
+                            tabs=[tab.inner_text().strip() for tab in page.get_by_role('tab').all()]
+                            check('settings tabs: no announcement and no mail service',tabs==['账号与同步','默认 AI 配置','快捷短语'])
+                            page.get_by_role('tab',name='默认 AI 配置',exact=True).click()
+                            api_box=page.get_by_label('API 地址')
+                            expect(api_box).to_have_value('https://api.bingyun.vip/v1')
+                            api_box.fill('api.example.com');api_box.blur()
+                            check('system AI address gets /v1 on blur',api_box.input_value()=='https://api.example.com/v1')
+                            for text in ('填写兼容 OpenAI 协议的服务根地址','AI 不够用','跳转到我的中转站'):
+                                check('system AI tab has no help text: '+text,page.get_by_text(text).count()==0)
+                            model_box=page.get_by_label('默认模型');fetch_button=page.get_by_role('button',name='获取模型')
+                            check('default model fetch button sits right of the field',fetch_button.count()==1 and same_row(model_box.bounding_box(),fetch_button.bounding_box()))
+                            api_box.fill(f'http://127.0.0.1:{dead_port}/v1');api_box.blur()
+                            page.get_by_placeholder('sk-...').fill('sk-fixture-key-0123456789')
+                            page.wait_for_timeout(2300)
+                            fetch_button.click()
+                            expect(page.get_by_text('读取模型列表失败')).to_be_visible()
+                            check('admin model fetch reports connection failure inline',True)
+                            page.get_by_role('button',name='退出登录',exact=True).click()
+                            expect(page.get_by_placeholder('请输入账号')).to_be_visible()
                 request={'cookie_id':'test-owned','msg_time':'local','user_url':'','send_user_id':'local','send_user_name':'local','item_id':'local','send_message':'local','chat_id':'local'}
                 check('anonymous reply blocked',client.post('/xianyu/reply',json=request).status_code==401)
                 check('cross account reply blocked',client.post('/xianyu/reply',headers=other,json=request).status_code==404)
@@ -214,6 +334,9 @@ def main():
                 owner=login('owner',new_password)
                 stop();start()
                 check('session survives service restart',client.get('/verify',headers=owner).json()['authenticated'])
+                with sqlite3.connect(work/'local.db') as d:
+                    left=[r[0] for r in d.execute("SELECT key FROM system_settings WHERE key LIKE 'announcement\\_%' ESCAPE '\\' OR key LIKE 'smtp\\_%' ESCAPE '\\'")]
+                check('restart cleans removed settings',left==[])
                 local_code='''from app.db_manager import db_manager as d
 r=d.conn.execute("SELECT user_id FROM cookies WHERE id='test-owned'").fetchone()
 assert d.save_cookie('test-owned','unb=test-owned; cookie2=updated',r[0])

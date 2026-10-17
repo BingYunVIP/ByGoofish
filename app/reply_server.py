@@ -45,6 +45,8 @@ from app.services.notification_test import (
 from app.routers.delivery_block import create_delivery_block_router
 from app.routers.logistics_quote import create_logistics_quote_router
 from app.routers.logistics_agent import create_logistics_agent_router
+from app.routers.ai_models import create_ai_models_router
+from app.services.ai_client import DEFAULT_AI_BASE_URL, AIConfigError, resolve_base_url, validate_outbound_url
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
@@ -332,6 +334,7 @@ app.include_router(create_logistics_quote_router(get_current_user, db_manager))
 logger.info("已注册物流报价解析路由")
 
 app.include_router(create_logistics_agent_router(get_current_user, db_manager))
+app.include_router(create_ai_models_router(get_current_user, db_manager))
 logger.info("已注册物流 Agent 路由")
 
 # 初始化文件日志收集器
@@ -375,6 +378,8 @@ app.mount('/static', PrivateAwareStaticFiles(directory=static_dir), name='static
 # 挂载 /assets 路径，指向 static/assets 目录
 # 这样访问 /assets/xxx.js 时会正确映射到 static_dir/assets/xxx.js
 assets_dir = os.path.join(static_dir, 'assets')
+# 前端构建产物不进版本库：没构建过时目录不存在，StaticFiles 会在导入时直接报错，这里先建好空目录
+os.makedirs(assets_dir, exist_ok=True)
 app.mount('/assets', StaticFiles(directory=assets_dir), name='assets')
 
 # 确保图片上传目录存在
@@ -1770,14 +1775,18 @@ class SystemSettingIn(BaseModel):
     description: Optional[str] = None
 
 
-class EmailTestIn(BaseModel):
-    """测试发信：SMTP 连接参数来自设置页表单当前值，测试前无需保存"""
-    to: str
-    smtp_server: str = ''
-    smtp_port: int = 0
-    smtp_user: str = ''
-    smtp_password: str = ''
-    smtp_from: str = ''
+class EmailChannelTestIn(BaseModel):
+    """邮件渠道测试：参数来自编辑窗口当前填写的内容，测试前无需保存。
+
+    授权码留空且带 channel_id 时，沿用该渠道已保存的授权码（服务器和发件邮箱未改动时）。
+    """
+    channel_id: Optional[int] = None
+    smtp_server: str = Field('', max_length=255)
+    smtp_port: int = Field(0, ge=0, le=65535)
+    email_user: str = Field('', max_length=255)
+    email_password: str = Field('', max_length=255)
+    smtp_from: str = Field('', max_length=80)
+    recipient_email: str = Field('', max_length=255)
 
 
 class SystemSettingCreateIn(BaseModel):
@@ -3975,7 +3984,7 @@ def get_system_settings(current_user: Dict[str, Any] = Depends(require_auth)):
 
 @app.put('/system-settings/{key}')
 def update_system_setting(key: str, setting_data: SystemSettingIn,
-                          _: Dict[str, Any] = Depends(require_admin)):
+                          admin_user: Dict[str, Any] = Depends(require_admin)):
     """更新系统设置"""
     from app.db_manager import db_manager
     try:
@@ -3987,6 +3996,8 @@ def update_system_setting(key: str, setting_data: SystemSettingIn,
             raise HTTPException(400, '请使用账号范围API密钥，不可修改展示标记')
         if secret_setting(key) and not setting_data.value.strip():
             return {'msg': 'secret unchanged'}
+        if key == 'ai_api_url':
+            setting_data.value = _validated_ai_base_url(setting_data.value, admin_user)
         success = db_manager.set_system_setting(key, setting_data.value, setting_data.description)
         if success:
             return {'msg': 'system setting updated'}
@@ -3998,31 +4009,27 @@ def update_system_setting(key: str, setting_data: SystemSettingIn,
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post('/system-settings/email-test')
-async def send_email_test(data: EmailTestIn, _: Dict[str, Any] = Depends(require_admin)):
-    """用设置页表单当前的 SMTP 配置发一封测试邮件，验证邮件服务可用性。"""
-    import re
-    from app.db_manager import db_manager
-    if not data.smtp_password:
-        data.smtp_password = db_manager.get_system_setting('smtp_password') or ''
-    to = data.to.strip()
-    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', to):
-        return {'success': False, 'message': '请输入正确的收件邮箱地址'}
-    if not (data.smtp_server.strip() and data.smtp_port and data.smtp_user.strip() and data.smtp_password.strip()):
-        return {'success': False, 'message': '请先完整填写 SMTP 服务器、端口、发件邮箱和授权码'}
-    # TLS/SSL 开关不在表单里，沿用库中已保存的值（默认 TLS 开、SSL 关）
-    smtp_use_tls = (db_manager.get_system_setting('smtp_use_tls') or 'true').lower() == 'true'
-    smtp_use_ssl = (db_manager.get_system_setting('smtp_use_ssl') or 'false').lower() == 'true'
-    smtp_from = data.smtp_from.strip() or data.smtp_user.strip()
+@app.post('/notification-channels/email-test')
+async def test_email_channel(data: EmailChannelTestIn, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """用邮件渠道编辑窗口里当前填写的配置发一封手动测试邮件，无需先保存渠道。"""
+    user_info = {"user_id": current_user.get("user_id"), "username": current_user.get("username", "")}
     try:
-        ok, message = await db_manager.send_test_email(
-            to, data.smtp_server.strip(), int(data.smtp_port),
-            data.smtp_user.strip(), data.smtp_password.strip(),
-            smtp_from, smtp_use_tls, smtp_use_ssl)
-        return {'success': ok, 'message': message}
-    except Exception as e:
-        logger.error(f"测试发信异常: {e}")
-        return {'success': False, 'message': f'测试发信异常：{e}'}
+        return await notification_test_service.send_email_config_test(
+            data.dict(exclude={'channel_id'}),
+            int(current_user['user_id']),
+            user_info,
+            channel_id=data.channel_id,
+            allow_private=current_user.get('username') == ADMIN_USERNAME,
+        )
+    except NotificationTestError as exc:
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail(), headers=headers) from exc
+    except Exception as exc:  # noqa: BLE001 - 未知异常不回显，避免带出配置内容
+        log_with_user("error", "source=notification_test mode=email_config result=server_error", user_info)
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "notification_send_failed", "message": "邮件测试服务暂时不可用，请稍后重试"},
+        ) from exc
 
 
 # ------------------------- 注册设置接口 -------------------------
@@ -6294,7 +6301,7 @@ class AIReplySettings(BaseModel):
     ai_enabled: bool
     model_name: str = "qwen-plus"
     api_key: str = ""
-    base_url: str = "https://ai.corleom.com/v1"
+    base_url: str = DEFAULT_AI_BASE_URL
     user_agent: str = ""
     max_discount_percent: int = 10
     max_discount_amount: int = 100
@@ -6303,6 +6310,20 @@ class AIReplySettings(BaseModel):
     context_message_limit: int = 12
     context_expire_minutes: int = 120
     custom_prompts: str = ""
+
+
+def _validated_ai_base_url(raw: str, current_user: Dict[str, Any]) -> str:
+    """规范化并校验用户填写的 AI 接口地址（自动补 /v1）；非管理员不能指向本机或内网。"""
+    try:
+        url = resolve_base_url(raw)
+        validate_outbound_url(
+            url,
+            allow_private=current_user.get('username') == ADMIN_USERNAME,
+            require_resolution=False,
+        )
+    except AIConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return url
 
 
 def _public_ai_reply_settings(settings: dict) -> dict:
@@ -6379,12 +6400,9 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
         if cookie_id not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
-        # 检查账号是否存在
-        if cookie_manager.manager is None:
-            raise HTTPException(status_code=500, detail='CookieManager 未就绪')
-
-        # 保存设置
+        # 保存设置（只涉及数据库，不依赖账号任务是否已启动）
         settings_dict = settings.dict()
+        settings_dict['base_url'] = _validated_ai_base_url(settings.base_url, current_user)
         settings_dict['context_message_limit'] = max(
             2, min(30, settings.context_message_limit)
         )
@@ -6467,7 +6485,8 @@ async def test_ai_reply(cookie_id: str, test_data: dict,
             'desc': test_data.get('item_desc', '这是一个测试商品')
         }
 
-        # 生成测试回复（跳过等待时间）
+        # 生成测试回复（跳过等待时间），失败时带回具体原因
+        failures: list = []
         reply = await ai_reply_engine.generate_reply_async(
             message=test_message,
             item_info=test_item_info,
@@ -6475,13 +6494,15 @@ async def test_ai_reply(cookie_id: str, test_data: dict,
             cookie_id=cookie_id,
             user_id="test_user",
             item_id="test_item",
-            skip_wait=True  # 测试时跳过10秒等待
+            skip_wait=True,  # 测试时跳过10秒等待
+            error_out=failures,
         )
 
         if reply:
             return {"message": "测试成功", "reply": reply}
         else:
-            raise HTTPException(status_code=400, detail="AI回复生成失败，请检查API Key是否正确、API地址是否可访问")
+            reason = failures[0] if failures else "请检查 API Key 是否正确、API 地址是否可访问"
+            raise HTTPException(status_code=400, detail=f"AI回复生成失败：{reason}")
 
     except HTTPException:
         raise
@@ -8991,7 +9012,7 @@ async def import_orders(
 
 # 定义后端 API 的一级路径。未匹配的 API 路径必须返回 JSON 404，不能回退到 SPA。
 API_ROOTS = {
-    'admin', 'ai-reply-settings', 'ai-reply-test', 'analytics', 'api', 'backup',
+    'admin', 'ai-models', 'ai-reply-settings', 'ai-reply-test', 'analytics', 'api', 'backup',
     'cards', 'change-admin-password', 'change-password', 'cookie', 'cookies',
     'blacklist', 'debug', 'default-replies', 'delivery-block-rules', 'delivery-rules', 'face-verification',
     'generate-captcha', 'geetest', 'health', 'item-reply', 'itemReplays', 'items',
@@ -9019,20 +9040,6 @@ DEFAULT_RATE_TEMPLATE = '宝贝收到了，很满意，感谢老板，欢迎下�
 def _seller_feature_enabled(key: str) -> bool:
     from app.db_manager import db_manager
     return str(db_manager.get_system_setting(key) or '').strip().lower() in ('1', 'true', 'yes')
-
-
-@app.get('/api/announcement')
-async def get_announcement(
-    force: bool = False,
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """全局公告与版本检查。
-
-    数据来自系统设置里配置的公网 JSON 地址，后端代拉并缓存 10 分钟。
-    远端不可用时沿用上次结果，保证页面不受影响。
-    """
-    from app.announcement import get_announcement_payload
-    return await get_announcement_payload(force=force)
 
 
 def _rate_template() -> str:

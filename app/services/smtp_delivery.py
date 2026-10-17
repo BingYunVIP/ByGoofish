@@ -2,10 +2,24 @@
 import smtplib
 import ssl
 import time
+from email.utils import formataddr
 
 
 class TLSVerificationFailed(RuntimeError):
     pass
+
+
+def format_sender(display_name, address):
+    """From 头 = 发件人显示名 + 发件邮箱。
+
+    QQ 等服务要求发件地址必须是登录账号，所以显示名只改名字、不改地址；
+    显示名为空或就是邮箱本身时只写邮箱。显示名里的换行会被折叠，防止邮件头注入。
+    """
+    address = (address or '').strip()
+    name = ' '.join(str(display_name or '').split())
+    if not name or name.lower() == address.lower():
+        return address
+    return formataddr((name, address))
 
 
 class DeliveryUncertain(RuntimeError):

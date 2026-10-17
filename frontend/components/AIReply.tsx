@@ -4,7 +4,6 @@ import {
   CheckCircle2,
   Eye,
   EyeOff,
-  ExternalLink,
   Loader2,
   MessageSquareText,
   Play,
@@ -19,18 +18,17 @@ import {
   updateAccountAISettings,
 } from '../services/api';
 import { notify } from '../services/feedback';
+import { DEFAULT_AI_BASE_URL, normalizeApiBaseUrl } from '../lib/aiEndpoint';
+import { describeApiError } from '../lib/errorMessage';
+import ModelPicker from './ModelPicker';
 import { EmptyState, PageHeader, PageLoading, SectionHeader } from './ui';
-
-// 自建中转，兼容 OpenAI 接口，每天可领免费额度，省去用户自己找服务商配密钥。
-const FREE_TOKEN_BASE_URL = 'https://ai.corleom.com/v1';
-const FREE_TOKEN_HOME = 'https://ai.corleom.com';
 
 const defaultSettings: AIReplySettings = {
   ai_enabled: false,
   model_name: 'qwen-plus',
   api_key: '',
   api_key_configured: false,
-  base_url: FREE_TOKEN_BASE_URL,
+  base_url: DEFAULT_AI_BASE_URL,
   user_agent: 'codex_cli_rs/0.0.0 (Hermes Agent)',
   max_discount_percent: 10,
   max_discount_amount: 100,
@@ -94,12 +92,14 @@ const AIReply: React.FC = () => {
 
     setSaving(true);
     try {
-      await updateAccountAISettings(selectedAccountId, settings);
+      // 接口地址自动补 /v1；后端会再校验一次并保存规范化后的值
+      const baseUrl = normalizeApiBaseUrl(settings.base_url) || DEFAULT_AI_BASE_URL;
+      await updateAccountAISettings(selectedAccountId, { ...settings, base_url: baseUrl });
       const refreshed = await getAccountAISettings(selectedAccountId);
       setSettings({ ...defaultSettings, ...refreshed, api_key: '' });
       notify('人工智能回复配置已保存', 'success');
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'AI配置保存失败', 'error');
+      notify(describeApiError(error, 'AI配置保存失败'), 'error');
     } finally {
       setSaving(false);
     }
@@ -122,7 +122,7 @@ const AIReply: React.FC = () => {
       setTestReply(result.reply || result.message || '测试完成');
       notify('AI回复测试完成', 'success');
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'AI回复测试失败', 'error');
+      notify(describeApiError(error, 'AI回复测试失败'), 'error');
     } finally {
       setTesting(false);
     }
@@ -207,45 +207,32 @@ const AIReply: React.FC = () => {
                   icon={Bot}
                 />
                 <div className="grid gap-4 p-5 md:grid-cols-2">
-                  <div className="md:col-span-2 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-brand-200 bg-brand-50 px-4 py-3">
-                    <div className="min-w-0">
-                      <p className="text-sm font-semibold text-gray-800">
-                        没有 API Key？每天可免费领取额度
-                      </p>
-                      <p className="mt-0.5 text-xs text-gray-600">
-                        兼容 OpenAI 接口，注册后把密钥填到下方即可直接用。
-                      </p>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      <a
-                        href={FREE_TOKEN_HOME}
-                        target="_blank"
-                        rel="noreferrer noopener"
-                        className="inline-flex items-center gap-1 rounded-md bg-brand-500 px-3 py-1.5 text-xs font-semibold text-brand-ink hover:bg-brand-600"
-                      >
-                        免费领取 token
-                        <ExternalLink className="h-3.5 w-3.5" />
-                      </a>
-                    </div>
-                  </div>
                   <label>
                     <span className="mb-1.5 block text-sm font-semibold text-gray-700">接口地址</span>
                     <input
                       value={settings.base_url}
                       onChange={event => updateSetting('base_url', event.target.value)}
+                      onBlur={() => updateSetting('base_url', normalizeApiBaseUrl(settings.base_url) || DEFAULT_AI_BASE_URL)}
                       className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
-                      placeholder={FREE_TOKEN_BASE_URL}
+                      placeholder={DEFAULT_AI_BASE_URL}
+                      autoComplete="off"
+                      spellCheck={false}
                     />
                   </label>
-                  <label>
-                    <span className="mb-1.5 block text-sm font-semibold text-gray-700">模型名称</span>
-                    <input
+                  <div>
+                    <label htmlFor="ai-model-name" className="mb-1.5 block text-sm font-semibold text-gray-700">模型名称</label>
+                    <ModelPicker
+                      id="ai-model-name"
                       value={settings.model_name}
-                      onChange={event => updateSetting('model_name', event.target.value)}
-                      className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
+                      onChange={model => updateSetting('model_name', model)}
+                      baseUrl={settings.base_url}
+                      apiKey={settings.api_key}
+                      userAgent={settings.user_agent}
+                      scope={{ kind: 'account', cookieId: selectedAccountId }}
+                      onBaseUrlResolved={url => updateSetting('base_url', url)}
                       placeholder="qwen-plus"
                     />
-                  </label>
+                  </div>
                   <label className="md:col-span-2">
                     <span className="mb-1.5 flex items-center justify-between gap-3 text-sm font-semibold text-gray-700">
                       API Key

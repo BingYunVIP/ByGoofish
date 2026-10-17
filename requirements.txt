@@ -32,7 +32,7 @@ psutil>=5.9.0
 python-multipart>=0.0.6
 
 # ==================== AI回复引擎 ====================
-openai>=1.50.0
+# 通过 httpx 直接调用中转站的 /messages、/responses、/chat/completions，不再依赖 openai SDK。
 
 # ==================== 图像处理 ====================
 Pillow>=10.0.0

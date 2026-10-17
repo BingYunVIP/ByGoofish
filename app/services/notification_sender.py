@@ -24,7 +24,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
-from .smtp_delivery import send_message as send_smtp_message, DeliveryUncertain, TLSVerificationFailed
+from .smtp_delivery import send_message as send_smtp_message, DeliveryUncertain, TLSVerificationFailed, format_sender
 
 from .notification_channels import (
     NotificationChannelConfigError,
@@ -347,7 +347,7 @@ class NotificationSender:
     def _send_email_sync(config: dict[str, Any], message: str) -> None:
         email = EmailMessage()
         email["Subject"] = _EMAIL_SUBJECT
-        email["From"] = str(config["email_user"])
+        email["From"] = format_sender(config.get("smtp_from"), str(config["email_user"]))
         email["To"] = str(config["recipient_email"])
         email.set_content(message)
 

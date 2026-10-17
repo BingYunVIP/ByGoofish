@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 import time
 import math
@@ -14,7 +15,13 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 from app.notification_events import EVENT_DEFINITIONS, EVENT_IDS
 
-from app.services.notification_channels import NotificationChannelConfigError
+from app.services.ai_client import AIConfigError, validate_outbound_host
+from app.services.notification_channels import (
+    NotificationChannelConfigError,
+    normalize_channel_type,
+    parse_channel_config,
+    validate_channel_config,
+)
 from app.services.notification_sender import (
     NotificationNetworkError,
     NotificationProviderRejected,
@@ -86,6 +93,19 @@ def build_test_message(cookie_id: str, event_type: str | None = None) -> str:
         "收到本消息说明通知投递成功，无需反复点击测试。"
     )
 
+
+def build_email_config_test_message(request_id: str) -> str:
+    """邮件渠道编辑窗口里“发送测试邮件”的正文。"""
+    return (
+        "【手动测试 · 无需处理】闲鱼超级管家\n"
+        "这是你在「通知与日志」编辑邮件渠道时点击“发送测试邮件”触发的测试，不是账号异常告警。\n"
+        "本次只验证这套邮件配置能否发信，不会检测Cookie，也不会改变账号的监听状态。\n"
+        f"追踪 ID：{request_id}\n"
+        "收到本邮件说明发信配置可用，无需反复点击测试。"
+    )
+
+
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # 每个用户的同一渠道每分钟最多尝试发送一次；被过滤的事件不占发信配额。
 notification_test_rate_limiter = NotificationTestRateLimiter(limit=1, window_seconds=60)
@@ -180,6 +200,42 @@ class NotificationTestService:
             operator,
         )
 
+        await self._deliver(target["channel_type"], target["channel_config"], message, request_id, operator)
+
+        self._log_safe(
+            "info",
+            f"source=notification_test rule_id={rule_id} request_id={request_id} "
+            f"channel_id={target['channel_id']} mode={mode} result=success",
+            operator,
+        )
+
+        return {
+            "success": True,
+            "sent": True,
+            "skipped": False,
+            "mode": mode,
+            "event_type": event_type if mode == 'event' else None,
+            # 发送器返回只代表渠道已接受提交，不代表已经进入用户收件箱。
+            "message": (
+                "测试邮件已提交（手动测试，不是账号异常告警），请检查收件箱或垃圾邮件"
+                if target["channel_type"] == "email"
+                else "测试通知已提交（手动测试，不是账号异常告警），请检查接收端"
+            ),
+            "request_id": request_id,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "duration_ms": round((time.monotonic() - started_at) * 1000),
+            "channel": {
+                "id": target["channel_id"],
+                "name": target["channel_name"],
+                "type": target["channel_type"],
+            },
+            "rule_enabled": bool(target.get("enabled")),
+            "channel_enabled": bool(target.get("channel_enabled")),
+        }
+
+    async def _deliver(self, channel_type: Any, channel_config: Any, message: str,
+                       request_id: str, operator: Optional[Dict[str, Any]]) -> None:
+        """发送一条消息，并把发送器的各类异常翻译成对前端稳定的 NotificationTestError。"""
         try:
             if self.sender is None:
                 raise NotificationTestError(
@@ -188,8 +244,8 @@ class NotificationTestService:
                     status_code=503,
                 )
             receipt = await self.sender.send(
-                target["channel_type"],
-                target["channel_config"],
+                channel_type,
+                channel_config,
                 message,
             )
             if not receipt:
@@ -238,33 +294,61 @@ class NotificationTestService:
                 status_code=502,
             )
 
-        self._log_safe(
-            "info",
-            f"source=notification_test rule_id={rule_id} request_id={request_id} "
-            f"channel_id={target['channel_id']} mode={mode} result=success",
-            operator,
-        )
+    async def send_email_config_test(
+        self,
+        config: Dict[str, Any],
+        user_id: int,
+        operator: Optional[Dict[str, Any]] = None,
+        *,
+        channel_id: Optional[int] = None,
+        allow_private: bool = False,
+    ) -> Dict[str, Any]:
+        """用编辑窗口里尚未保存的邮件配置发一封手动测试邮件。
 
+        授权码留空时沿用 channel_id 渠道已保存的授权码，但只在 SMTP 服务器和发件邮箱都没改的
+        情况下：否则一次点击就能把已保存的授权码发给任意服务器。
+        """
+        config = {key: (value.strip() if isinstance(value, str) else value) for key, value in config.items()}
+        if not config.get('email_password') and channel_id is not None:
+            saved = self.db.get_notification_channel(channel_id, user_id)  # 按用户过滤，查不到别人的渠道
+            if saved and normalize_channel_type(saved.get('type')) == 'email':
+                try:
+                    old = parse_channel_config(saved.get('config'))
+                except NotificationChannelConfigError:
+                    old = {}
+                if all(str(old.get(key) or '').lower() == str(config.get(key) or '').lower()
+                       for key in ('smtp_server', 'email_user')):
+                    config['email_password'] = old.get('email_password') or ''
+        try:
+            _, config = validate_channel_config('email', config)
+        except NotificationChannelConfigError:
+            raise NotificationTestError(
+                'notification_config_invalid',
+                '请先完整填写 SMTP 服务器、端口、发件邮箱、授权码和接收邮箱', 400) from None
+        if not all(_EMAIL_PATTERN.match(str(config[key])) for key in ('email_user', 'recipient_email')):
+            raise NotificationTestError('notification_config_invalid', '发件邮箱或接收邮箱格式不正确', 400)
+        try:
+            validate_outbound_host(str(config['smtp_server']), int(config['smtp_port']), allow_private=allow_private)
+        except AIConfigError as exc:
+            raise NotificationTestError('notification_target_forbidden', str(exc), 400) from None
+
+        if self.limiter is not None:
+            retry_after = self.limiter.acquire(('email-config', int(user_id)))
+            if retry_after is not None:
+                raise NotificationTestError(
+                    'notification_rate_limited', '测试发送过于频繁，请稍后再试', status_code=429, retry_after=retry_after)
+
+        request_id = secrets.token_hex(6)
+        started_at = time.monotonic()
+        self._log_safe('info', f'source=notification_test mode=email_config request_id={request_id} '
+                       f'user_id={user_id} result=started', operator)
+        await self._deliver('email', config, build_email_config_test_message(request_id), request_id, operator)
+        self._log_safe('info', f'source=notification_test mode=email_config request_id={request_id} '
+                       f'user_id={user_id} result=success', operator)
         return {
-            "success": True,
-            "sent": True,
-            "skipped": False,
-            "mode": mode,
-            "event_type": event_type if mode == 'event' else None,
-            # 发送器返回只代表渠道已接受提交，不代表已经进入用户收件箱。
-            "message": (
-                "测试邮件已提交（手动测试，不是账号异常告警），请检查收件箱或垃圾邮件"
-                if target["channel_type"] == "email"
-                else "测试通知已提交（手动测试，不是账号异常告警），请检查接收端"
-            ),
-            "request_id": request_id,
-            "sent_at": datetime.now(timezone.utc).isoformat(),
-            "duration_ms": round((time.monotonic() - started_at) * 1000),
-            "channel": {
-                "id": target["channel_id"],
-                "name": target["channel_name"],
-                "type": target["channel_type"],
-            },
-            "rule_enabled": bool(target.get("enabled")),
-            "channel_enabled": bool(target.get("channel_enabled")),
+            'success': True, 'sent': True, 'skipped': False, 'mode': 'email_config',
+            'message': '测试邮件已提交（手动测试，不是账号异常告警），请检查收件箱或垃圾邮件',
+            'request_id': request_id,
+            'sent_at': datetime.now(timezone.utc).isoformat(),
+            'duration_ms': round((time.monotonic() - started_at) * 1000),
         }

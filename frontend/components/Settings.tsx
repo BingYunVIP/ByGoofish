@@ -1,12 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import {
   Database,
-  ExternalLink,
   Eye,
   EyeOff,
   KeyRound,
-  Mail,
-  Megaphone,
   RefreshCw,
   Save,
   Settings as SettingsIcon,
@@ -17,6 +14,7 @@ import {
 } from 'lucide-react';
 
 import { validatePassword } from '../lib/authValidation';
+import { DEFAULT_AI_BASE_URL, normalizeApiBaseUrl } from '../lib/aiEndpoint';
 
 import {
   changePassword,
@@ -24,12 +22,13 @@ import {
   deleteQuickPhrase,
   getQuickPhrases,
   getSystemSettings,
-  sendTestEmail,
   updateQuickPhrase,
   updateSystemSettings,
 } from '../services/api';
 import { notify } from '../services/feedback';
+import { describeApiError } from '../lib/errorMessage';
 import { QuickPhrase, SystemSettings } from '../types';
+import ModelPicker from './ModelPicker';
 import {
   NoticeBanner,
   PageHeader,
@@ -38,7 +37,7 @@ import {
   SectionHeader,
 } from './ui';
 
-type SettingsSection = 'general' | 'ai' | 'email' | 'phrases' | 'notice';
+type SettingsSection = 'general' | 'ai' | 'phrases';
 
 /**
  * 把后端的开关值转成布尔。
@@ -127,10 +126,6 @@ const Settings: React.FC = () => {
   };
 
   const [showApiKey, setShowApiKey] = useState(false);
-  const [showSmtpPassword, setShowSmtpPassword] = useState(false);
-  // 测试发信：收件地址 + 发送中状态
-  const [emailTestTo, setEmailTestTo] = useState('');
-  const [emailTesting, setEmailTesting] = useState(false);
 
   // 修改登录密码。与页面顶部的「保存设置」互不影响：这里改的是当前账号的凭据，
   // 走的是独立接口，成功后立刻生效。
@@ -184,45 +179,25 @@ const Settings: React.FC = () => {
 
   const loadSettings = () => {
     setLoading(true);
-    getSystemSettings().then(setSettings).finally(() => setLoading(false));
+    getSystemSettings()
+      // 接口地址没配过时直接显示默认地址：它是输入框里的真实内容，可以直接修改
+      .then(data => setSettings({ ...data, ai_api_url: data.ai_api_url || DEFAULT_AI_BASE_URL }))
+      .finally(() => setLoading(false));
   };
 
   const handleSave = async () => {
     if (!settings) return;
     setSaving(true);
     try {
-      await updateSystemSettings(settings);
+      // 接口地址自动补 /v1；后端会再校验一次并保存规范化后的值
+      const apiUrl = normalizeApiBaseUrl(settings.ai_api_url || '') || DEFAULT_AI_BASE_URL;
+      await updateSystemSettings({ ...settings, ai_api_url: apiUrl });
+      setSettings({ ...settings, ai_api_url: apiUrl });
       notify('系统配置已保存');
     } catch (error) {
-      notify(`保存失败：${(error as Error).message}`);
+      notify(`保存失败：${describeApiError(error)}`);
     } finally {
       setSaving(false);
-    }
-  };
-
-  // 用表单当前填写的 SMTP 配置直接发一封测试邮件，不用先保存
-  const handleTestEmail = async () => {
-    if (!settings) return;
-    const to = emailTestTo.trim();
-    if (!to) {
-      notify('请先填写接收测试邮件的邮箱');
-      return;
-    }
-    setEmailTesting(true);
-    try {
-      const res = await sendTestEmail({
-        to,
-        smtp_server: settings.smtp_server || '',
-        smtp_port: Number(settings.smtp_port) || 0,
-        smtp_user: settings.smtp_user || '',
-        smtp_password: settings.smtp_password || '',
-        smtp_from: settings.smtp_from || '',
-      });
-      notify(res.message || (res.success ? '测试邮件已发送' : '发送失败'), res.success ? 'success' : 'error');
-    } catch (error) {
-      notify(`测试发信失败：${(error as Error).message}`, 'error');
-    } finally {
-      setEmailTesting(false);
     }
   };
 
@@ -232,7 +207,7 @@ const Settings: React.FC = () => {
     <div className="page-stack animate-fade-in">
       <PageHeader
         title="系统设置"
-        description="配置管理端访问、商品同步、默认 AI 参数和邮件服务。"
+        description="配置管理端访问、商品同步和默认 AI 参数。"
         icon={SettingsIcon}
         actions={(
           <>
@@ -265,9 +240,7 @@ const Settings: React.FC = () => {
         items={[
           { id: 'general', label: '账号与同步', icon: UserRound },
           { id: 'ai', label: '默认 AI 配置', icon: Sparkles },
-          { id: 'email', label: '邮件服务', icon: Mail },
           { id: 'phrases', label: '快捷短语', icon: Zap },
-          { id: 'notice', label: '公告与更新', icon: Megaphone },
         ]}
       />
 
@@ -290,7 +263,7 @@ const Settings: React.FC = () => {
             />
             <SettingToggle
               title="注册邮箱验证"
-              description="要求注册时填写邮箱验证码。未配置下方「邮件服务」时请关闭，否则用户收不到验证码、无法完成注册。"
+              description="要求注册时填写邮箱验证码，验证码通过「通知与日志」里已启用的邮件渠道发出。没有邮件渠道时请关闭，否则用户收不到验证码、无法完成注册。"
               checked={toBool(settings.email_verification_enabled, true)}
               onChange={() => setSettings({
                 ...settings,
@@ -505,63 +478,6 @@ const Settings: React.FC = () => {
         </div>
       )}
 
-      {activeSection === 'notice' && (
-        <div className="grid gap-4 xl:grid-cols-2">
-          <section className="section-panel">
-            <SectionHeader
-              title="公告与更新"
-              description="填入你的公网 JSON 地址后，系统会定时拉取公告并检查新版本。"
-              icon={Megaphone}
-            />
-            <SettingToggle
-              title="启用公告与更新检查"
-              description="关闭后不再拉取远端公告，也不提示新版本。"
-              checked={settings.announcement_enabled !== 'false'}
-              onChange={() => setSettings({
-                ...settings,
-                announcement_enabled: settings.announcement_enabled === 'false' ? 'true' : 'false',
-              })}
-            />
-            <SettingToggle
-              title="展示公告"
-              description="关闭后顶部横幅和「关于」页都不再显示公告内容，仍会正常检查新版本。"
-              checked={toBool(settings.announcement_show_notice, true)}
-              onChange={() => setSettings({
-                ...settings,
-                announcement_show_notice: !toBool(settings.announcement_show_notice, true),
-              })}
-            />
-            <SettingToggle
-              title="展示版本更新提示"
-              description="关闭后不再弹出新版本横幅，公告照常显示。适合不希望团队成员自行升级的场景。"
-              checked={toBool(settings.announcement_show_update, true)}
-              onChange={() => setSettings({
-                ...settings,
-                announcement_show_update: !toBool(settings.announcement_show_update, true),
-              })}
-            />
-            <div className="px-4 py-3">
-              <label className="field-label">公告 JSON 地址</label>
-              <input
-                type="url"
-                value={settings.announcement_source_url || ''}
-                onChange={e => setSettings({
-                  ...settings,
-                  announcement_source_url: e.target.value,
-                })}
-                placeholder="https://connect.corleom.com/announcement.json（留空即用此地址）"
-                className="ios-input mt-1 w-full rounded-md px-3 py-2 text-sm"
-              />
-              <p className="mt-1.5 text-xs text-gray-500">
-                留空则使用官方公告源，可填入自建地址替换。
-                后端每 10 分钟拉取一次并缓存；远端不可用时沿用上次结果。
-                在「关于」页可手动点「检查更新」立即刷新。
-              </p>
-            </div>
-          </section>
-        </div>
-      )}
-
       {activeSection === 'phrases' && (
         <section className="section-panel">
           <SectionHeader
@@ -642,26 +558,17 @@ const Settings: React.FC = () => {
               <span className="field-label">API 地址</span>
               <input
                 type="text"
-                value={settings.ai_api_url || 'https://dashscope.aliyuncs.com/compatible-mode/v1'}
+                value={settings.ai_api_url ?? ''}
                 onChange={(event) => setSettings({ ...settings, ai_api_url: event.target.value })}
+                onBlur={() => setSettings(current => current && ({
+                  ...current,
+                  ai_api_url: normalizeApiBaseUrl(current.ai_api_url || '') || DEFAULT_AI_BASE_URL,
+                }))}
                 className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
-                placeholder="https://api.openai.com/v1"
+                placeholder={DEFAULT_AI_BASE_URL}
+                autoComplete="off"
+                spellCheck={false}
               />
-              <span className="mt-1 block text-xs text-gray-500">
-                填写兼容 OpenAI 协议的服务根地址，无需补全 `/chat/completions`。
-              </span>
-              <span className="mt-1 flex items-center gap-1 text-xs text-gray-500">
-                AI 不够用？
-                <a
-                  href="https://corleom.com/"
-                  target="_blank"
-                  rel="noreferrer noopener"
-                  className="inline-flex items-center gap-1 font-semibold text-[var(--brand-text)] hover:underline"
-                >
-                  跳转到我的中转站
-                  <ExternalLink className="h-3 w-3" />
-                </a>
-              </span>
             </label>
 
             <label>
@@ -672,7 +579,8 @@ const Settings: React.FC = () => {
                   value={settings.ai_api_key || ''}
                   onChange={(event) => setSettings({ ...settings, ai_api_key: event.target.value })}
                   className="ios-input w-full rounded-md px-3 py-2.5 pr-11 font-mono text-sm"
-                  placeholder="sk-..."
+                  placeholder={settings.ai_api_key_configured ? '已配置，留空保留原密钥' : 'sk-...'}
+                  autoComplete="new-password"
                 />
                 <button
                   type="button"
@@ -685,19 +593,19 @@ const Settings: React.FC = () => {
               </div>
             </label>
 
-            <label>
-              <span className="field-label">默认模型</span>
-              <select
-                value={settings.ai_model || 'qwen-plus'}
-                onChange={(event) => setSettings({ ...settings, ai_model: event.target.value })}
-                className="ios-input w-full rounded-md px-3 py-2.5"
-              >
-                <option value="qwen-plus">通义千问 Plus</option>
-                <option value="qwen-turbo">通义千问 Turbo</option>
-                <option value="gpt-3.5-turbo">GPT-3.5 Turbo</option>
-                <option value="gpt-4">GPT-4</option>
-              </select>
-            </label>
+            <div>
+              <label htmlFor="default-ai-model" className="field-label">默认模型</label>
+              <ModelPicker
+                id="default-ai-model"
+                value={settings.ai_model ?? ''}
+                onChange={(model) => setSettings({ ...settings, ai_model: model })}
+                baseUrl={settings.ai_api_url ?? ''}
+                apiKey={settings.ai_api_key ?? ''}
+                scope={{ kind: 'system' }}
+                onBaseUrlResolved={(url) => setSettings(current => current && ({ ...current, ai_api_url: url }))}
+                placeholder="例如 gpt-6-sol"
+              />
+            </div>
 
             <label className="lg:col-span-2">
               <span className="field-label">默认自动回复内容</span>
@@ -715,111 +623,6 @@ const Settings: React.FC = () => {
                 message="常用兼容服务包括阿里云 DashScope 和 OpenAI。API Key 仅保存在当前系统配置中。"
               />
             </div>
-          </div>
-        </section>
-      )}
-
-      {activeSection === 'email' && (
-        <section className="section-panel">
-          <SectionHeader
-            title="SMTP 邮件服务"
-            description="用于发送注册验证码和系统邮件通知。"
-            icon={Mail}
-          />
-          <div className="grid gap-4 p-4 lg:grid-cols-2">
-            <label>
-              <span className="field-label">SMTP 服务器</span>
-              <input
-                type="text"
-                value={settings.smtp_server || ''}
-                onChange={(event) => setSettings({ ...settings, smtp_server: event.target.value })}
-                placeholder="smtp.qq.com"
-                className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
-              />
-            </label>
-
-            <label>
-              <span className="field-label">SMTP 端口</span>
-              <input
-                type="number"
-                value={settings.smtp_port || 587}
-                onChange={(event) => setSettings({
-                  ...settings,
-                  smtp_port: parseInt(event.target.value, 10),
-                })}
-                placeholder="587"
-                className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
-              />
-            </label>
-
-            <label>
-              <span className="field-label">发件邮箱</span>
-              <input
-                type="email"
-                value={settings.smtp_user || ''}
-                onChange={(event) => setSettings({ ...settings, smtp_user: event.target.value })}
-                placeholder="your-email@qq.com"
-                className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
-              />
-            </label>
-
-            <label>
-              <span className="field-label">邮箱密码或授权码</span>
-              <div className="relative">
-                <input
-                  type={showSmtpPassword ? 'text' : 'password'}
-                  value={settings.smtp_password || ''}
-                  onChange={(event) => setSettings({ ...settings, smtp_password: event.target.value })}
-                  placeholder={settings.smtp_password_configured ? '已配置，留空保留原授权码' : '输入密码或授权码'}
-                  className="ios-input w-full rounded-md px-3 py-2.5 pr-11 text-sm"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowSmtpPassword(!showSmtpPassword)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-2 text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-                  aria-label={showSmtpPassword ? '隐藏邮箱授权码' : '显示邮箱授权码'}
-                >
-                  {showSmtpPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
-              </div>
-              <span className="mt-1 block text-xs text-gray-500">QQ 邮箱等服务通常要求填写授权码。</span>
-            </label>
-
-            <label className="lg:col-span-2">
-              <span className="field-label">发件人显示名</span>
-              <input
-                type="text"
-                value={settings.smtp_from || ''}
-                onChange={(event) => setSettings({ ...settings, smtp_from: event.target.value })}
-                placeholder="闲鱼自动回复系统"
-                className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
-              />
-            </label>
-          </div>
-
-          <div className="border-t border-gray-100 p-4">
-            <span className="field-label">测试发信</span>
-            <div className="flex flex-col gap-2 sm:flex-row">
-              <input
-                type="email"
-                value={emailTestTo}
-                onChange={(event) => setEmailTestTo(event.target.value)}
-                placeholder="接收测试邮件的邮箱"
-                className="ios-input w-full rounded-md px-3 py-2.5 text-sm sm:max-w-xs"
-              />
-              <button
-                type="button"
-                disabled={emailTesting}
-                onClick={() => void handleTestEmail()}
-                className="ios-btn-secondary flex items-center justify-center gap-2 whitespace-nowrap rounded-md px-4 py-2.5 text-sm disabled:opacity-50"
-              >
-                {emailTesting ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Mail className="h-4 w-4" />}
-                {emailTesting ? '发送中' : '发送测试邮件'}
-              </button>
-            </div>
-            <p className="mt-1.5 text-xs text-gray-500">
-              使用上方表单当前填写的配置直接发送，无需先保存；验证通过后注册验证码和系统通知都能正常发出。
-            </p>
           </div>
         </section>
       )}

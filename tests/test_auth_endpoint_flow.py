@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from app import reply_server
+from app.auth import SessionStore
 from app.db_manager import DBManager
 from app.reply_server import (
     LoginRequest,
@@ -32,11 +33,13 @@ class AuthEndpointFlowTests(unittest.TestCase):
         self.fresh_tracker = reply_server.login_failure_tracker.__class__()
         self._patches = [
             mock.patch("app.db_manager.db_manager", self.db),
+            mock.patch("app.auth.db_manager", self.db),  # 会话存储按用户表校验，必须指向同一个测试库
             mock.patch.object(reply_server, "email_code_send_limiter", self.fresh_limiter),
             mock.patch.object(reply_server, "login_failure_tracker", self.fresh_tracker),
         ]
         for p in self._patches:
             p.start()
+        SessionStore()  # 在这个临时库里建出会话表
         # SMTP 不真发信，直接成功
         self.db.send_verification_email = mock.AsyncMock(return_value=True)
 

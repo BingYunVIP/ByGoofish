@@ -2,7 +2,7 @@
 
 回归两个故障，都是买家侧可见的：
 
-1. 思维链泄露。_extract_openai_content 里曾有一句「content 为空就取
+1. 思维链泄露。extract_chat_text 里曾有一句「content 为空就取
    reasoning_content 兜底」。但 reasoning_content 装的是思维链而非答案，
    推理模型（deepseek-r1、qwq 等）把 token 预算花在思考上时 content 就是空的，
    于是原始推理被当成回复发给了买家：
@@ -21,6 +21,7 @@ import unittest
 from unittest.mock import patch
 
 from app.ai_reply_engine import AIReplyEngine, ReasoningBudgetExhausted
+from app.services.ai_client import extract_chat_text
 
 
 class _FakeMessage:
@@ -55,24 +56,24 @@ class ExtractContentTests(unittest.TestCase):
         ))
 
         with self.assertRaises(RuntimeError) as ctx:
-            AIReplyEngine._extract_openai_content(response)
+            extract_chat_text(response)
 
         self.assertNotIn('我们需要理解', str(ctx.exception))
 
     def test_normal_content_is_returned(self):
         response = _FakeResponse(_FakeChoice(_FakeMessage(content='  170包邮成交～  ')))
-        self.assertEqual(AIReplyEngine._extract_openai_content(response), '170包邮成交～')
+        self.assertEqual(extract_chat_text(response), '170包邮成交～')
 
     def test_content_wins_over_reasoning(self):
         response = _FakeResponse(_FakeChoice(
             _FakeMessage(content='196元包邮', reasoning_content=LEAKED)
         ))
-        self.assertEqual(AIReplyEngine._extract_openai_content(response), '196元包邮')
+        self.assertEqual(extract_chat_text(response), '196元包邮')
 
     def test_content_filter_is_reported(self):
         response = _FakeResponse(_FakeChoice(_FakeMessage(), finish_reason='content_filter'))
         with self.assertRaises(RuntimeError) as ctx:
-            AIReplyEngine._extract_openai_content(response)
+            extract_chat_text(response)
         self.assertIn('内容过滤', str(ctx.exception))
 
 

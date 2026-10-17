@@ -22,6 +22,7 @@ import {
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
 import { useDialogFocus } from '../lib/useDialogFocus';
+import { DEFAULT_AI_BASE_URL } from '../lib/aiEndpoint';
 import { rotateAccountApiKey } from '../services/api';
 import {Power, Edit2, Trash2, QrCode, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
 import { EmptyState, PageHeader, PageLoading } from './ui';
@@ -84,7 +85,7 @@ const AccountList: React.FC = () => {
     ai_enabled: false,
     model_name: 'qwen-plus',
     api_key: '',
-    base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    base_url: DEFAULT_AI_BASE_URL,
     user_agent: '',
     max_discount_percent: 10,
     max_discount_amount: 100,
@@ -353,7 +354,7 @@ const AccountList: React.FC = () => {
         ai_enabled: settings.ai_enabled ?? false,
         model_name: settings.model_name || 'qwen-plus',
         api_key: settings.api_key || '',
-        base_url: settings.base_url || 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        base_url: settings.base_url || DEFAULT_AI_BASE_URL,
         user_agent: settings.user_agent ?? '',
         max_discount_percent: settings.max_discount_percent ?? 10,
         max_discount_amount: settings.max_discount_amount ?? 100,

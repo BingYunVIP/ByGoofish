@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
 from app.password_hasher import hash_password, is_bcrypt_hash, verify_password
+from app.services.ai_client import DEFAULT_AI_BASE_URL, AIConfigError, is_default_base_url, resolve_base_url
 from app.specification import (
     DEFAULT_SPEC_KEY,
     canonicalize_specification,
@@ -172,7 +173,7 @@ class DBManager:
                 ai_enabled BOOLEAN DEFAULT FALSE,
                 model_name TEXT DEFAULT 'qwen-plus',
                 api_key TEXT,
-                base_url TEXT DEFAULT 'https://ai.corleom.com/v1',
+                base_url TEXT DEFAULT 'https://api.bingyun.vip/v1',
                 user_agent TEXT,
                 max_discount_percent INTEGER DEFAULT 10,
                 max_discount_amount INTEGER DEFAULT 100,
@@ -973,13 +974,6 @@ class DBManager:
             ('show_default_login_info', 'true', '是否显示默认登录信息'),
             ('login_captcha_enabled', 'true', '登录滑动验证码开关'),
             ('email_verification_enabled', 'true', '注册时是否要求邮箱验证码'),
-            ('smtp_server', '', 'SMTP服务器地址'),
-            ('smtp_port', '587', 'SMTP端口'),
-            ('smtp_user', '', 'SMTP登录用户名（发件邮箱）'),
-            ('smtp_password', '', 'SMTP登录密码/授权码'),
-            ('smtp_from', '', '发件人显示名（留空则使用用户名）'),
-            ('smtp_use_tls', 'true', '是否启用TLS'),
-            ('smtp_use_ssl', 'false', '是否启用SSL'),
             ('qq_reply_secret_key', '', '旧全局密钥已禁用；使用账号范围接口密钥'),
             ('item_sync_enabled', 'true', '是否启用定时自动同步商品'),
             ('item_sync_interval', '600', '商品同步间隔时间（秒）'),
@@ -999,8 +993,25 @@ class DBManager:
             self.conn.rollback()
             raise
 
+    @staticmethod
+    def _cleanup_removed_settings(cursor):
+        """清理已删除功能留下的系统设置。
+
+        * 公告与更新检查已移除，announcement_* 不再有任何用途；
+        * 系统级 SMTP 已合并进「通知与日志」的邮件渠道：从未填写过的旧默认项直接删除，
+          填写过的保留不动（不静默销毁凭证），只是不再被读取。
+        """
+        cursor.execute("DELETE FROM system_settings WHERE key LIKE 'announcement\\_%' ESCAPE '\\'")
+        cursor.execute("SELECT value FROM system_settings WHERE key IN ('smtp_server', 'smtp_password')")
+        if all(not (row[0] or '').strip() for row in cursor.fetchall()):
+            cursor.execute(
+                "DELETE FROM system_settings WHERE key IN "
+                "('smtp_server','smtp_port','smtp_user','smtp_password','smtp_from','smtp_use_tls','smtp_use_ssl')"
+            )
+
     def _migrate_database(self, cursor):
         """执行数据库迁移"""
+        self._cleanup_removed_settings(cursor)
         try:
             # 检查cards表是否存在image_url列
             cursor.execute("PRAGMA table_info(cards)")
@@ -2829,7 +2840,7 @@ class DBManager:
                     settings.get('ai_enabled', False),
                     settings.get('model_name', 'qwen-plus'),
                     settings.get('api_key', ''),
-                    settings.get('base_url', 'https://ai.corleom.com/v1'),
+                    resolve_base_url(settings.get('base_url')),
                     settings.get('user_agent', ''),
                     settings.get('max_discount_percent', 10),
                     settings.get('max_discount_amount', 100),
@@ -2847,14 +2858,21 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
+    @staticmethod
+    def _resolve_ai_base_url(raw) -> str:
+        """规范化已保存的接口地址；格式损坏时退回默认地址，不让一条坏配置拖垮回复流程。"""
+        try:
+            return resolve_base_url(raw)
+        except AIConfigError:
+            return DEFAULT_AI_BASE_URL
+
     def get_ai_reply_settings(self, cookie_id: str) -> dict:
         """获取AI回复设置
         
         优先使用账号级别的设置，如果账号没有配置api_key/base_url/model_name，
         则从系统设置中读取全局AI配置作为默认值
         """
-        # 默认值常量，用于判断是否使用系统设置
-        DEFAULT_BASE_URL = 'https://ai.corleom.com/v1'
+        # 默认模型常量，用于判断是否使用系统设置
         DEFAULT_MODEL = 'qwen-plus'
         
         with self.lock:
@@ -2872,7 +2890,7 @@ class DBManager:
                 
                 # 获取系统级别的AI设置作为默认值
                 system_api_key = self.get_system_setting('ai_api_key') or ''
-                system_base_url = self.get_system_setting('ai_api_url') or DEFAULT_BASE_URL
+                system_base_url = self._resolve_ai_base_url(self.get_system_setting('ai_api_url'))
                 system_model = self.get_system_setting('ai_model') or DEFAULT_MODEL
                 
                 if result:
@@ -2883,8 +2901,11 @@ class DBManager:
                     
                     # 如果账号值为空或等于硬编码默认值，则使用系统设置
                     use_model = account_model if (account_model and account_model != DEFAULT_MODEL) else system_model
-                    use_api_key = account_api_key if account_api_key else system_api_key
-                    use_base_url = account_base_url if (account_base_url and account_base_url != DEFAULT_BASE_URL) else system_base_url
+                    use_base_url = system_base_url if is_default_base_url(account_base_url) else self._resolve_ai_base_url(account_base_url)
+                    # 系统级密钥只用于系统级地址：账号自己填了别的地址又没填密钥时，
+                    # 不能把全局密钥发到那个地址去（多用户部署下等于泄露管理员的密钥）。
+                    use_api_key = account_api_key if account_api_key else (
+                        system_api_key if use_base_url == system_base_url else '')
                     
                     return {
                         'ai_enabled': bool(result[0]),
@@ -2922,7 +2943,7 @@ class DBManager:
                     'ai_enabled': False,
                     'model_name': 'qwen-plus',
                     'api_key': '',
-                    'base_url': 'https://ai.corleom.com/v1',
+                    'base_url': DEFAULT_AI_BASE_URL,
                     'user_agent': '',
                     'max_discount_percent': 10,
                     'max_discount_amount': 100,
@@ -4269,16 +4290,44 @@ class DBManager:
                 logger.error(f"验证邮箱验证码失败: {e}")
                 return False
 
-    async def send_verification_email(self, email: str, code: str) -> bool:
-        """发送验证码邮件（支持SMTP和API两种方式）"""
+    def get_mail_sender_config(self) -> Optional[Dict[str, Any]]:
+        """注册验证码等系统邮件使用的发信配置。
+
+        系统不再单独保存一份 SMTP 设置，邮箱只在「通知与日志」里配置一处：
+        这里取管理员第一个启用的「邮件」通知渠道。没有可用渠道返回 None。
+        """
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                SELECT c.config FROM notification_channels c
+                JOIN users u ON u.id = c.user_id
+                WHERE c.type = 'email' AND c.enabled = 1 AND u.username = 'admin'
+                ORDER BY c.id LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
         try:
-            subject = "闲鱼自动回复系统 - 邮箱验证码"
-            # 使用简单的纯文本邮件内容
-            text_content = f"""【闲鱼自动回复系统】邮箱验证码
+            config = json.loads(row[0])
+            port = int(config.get('smtp_port') or 0)
+        except (TypeError, ValueError):
+            return None
+        if not (isinstance(config, dict) and config.get('smtp_server') and port
+                and config.get('email_user') and config.get('email_password')):
+            return None
+        return {**config, 'smtp_port': port}
+
+    async def send_verification_email(self, email: str, code: str) -> bool:
+        """发送验证码邮件，发信账号取自管理员的邮件通知渠道（见 get_mail_sender_config）。"""
+        try:
+            subject = "闲鱼超级管家 - 邮箱验证码"
+            text_content = f"""【闲鱼超级管家】邮箱验证码
 
 您好！
 
-感谢您使用闲鱼自动回复系统。为了确保账户安全，请使用以下验证码完成邮箱验证：
+为了确保账户安全，请使用以下验证码完成邮箱验证：
 
 验证码：{code}
 
@@ -4288,46 +4337,28 @@ class DBManager:
 • 如非本人操作，请忽略此邮件
 • 系统不会主动索要您的验证码
 
-如果您在使用过程中遇到任何问题，请联系我们的技术支持团队。
-感谢您选择闲鱼自动回复系统！
-
 ---
-此邮件由系统自动发送，请勿直接回复
-© 2025 闲鱼自动回复系统"""
+此邮件由系统自动发送，请勿直接回复"""
 
-            # 从系统设置读取SMTP配置
-            try:
-                smtp_server = self.get_system_setting('smtp_server') or ''
-                smtp_port = int(self.get_system_setting('smtp_port') or 0)
-                smtp_user = self.get_system_setting('smtp_user') or ''
-                smtp_password = self.get_system_setting('smtp_password') or ''
-                smtp_from = (self.get_system_setting('smtp_from') or '').strip() or smtp_user
-                smtp_use_tls = (self.get_system_setting('smtp_use_tls') or 'true').lower() == 'true'
-                smtp_use_ssl = (self.get_system_setting('smtp_use_ssl') or 'false').lower() == 'true'
-            except Exception as e:
-                logger.error(f"读取SMTP系统设置失败: {e}")
-                # 读不到配置就直说，不把收件人邮箱转发到站外接口
-                return False
-
-            # 检查SMTP配置是否完整
-            if smtp_server and smtp_port and smtp_user and smtp_password:
-                # 配置完整，使用SMTP方式发送
-                logger.info(f"使用SMTP方式发送验证码邮件: {email}")
-                return await self._send_email_via_smtp(email, subject, text_content,
-                                                     smtp_server, smtp_port, smtp_user,
-                                                     smtp_password, smtp_from, smtp_use_tls, smtp_use_ssl)
-            else:
-                # 这里原先会回退到第三方邮件接口，等于把用户邮箱发到站外服务器，
-                # 部署方和注册用户都不知情，也无法保证对方可用或可信。
-                # 现在直接失败：要么配好自己的 SMTP，要么在系统设置里关掉「注册邮箱验证」。
+            config = self.get_mail_sender_config()
+            if not config:
+                # 不回退到任何第三方邮件接口：那等于把用户邮箱发到站外服务器。
                 logger.warning(
-                    f"未配置 SMTP，无法发送验证码邮件: {email}。"
-                    "请在「系统设置 → 邮件服务」中配置，或关闭「注册邮箱验证」。"
+                    f"没有可用的邮件渠道，无法发送验证码邮件: {email}。"
+                    "请在「通知与日志」添加并启用邮件渠道，或关闭「注册邮箱验证」。"
                 )
                 return False
-
+            port = config['smtp_port']
+            logger.info(f"使用邮件渠道发送验证码邮件: {email}")
+            return await self._send_email_via_smtp(
+                email, subject, text_content,
+                config['smtp_server'], port, config['email_user'], config['email_password'],
+                str(config.get('smtp_from') or ''),
+                bool(config.get('smtp_use_tls', port != 465)),
+                bool(config.get('smtp_use_ssl', port == 465)),
+            )
         except Exception as e:
-            logger.error(f"发送验证码邮件异常: {e}")
+            logger.error(f"发送验证码邮件异常: {type(e).__name__}")
             return False
 
     async def _send_email_via_smtp(self, email: str, subject: str, text_content: str,
@@ -4336,44 +4367,15 @@ class DBManager:
                                  raise_errors: bool = False) -> bool:
         import asyncio
         from email.message import EmailMessage
-        from app.services.smtp_delivery import send_message
+        from app.services.smtp_delivery import format_sender, send_message
         msg = EmailMessage()
         msg['Subject'] = subject
-        msg['From'] = smtp_from
+        msg['From'] = format_sender(smtp_from, smtp_user)
         msg['To'] = email
         msg.set_content(text_content)
         await asyncio.to_thread(send_message, msg, smtp_server, smtp_port, smtp_user, smtp_password,
                                 use_ssl=smtp_use_ssl, use_tls=smtp_use_tls, timeout=30)
         return True
-
-    async def send_test_email(self, email_to: str, smtp_server: str, smtp_port: int,
-                              smtp_user: str, smtp_password: str, smtp_from: str,
-                              smtp_use_tls: bool, smtp_use_ssl: bool) -> tuple:
-        """发送一封测试邮件，返回 (是否成功, 面向用户的中文原因)。"""
-        import smtplib
-        from app.services.smtp_delivery import DeliveryUncertain
-        subject = "闲鱼超级管家 - SMTP 测试邮件"
-        text_content = (
-            "这是一封测试邮件。\n\n"
-            "收到本邮件，说明「系统设置 → 邮件服务」中的 SMTP 配置可以正常发信，\n"
-            "注册验证码与系统通知邮件都将通过该配置发出。\n\n"
-            f"收件地址：{email_to}\n"
-            "---\n此邮件由系统自动发送，请勿直接回复"
-        )
-        try:
-            ok = await self._send_email_via_smtp(email_to, subject, text_content,
-                                                 smtp_server, smtp_port, smtp_user,
-                                                 smtp_password, smtp_from, smtp_use_tls,
-                                                 smtp_use_ssl, raise_errors=True)
-            return ok, f"测试邮件已发送至 {email_to}，请查收（记得看一眼垃圾箱）"
-        except DeliveryUncertain:
-            return False, '邮件提交结果不确定，请先查收邮箱，不要立即重复发送'
-        except smtplib.SMTPAuthenticationError:
-            return False, "SMTP 认证失败：请核对发件邮箱与密码/授权码（QQ 邮箱等须用授权码，不是登录密码）"
-        except (TimeoutError, ConnectionError, OSError):
-            return False, f"无法连接 {smtp_server}:{smtp_port}：请核对服务器地址和端口是否正确、端口是否被防火墙拦截"
-        except smtplib.SMTPException as exc:
-            return False, f"SMTP 服务器返回错误：{exc}"
 
     @staticmethod
     def _serialize_delivery_template_images(images):

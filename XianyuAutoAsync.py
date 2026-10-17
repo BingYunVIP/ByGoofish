@@ -5145,11 +5145,11 @@ class XianyuLive:
 
     async def _send_email_notification(self, config_data: dict, message: str, attachment_path: str = None):
         from email.message import EmailMessage
-        from app.services.smtp_delivery import send_message, DeliveryUncertain
+        from app.services.smtp_delivery import send_message, DeliveryUncertain, format_sender
         from pathlib import Path
         email = EmailMessage()
         email['Subject'] = '闲鱼账号通知'
-        email['From'] = config_data['email_user']
+        email['From'] = format_sender(config_data.get('smtp_from'), config_data['email_user'])
         email['To'] = config_data['recipient_email']
         email.set_content(message)
         if attachment_path and Path(attachment_path).is_file():

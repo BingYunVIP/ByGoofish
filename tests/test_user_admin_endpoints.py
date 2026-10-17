@@ -6,11 +6,15 @@ patch 模块属性即可生效。SESSION_TOKENS 是模块级内存表，测试�
 假 token 验证吊销，结束时清理干净。
 """
 
+import os
+import tempfile
 import unittest
 from unittest import mock
 
 from fastapi import HTTPException
 
+from app.auth import SessionStore
+from app.db_manager import DBManager
 from app.reply_server import (
     SESSION_TOKENS,
     PasswordResetIn,
@@ -39,6 +43,16 @@ class UserAdminEndpointTests(unittest.TestCase):
         patcher = mock.patch("app.db_manager.db_manager", self.db)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # 会话存储按用户表校验用户：给它一个真实的临时库，里面有 id=2 的用户（内置 admin 是 id=1）
+        self._temp = tempfile.TemporaryDirectory()
+        self.auth_db = DBManager(os.path.join(self._temp.name, "admin_auth.db"))
+        self.auth_db.create_user("buyer_a", "buyer_a@x.com", "goodpass123")
+        auth_patcher = mock.patch("app.auth.db_manager", self.auth_db)
+        auth_patcher.start()
+        SessionStore()  # 在这个临时库里建出会话表
+        self.addCleanup(self._temp.cleanup)
+        self.addCleanup(self.auth_db.conn.close)
+        self.addCleanup(auth_patcher.stop)
 
     def _inject_token(self, user_id, suffix=""):
         token = f"tok-{user_id}{suffix}"
@@ -67,14 +81,13 @@ class UserAdminEndpointTests(unittest.TestCase):
     def test_status_updates_and_revokes_sessions(self):
         self.db.get_user_by_id = mock.Mock(return_value=fake_user())
         self.db.set_user_active = mock.Mock(return_value=True)
-        self._inject_token(2)
-        self._inject_token(2, "-b")
+        tokens = [self._inject_token(2), self._inject_token(2, "-b")]
 
         resp = set_user_status(2, UserStatusIn(is_active=False), ADMIN)
 
         self.db.set_user_active.assert_called_once_with(2, False)
         self.assertEqual(resp["revoked_tokens"], 2)
-        self.assertFalse(any(d["user_id"] == 2 for d in SESSION_TOKENS.values()))
+        self.assertFalse(any(token in SESSION_TOKENS for token in tokens))
 
     # ---- reset_user_password ----
 

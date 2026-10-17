@@ -1,7 +1,6 @@
 import React, { Suspense, lazy, useState, useEffect } from 'react';
 import Sidebar from './components/Sidebar';
 import GlobalFeedback from './components/GlobalFeedback';
-import AnnouncementBanner from './components/AnnouncementBanner';
 import ThemeToggle from './components/ThemeToggle';
 import CaptchaInput from './components/CaptchaInput';
 import { useCaptcha } from './lib/useCaptcha';
@@ -22,7 +21,6 @@ const Keywords = lazy(() => import('./components/Keywords'));
 const MessageManagement = lazy(() => import('./components/MessageManagement'));
 const NotificationsAndLogs = lazy(() => import('./components/NotificationsAndLogs'));
 const UserManagement = lazy(() => import('./components/UserManagement'));
-const About = lazy(() => import('./components/About'));
 const BuyerInteraction = lazy(() => import('./components/BuyerInteraction'));
 
 const PageLoader = () => (
@@ -46,7 +44,6 @@ const pageLabels: Record<string, string> = {
   notifications: '通知与日志',
   settings: '系统设置',
   users: '用户管理',
-  about: '关于',
 };
 
 // 系统级页面仅管理员可用；普通用户 localStorage 里残留这些 tab 时切回总览
@@ -54,7 +51,11 @@ const ADMIN_ONLY_TABS = ['settings', 'users'];
 
 const App: React.FC = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [activeTab, setActiveTab] = useState(() => localStorage.getItem('active_page') || 'dashboard');
+  // 记住的页面可能已不存在（比如被移除的页面），只接受仍然有效的页面，否则回到总览
+  const [activeTab, setActiveTab] = useState(() => {
+    const stored = localStorage.getItem('active_page');
+    return stored && stored in pageLabels ? stored : 'dashboard';
+  });
   const [checkingAuth, setCheckingAuth] = useState(true);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -519,7 +520,7 @@ const App: React.FC = () => {
                 )}
 
                 <p className="mt-7 border-t border-gray-100 pt-5 text-xs font-medium text-gray-400">
-                  闲鱼超级管家 · xy.corleom.com
+                  闲鱼超级管家
                 </p>
               </div>
             </div>
@@ -571,7 +572,6 @@ const App: React.FC = () => {
           </div>
           <ThemeToggle compact className="ml-auto" />
         </header>
-        {activeTab !== 'messages' && <AnnouncementBanner />}
         <div className={
           activeTab === 'messages'
             ? 'h-[calc(100vh-3.5rem)] lg:h-screen overflow-hidden'
@@ -620,9 +620,6 @@ const App: React.FC = () => {
             </section>)}
           {activeTab === 'buyer-interaction' && (<section>
             <Suspense fallback={activeTab === 'buyer-interaction' ? <PageLoader /> : null}><BuyerInteraction /></Suspense>
-          </section>)}
-          {activeTab === 'about' && (<section>
-            <Suspense fallback={activeTab === 'about' ? <PageLoader /> : null}><About /></Suspense>
           </section>)}
         </div>
       </main>

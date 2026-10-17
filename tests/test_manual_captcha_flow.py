@@ -49,7 +49,7 @@ async def _run_flow():
             return {"ok": False, "stage": "captcha_not_present"}
 
         # 2. 建会话
-        await captcha_controller.create_session("mock-account", page)
+        await captcha_controller.create_session("mock-account", page, owner_id=1)  # 验证会话必须绑定所有者
 
         # 3. 模拟用户拖滑块：按下 → 拖动 → 释放
         box_handle = await page.query_selector("#nc_scale")

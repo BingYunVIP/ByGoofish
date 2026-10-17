@@ -17,16 +17,15 @@ import threading
 import re
 from typing import List, Dict, Optional
 from loguru import logger
-from openai import OpenAI
 from app.db_manager import db_manager
-
-
-class ReasoningBudgetExhausted(RuntimeError):
-    """推理模型把 max_tokens 全花在思维链上，没给正文留下额度。
-
-    单独立一个类型，是为了让 _generate_with_retry 能把它和限流、网络抖动区分开：
-    这类失败换时间重试没用，得加大预算再试。
-    """
+# ReasoningBudgetExhausted 定义在 ai_client，这里重新导出以兼容旧的导入路径。
+from app.services.ai_client import (
+    AIClient,
+    AIConfigError,
+    AIRequestError,
+    DEFAULT_USER_AGENT,
+    ReasoningBudgetExhausted,
+)
 
 
 class AIReplyEngine:
@@ -67,27 +66,21 @@ class AIReplyEngine:
 注意：结合商品信息，给出实用建议。'''
         }
     
-    def _create_openai_client(self, cookie_id: str) -> Optional[OpenAI]:
+    def _create_ai_client(self, settings: dict, cookie_id: str) -> Optional[AIClient]:
+        """按账号的 AI 设置创建网关客户端；无状态，不缓存（支持多进程部署）。
+
+        不记录密钥的任何片段。
         """
-        (原 get_client) 创建指定账号的OpenAI客户端
-        修复 P0-2: 移除了缓存逻辑，以支持多进程无状态部署
-        """
-        settings = db_manager.get_ai_reply_settings(cookie_id)
         if not settings['ai_enabled'] or not settings['api_key']:
             return None
-        
         try:
-            logger.info(f"创建新的OpenAI客户端实例 {cookie_id}: base_url={settings['base_url']}, api_key={'***' + settings['api_key'][-4:] if settings['api_key'] else 'None'}")
-            client = OpenAI(
-                api_key=settings['api_key'],
-                base_url=settings['base_url'],
-                timeout=30.0,
-                default_headers={"User-Agent": settings.get('user_agent') or 'codex_cli_rs/0.0.0 (Hermes Agent)'},
+            return AIClient(
+                settings['base_url'],
+                settings['api_key'],
+                user_agent=settings.get('user_agent') or DEFAULT_USER_AGENT,
             )
-            logger.info(f"为账号 {cookie_id} 创建OpenAI客户端成功，实际base_url: {client.base_url}")
-            return client
-        except Exception as e:
-            logger.error(f"创建OpenAI客户端失败 {cookie_id}: {e}")
+        except AIConfigError as e:
+            logger.error(f"创建AI客户端失败 {cookie_id}: {e}")
             return None
 
     def _is_dashscope_api(self, settings: dict) -> bool:
@@ -103,9 +96,14 @@ class AIReplyEngine:
         return is_custom_model and is_dashscope_url
 
     def _is_gemini_api(self, settings: dict) -> bool:
-        """判断是否为Gemini API (通过模型名称)"""
-        model_name = settings.get('model_name', '').lower()
-        return 'gemini' in model_name
+        """判断是否直连 Google Gemini 原生接口：接口地址指向 Google，且模型是 Gemini。
+
+        经中转站调用 Gemini 模型时走中转站自己的协议；
+        如果只看模型名，会把中转站的密钥发给 Google。
+        """
+        base_url = (settings.get('base_url') or '').lower()
+        model_name = (settings.get('model_name') or '').lower()
+        return 'generativelanguage.googleapis.com' in base_url and 'gemini' in model_name
 
     def _call_dashscope_api(self, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
         """调用DashScope API"""
@@ -203,63 +201,20 @@ class AIReplyEngine:
             logger.error(f"Gemini API 响应格式错误: {type(e).__name__}")
             raise RuntimeError("Gemini API 响应格式错误")
 
-    def _call_openai_api(self, client: OpenAI, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
-        """调用OpenAI兼容API"""
+    def _call_ai_api(self, client: AIClient, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
+        """调用 AI 网关。协议选择与降级由 AIClient 负责，正文提取规则见 ai_client.extract_chat_text。"""
         try:
-            logger.info(f"调用OpenAI API: model={settings['model_name']}, base_url={settings.get('base_url', 'default')}")
-            response = client.chat.completions.create(
-                model=settings['model_name'],
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature
+            logger.info(f"调用AI接口: model={settings['model_name']}, base_url={client.base_url}")
+            return client.complete(
+                settings['model_name'], messages, max_tokens=max_tokens, temperature=temperature
             )
-            return self._extract_openai_content(response)
         except Exception as e:
-            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            status_code = getattr(e, 'status_code', None)
             logger.error(
-                f"OpenAI API调用失败: {type(e).__name__}"
+                f"AI接口调用失败: {type(e).__name__}"
                 + (f", HTTP {status_code}" if status_code else "")
             )
             raise
-
-    @staticmethod
-    def _extract_openai_content(response) -> str:
-        """从 OpenAI 兼容响应里取正文。
-
-        不能直接 `choices[0].message.content.strip()`：content 为 None 的情况很常见，
-        那样会抛 AttributeError，在调用方看来就是"接口明明通，回复却经常失败"。
-        已知会返回 None 的场景：
-          - finish_reason='length'，回复被 max_tokens 截断；
-          - 命中服务端内容过滤；
-          - 推理类模型（deepseek-r1、qwq 等）把预算全花在思维链上。
-
-        绝对不能拿 reasoning_content 当正文兜底。它装的是思维链而非答案，
-        答案永远在 content 里。曾经这里有一句「content 为空就取
-        reasoning_content」，结果推理模型把 token 预算吃光、content 为空时，
-        原始思维链被当成回复直接发给了买家 —— 买家看到的是
-        「我们需要理解这个对话场景。用户是卖家，我们是客服助手…」，
-        连议价底价和最大优惠都一并泄露了出去。
-        """
-        choices = getattr(response, 'choices', None)
-        if not choices:
-            raise RuntimeError("AI 返回内容为空（choices 为空）")
-
-        choice = choices[0]
-        message = getattr(choice, 'message', None)
-        content = getattr(message, 'content', None) if message else None
-
-        if not content:
-            finish_reason = getattr(choice, 'finish_reason', None)
-            if finish_reason == 'length':
-                raise ReasoningBudgetExhausted(
-                    "AI 回复被 max_tokens 截断且未返回正文"
-                    "（推理模型把预算用在思维链上）"
-                )
-            if finish_reason == 'content_filter':
-                raise RuntimeError("AI 回复被服务端内容过滤拦截")
-            raise RuntimeError(f"AI 返回内容为空（finish_reason={finish_reason}）")
-
-        return content.strip()
 
     # 预算上限。推理模型的思维链动辄上千 token，卡太死就只剩思考、没有正文。
     MAX_TOKENS_FLOOR = 200
@@ -294,20 +249,26 @@ class AIReplyEngine:
             logger.info("使用Gemini API生成回复")
             return self._call_gemini_api(settings, messages, max_tokens=max_tokens, temperature=0.7)
 
-        logger.info("使用OpenAI兼容API生成回复")
-        # 修复 P0-2: 调用已修改的无状态客户端创建方法
-        client = self._create_openai_client(cookie_id)
+        logger.info("使用AI网关生成回复")
+        # 修复 P0-2: 无状态客户端，每次按当前设置创建
+        client = self._create_ai_client(settings, cookie_id)
         if not client:
             return None
-        return self._call_openai_api(client, settings, messages, max_tokens=max_tokens, temperature=0.7)
+        return self._call_ai_api(client, settings, messages, max_tokens=max_tokens, temperature=0.7)
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
         """判断这次失败换个时间重试还有没有意义。
 
-        限流、超时、连接中断、网关错误都是暂时的；鉴权失败、参数错误重试多少次
-        都一样，重试只会拖慢回复。
+        限流、连接中断、网关错误都是暂时的；鉴权失败、参数错误重试多少次
+        都一样，重试只会拖慢回复。超时不再重试：AIClient 已在总时限内换协议
+        再试过一次，再等一整轮只会让买家等得更久。
         """
+        if isinstance(exc, AIRequestError):
+            if exc.kind == 'timeout':
+                return False
+            if exc.status_code is None:
+                return exc.kind == 'network'
         status = getattr(getattr(exc, 'response', None), 'status_code', None)
         if status is None:
             status = getattr(exc, 'status_code', None)
@@ -597,10 +558,21 @@ class AIReplyEngine:
                 self._chat_locks[chat_id] = threading.Lock()
             return self._chat_locks[chat_id]
     
+    @staticmethod
+    def _failure_reason(exc: Exception) -> str:
+        """面向用户的失败原因。只有我们自己的异常（已脱敏）才带原文，其他异常只给类型名。"""
+        if isinstance(exc, (AIRequestError, AIConfigError, ReasoningBudgetExhausted)):
+            return str(exc)
+        return f"内部错误（{type(exc).__name__}）"
+
     def generate_reply(self, message: str, item_info: dict, chat_id: str,
                       cookie_id: str, user_id: str, item_id: str,
-                      skip_wait: bool = False) -> Optional[str]:
-        """生成AI回复"""
+                      skip_wait: bool = False, error_out: Optional[list] = None) -> Optional[str]:
+        """生成AI回复。
+
+        error_out: 传入列表时，失败原因会追加进去（「回复测试」据此给出具体原因，
+        正常收发消息不需要）。
+        """
         if not self.is_ai_enabled(cookie_id):
             return None
         if self.is_system_or_order_event(message):
@@ -724,6 +696,8 @@ class AIReplyEngine:
                 reply = self._normalize_reply(reply)
                 if not reply:
                     logger.warning(f"AI服务返回空回复，账号={cookie_id}, intent={intent}")
+                    if error_out is not None:
+                        error_out.append("模型返回了空内容，或疑似把思考过程当成了回复而被丢弃")
                     return None
 
                 # 10.5 议价底价硬校验。底价原先只写在提示词里，模型不照做就没人管 ——
@@ -754,18 +728,22 @@ class AIReplyEngine:
                 
         except Exception as e:
             logger.error(f"AI回复生成失败: 账号={cookie_id}, 错误={type(e).__name__}: {e}")
+            if error_out is not None:
+                error_out.append(self._failure_reason(e))
             return None
 
     async def generate_reply_async(self, message: str, item_info: dict, chat_id: str,
                                    cookie_id: str, user_id: str, item_id: str,
-                                   skip_wait: bool = False) -> Optional[str]:
+                                   skip_wait: bool = False, error_out: Optional[list] = None) -> Optional[str]:
         """
         异步包装器：在独立线程池中执行同步的 `generate_reply`，并返回结果。
         这样可以在异步代码中直接 await，而不阻塞事件循环。
         """
         try:
             import asyncio as _asyncio
-            return await _asyncio.to_thread(self.generate_reply, message, item_info, chat_id, cookie_id, user_id, item_id, skip_wait)
+            return await _asyncio.to_thread(
+                self.generate_reply, message, item_info, chat_id, cookie_id, user_id, item_id, skip_wait, error_out
+            )
         except Exception as e:
             logger.error(f"异步生成回复失败: {e}")
             return None

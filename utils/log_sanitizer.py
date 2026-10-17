@@ -37,6 +37,9 @@ _AUTHORIZATION_PATTERN = re.compile(
     r"(?i)(\bauthorization\s*:\s*bearer\s+)[^\s,;]+"
 )
 _COOKIE_HEADER_PATTERN = re.compile(r"(?i)(\bcookie\s*[=:]\s*)[^\r\n]+")
+_API_KEY_HEADER_PATTERN = re.compile(r"(?i)(\bx-api-key\s*:\s*)[^\s,;]+")
+# 形如 sk-... 的模型服务密钥，即使它夹在错误信息里、没有 key= 前缀也要抹掉。
+_SK_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}")
 _PAIR_PATTERN = re.compile(
     rf"(?i)\b(?P<key>{_KEY_PATTERN})\b"
     rf"(?P<separator>\s*[=:]\s*)"
@@ -61,6 +64,8 @@ _QUOTED_PATTERN = re.compile(
 _REDACTION_PATTERNS = (
     _AUTHORIZATION_PATTERN,
     _COOKIE_HEADER_PATTERN,
+    _API_KEY_HEADER_PATTERN,
+    _SK_KEY_PATTERN,
     _QUOTED_PATTERN,
     _PAIR_PATTERN,
 )
@@ -70,8 +75,13 @@ def redact_sensitive_text(value: Any) -> str:
     """Return a log-safe representation without secret values."""
     text = str(value)
     for pattern in _REDACTION_PATTERNS:
-        if pattern is _AUTHORIZATION_PATTERN or pattern is _COOKIE_HEADER_PATTERN:
+        if pattern is _AUTHORIZATION_PATTERN or pattern is _COOKIE_HEADER_PATTERN \
+                or pattern is _API_KEY_HEADER_PATTERN:
             text = pattern.sub(rf"\1{REDACTED}", text)
+            continue
+
+        if pattern is _SK_KEY_PATTERN:
+            text = pattern.sub(REDACTED, text)
             continue
 
         if pattern is _QUOTED_PATTERN:

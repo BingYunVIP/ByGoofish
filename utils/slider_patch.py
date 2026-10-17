@@ -78,7 +78,7 @@ def send_notification(user_id: str, title: str, message: str, notification_type:
                     email_user = config_data.get('email_user', '')
                     email_password = config_data.get('email_password', '')
                     recipient_email = config_data.get('recipient_email', '')
-                    smtp_from = config_data.get('smtp_from', email_user)  # 发件人显示名称，默认使用邮箱地址
+                    smtp_from = config_data.get('smtp_from', '')  # 发件人显示名称，留空只显示邮箱地址
                     smtp_use_ssl = config_data.get('smtp_use_ssl', smtp_port == 465)  # 端口465默认使用SSL
                     smtp_use_tls = config_data.get('smtp_use_tls', smtp_port == 587)  # 端口587默认使用TLS
                     
@@ -90,7 +90,8 @@ def send_notification(user_id: str, title: str, message: str, notification_type:
                             
                             # 创建邮件
                             msg = MIMEMultipart()
-                            msg['From'] = smtp_from
+                            from app.services.smtp_delivery import format_sender
+                            msg['From'] = format_sender(smtp_from, email_user)
                             msg['To'] = recipient_email
                             msg['Subject'] = f"闲鱼自动回复通知 - {title}"
                             
