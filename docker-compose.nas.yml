@@ -17,8 +17,8 @@
 
 services:
   xianyu-app:
-    image: ghcr.io/23star/xianyu-super-butler:latest
-    container_name: xianyu-super-butler
+    image: ghcr.io/bingyunvip/bygoofish:latest
+    container_name: bygoofish
     restart: unless-stopped
     ports:
       - "8080:8080"

@@ -5,7 +5,8 @@
 # 内存不够时直接 OOM，表现为"部署不上、机器卡死"。
 # 有了预构建镜像，这些设备只需要 pull，几分钟就能起来。
 #
-# 发布后镜像地址：ghcr.io/<owner>/xianyu-super-butler:latest
+# 发布后镜像地址：ghcr.io/<owner>/bygoofish:latest
+# 只在推送 v* 标签或手动运行时发布；开发阶段推送 main 分支不会自动发布镜像。
 # 首次发布后需要到仓库 Packages 页面把镜像设为 Public，否则 pull 需要登录。
 
 name: Publish Docker image
@@ -14,8 +15,6 @@ on:
   push:
     tags:
       - 'v*'
-    branches:
-      - main
   workflow_dispatch:
 
 env:
