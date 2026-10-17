@@ -152,8 +152,8 @@ def main():
                 check('real relay: reply generated for a non-Claude model', bool(reply.strip()),
                       f'{time.monotonic() - started:.1f}s, {len(reply)} chars')
                 log = server_log()
-                check('non-Claude model went through /responses first',
-                      f'AI请求成功 协议=/responses 模型={model}' in log and f'协议=/chat/completions 模型={model}' not in log)
+                check('non-Claude model went through /responses first, as an SSE stream',
+                      f'AI请求成功 协议=/responses 方式=流式 模型={model}' in log and '协议=/chat/completions' not in log)
 
                 # ---- 4. Claude 模型：先 /messages，不成功再 /chat/completions ----
                 before = len(log)

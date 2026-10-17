@@ -50,6 +50,56 @@ def error(status, message='boom'):
     return status, {'error': {'message': message}}, {}
 
 
+class SSE:
+    """流式响应：逐段写出（延迟秒数, 文本），写完直接关闭连接。"""
+
+    def __init__(self, *chunks):
+        self.chunks = [chunk if isinstance(chunk, tuple) else (0, chunk) for chunk in chunks]
+
+
+def event(data, name=None):
+    head = f'event: {name}\n' if name else ''
+    return head + 'data: ' + (data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)) + '\n\n'
+
+
+def chat_stream(*texts, finish='stop', done=True):
+    chunks = [event({'choices': [{'delta': {'content': text}}]}) for text in texts]
+    if finish:
+        chunks.append(event({'choices': [{'delta': {}, 'finish_reason': finish}]}))
+    if done:
+        chunks.append(event('[DONE]'))
+    return 200, SSE(*chunks), {}
+
+
+def responses_stream(*items, status='completed', final=None):
+    """items：(output_index, type, phase, 文本片段列表)。"""
+    chunks = [event({'type': 'response.created', 'response': {'status': 'in_progress'}}, 'response.created')]
+    for index, kind, phase, texts in items:
+        item = {'type': kind, **({'role': 'assistant'} if kind == 'message' else {}), **({'phase': phase} if phase else {})}
+        chunks.append(event({'type': 'response.output_item.added', 'output_index': index, 'item': item}))
+        for text in texts:
+            chunks.append(event({'type': 'response.output_text.delta', 'output_index': index, 'delta': text}))
+        chunks.append(event({'type': 'response.output_item.done', 'output_index': index, 'item': item}))
+    if status:
+        chunks.append(event({'type': f'response.{status}', 'response': {'status': status, **(final or {})}}))
+    return 200, SSE(*chunks), {}
+
+
+def messages_stream(*texts, stop='end_turn', thinking='内部思考', terminal=True):
+    chunks = [event({'type': 'message_start', 'message': {'stop_reason': None}}, 'message_start')]
+    if thinking:
+        chunks.append(event({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'thinking', 'thinking': ''}}))
+        chunks.append(event({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'thinking_delta', 'thinking': thinking}}))
+    if texts:
+        chunks.append(event({'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'text', 'text': ''}}))
+        for text in texts:
+            chunks.append(event({'type': 'content_block_delta', 'index': 1, 'delta': {'type': 'text_delta', 'text': text}}))
+    chunks.append(event({'type': 'message_delta', 'delta': {'stop_reason': stop}}, 'message_delta'))
+    if terminal:
+        chunks.append(event({'type': 'message_stop'}, 'message_stop'))
+    return 200, SSE(*chunks), {}
+
+
 class RelayServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -72,6 +122,19 @@ class RelayServer(ThreadingHTTPServer):
             self.server.requests.append(record)
             route = self.server.routes.get((self.command, path))
             status, payload, headers = route(record) if route else error(404, 'not found')
+            if isinstance(payload, SSE):
+                self.send_response(status)
+                self.send_header('content-type', 'text/event-stream')
+                self.send_header('cache-control', 'no-cache')
+                self.end_headers()  # 没有 content-length：写完后关闭连接
+                try:
+                    for delay, text in payload.chunks:
+                        time.sleep(delay)
+                        self.wfile.write(text.encode())
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             data = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header('content-type', 'application/json')
@@ -95,6 +158,7 @@ class AIClientTestCase(unittest.TestCase):
     def setUp(self):
         ai_client._protocol_memory.clear()
         ai_client._no_temperature.clear()
+        ai_client._plain_memory.clear()
         self.server = RelayServer()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -272,6 +336,163 @@ class FallbackTests(AIClientTestCase):
             self.client(timeout=0.4, total_timeout=0.8).complete('gpt-test', MESSAGES, max_tokens=50)
         self.assertEqual(ctx.exception.kind, 'timeout')
         self.assertLess(time.monotonic() - started, 1.4)
+
+
+class StreamingTests(AIClientTestCase):
+    """SSE 流式优先：先发 stream:true，边收边拼；不支持或中断时再用非流式。"""
+
+    def assert_streamed(self, request):
+        self.assertIs(request['body']['stream'], True)
+        self.assertIn('text/event-stream', request['headers']['accept'])
+
+    def test_chat_stream_is_assembled_from_deltas(self):
+        self.route('POST', '/v1/responses', error(404))
+        self.route('POST', '/v1/chat/completions', chat_stream('有货，', '可以', '拍。'))
+        self.assertEqual(self.complete('gpt-test'), '有货，可以拍。')
+        self.assert_streamed(self.server.requests[-1])
+
+    def test_chat_stream_without_done_marker_is_fine_after_finish_reason(self):
+        self.route('POST', '/v1/responses', error(404))
+        self.route('POST', '/v1/chat/completions', chat_stream('好的', done=False))
+        self.assertEqual(self.complete('gpt-test'), '好的')
+
+    def test_responses_stream_uses_only_the_final_answer(self):
+        """真实中转站的流里会先出现一个只有空格的消息和 reasoning 项，最后才是 final_answer。"""
+        self.route('POST', '/v1/responses', responses_stream(
+            (0, 'message', None, [' ']), (1, 'reasoning', None, []),
+            (2, 'message', 'final_answer', ['你好，', '有什么', '可以帮您？'])))
+        self.assertEqual(self.complete('gpt-6-sol'), '你好，有什么可以帮您？')
+        self.assertEqual(self.server.paths(), ['/v1/responses'])
+        self.assert_streamed(self.server.requests[0])
+
+    def test_commentary_is_never_used_as_the_reply(self):
+        self.route('POST', '/v1/responses', responses_stream(
+            (0, 'message', 'commentary', ['我先查一下底价，最低 176 元']), (1, 'message', 'final_answer', ['可以便宜到 180。'])))
+        self.assertEqual(self.complete('gpt-6-sol'), '可以便宜到 180。')
+
+    def test_responses_text_from_final_object_when_stream_has_no_text_events(self):
+        final = {'output': [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': '来自最终对象'}]}]}
+        self.route('POST', '/v1/responses', responses_stream(status='completed', final=final))
+        self.assertEqual(self.complete('gpt-6-sol'), '来自最终对象')
+
+    def test_messages_stream_ignores_thinking(self):
+        self.route('POST', '/v1/messages', messages_stream('可以', '拍'))
+        self.assertEqual(self.complete('claude-opus-5-5'), '可以拍')
+        request = self.server.requests[0]
+        self.assert_streamed(request)
+        self.assertEqual(request['headers']['anthropic-version'], '2023-06-01')
+
+    def test_json_reply_to_a_stream_request_is_accepted(self):
+        self.route('POST', '/v1/responses', responses_ok('服务端忽略了 stream'))
+        self.assertEqual(self.complete('gpt-test'), '服务端忽略了 stream')
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_unsupported_stream_retries_once_without_streaming_and_is_remembered(self):
+        def responses(request):
+            if request['body'].get('stream'):
+                return error(400, 'Streaming is not supported for this model')
+            return responses_ok('非流式成功')
+        self.route('POST', '/v1/responses', responses)
+        self.assertEqual(self.complete('gpt-test'), '非流式成功')
+        self.assertEqual([bool(r['body'].get('stream')) for r in self.server.requests], [True, False])
+        self.assertEqual(self.complete('gpt-test'), '非流式成功')
+        self.assertEqual([bool(r['body'].get('stream')) for r in self.server.requests[2:]], [False])  # 记住了
+        ai_client._plain_memory.clear()  # 过期后重新优先流式
+        self.complete('gpt-test')
+        self.assertTrue(self.server.requests[-2]['body'].get('stream'))
+
+    def test_truncated_stream_is_never_used_and_retries_without_streaming(self):
+        def responses(request):
+            if request['body'].get('stream'):  # 有文本但没有结束事件：连接被截断
+                return responses_stream((0, 'message', 'final_answer', ['半截回复']), status=None)
+            return responses_ok('完整回复')
+        self.route('POST', '/v1/responses', responses)
+        self.assertEqual(self.complete('gpt-test'), '完整回复')
+        self.assertEqual(len(self.server.requests), 2)
+
+    def test_truncated_chat_and_messages_streams_are_rejected(self):
+        for protocol, model, route, truncated in (
+            ('/v1/chat/completions', 'gpt-test', chat_stream('半截', finish=None, done=False), None),
+            ('/v1/messages', 'claude-opus-5-5', messages_stream('半截', stop=None, terminal=False), None),
+        ):
+            self.route('POST', '/v1/responses', error(404))
+            self.route('POST', protocol, lambda request, route=route: route if request['body'].get('stream') else error(502, 'plain also down'))
+            with self.assertRaises(AIRequestError):
+                self.complete(model)
+            ai_client._protocol_memory.clear()
+            ai_client._plain_memory.clear()
+
+    def test_stream_error_event_moves_on_to_the_next_protocol(self):
+        self.route('POST', '/v1/responses', (200, SSE(event({'type': 'error', 'error': {'message': 'upstream exploded'}}, 'error')), {}))
+        self.route('POST', '/v1/chat/completions', chat_stream('降级后的回复'))
+        self.assertEqual(self.complete('gpt-test'), '降级后的回复')
+        self.assertEqual(self.server.paths(), ['/v1/responses', '/v1/chat/completions'])
+
+    def test_response_failed_event_is_reported(self):
+        self.route('POST', '/v1/responses', responses_stream(status='failed', final={'error': {'message': 'model overloaded'}}))
+        self.route('POST', '/v1/chat/completions', error(503, 'also down'))
+        with self.assertRaises(AIRequestError) as ctx:
+            self.complete('gpt-test')
+        self.assertIn('model overloaded', str(ctx.exception))
+
+    def test_exhausted_budget_in_a_responses_stream_does_not_fall_back(self):
+        self.route('POST', '/v1/responses', responses_stream(
+            (0, 'reasoning', None, []), status='incomplete', final={'incomplete_details': {'reason': 'max_output_tokens'}}))
+        self.route('POST', '/v1/chat/completions', chat_ok('不应被调用'))
+        with self.assertRaises(ReasoningBudgetExhausted):
+            self.complete('gpt-test')
+        self.assertEqual(self.server.paths(), ['/v1/responses'])
+
+    def test_exhausted_budget_in_a_messages_stream_does_not_fall_back(self):
+        self.route('POST', '/v1/messages', messages_stream(stop='max_tokens'))
+        self.route('POST', '/v1/chat/completions', chat_ok('不应被调用'))
+        with self.assertRaises(ReasoningBudgetExhausted):
+            self.complete('claude-opus-5-5')
+        self.assertEqual(self.server.paths(), ['/v1/messages'])
+
+    def test_exhausted_budget_in_a_chat_stream_is_reported(self):
+        self.route('POST', '/v1/responses', error(404))
+        self.route('POST', '/v1/chat/completions', chat_stream(finish='length'))
+        with self.assertRaises(ReasoningBudgetExhausted):
+            self.complete('gpt-test')
+
+    def test_refusal_in_a_stream_does_not_fall_back(self):
+        self.route('POST', '/v1/messages', messages_stream(stop='refusal', thinking=''))
+        self.route('POST', '/v1/chat/completions', chat_ok('不应被调用'))
+        with self.assertRaises(AIRequestError) as ctx:
+            self.complete('claude-opus-5-5')
+        self.assertEqual(ctx.exception.kind, 'refusal')
+        self.assertEqual(self.server.paths(), ['/v1/messages'])
+
+    def test_auth_failure_is_not_retried_in_either_mode(self):
+        self.route('POST', '/v1/responses', error(401, 'Invalid API key'))
+        self.route('POST', '/v1/chat/completions', chat_ok('不应被调用'))
+        with self.assertRaises(AIRequestError) as ctx:
+            self.complete('gpt-test')
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_slow_stream_is_cut_at_the_total_deadline(self):
+        slow = SSE(*[(0.3, event({'choices': [{'delta': {'content': '字'}}]})) for _ in range(20)])
+        self.route('POST', '/v1/responses', error(404))
+        self.route('POST', '/v1/chat/completions', (200, slow, {}))
+        started = time.monotonic()
+        with self.assertRaises(AIRequestError) as ctx:
+            self.client(timeout=5, total_timeout=1.0, min_fallback=0.2).complete('gpt-test', MESSAGES, max_tokens=50)
+        self.assertEqual(ctx.exception.kind, 'timeout')
+        self.assertLess(time.monotonic() - started, 2.5)
+
+    def test_upstream_errors_are_not_mistaken_for_stream_problems(self):
+        self.route('POST', '/v1/responses', error(400, 'upstream request failed'))
+        self.route('POST', '/v1/chat/completions', chat_ok('降级'))
+        self.assertEqual(self.complete('gpt-test'), '降级')
+        self.assertEqual(self.server.paths(), ['/v1/responses', '/v1/chat/completions'])  # 没有多余的非流式重试
+
+    def test_non_stream_extraction_also_ignores_commentary(self):
+        data = {'status': 'completed', 'output': [
+            {'type': 'message', 'phase': 'commentary', 'content': [{'type': 'output_text', 'text': '过程说明'}]},
+            {'type': 'message', 'phase': 'final_answer', 'content': [{'type': 'output_text', 'text': '最终回复'}]}]}
+        self.assertEqual(ai_client.extract_text('responses', data), '最终回复')
 
 
 class ParameterAdjustTests(AIClientTestCase):

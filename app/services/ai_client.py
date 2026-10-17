@@ -11,16 +11,21 @@
 降级成功后在内存里记住该（地址, 模型）一段时间，后续直接走可用协议，
 避免每条买家消息都先失败一次。
 
+每个协议都优先用 SSE 流式请求（``stream: true``），边收边拼；服务端忽略 stream 直接返回 JSON 时照常处理。
+流式不被支持或中途中断时，对同一协议改用一次非流式请求，并记住 30 分钟；
+只有流结束事件齐全才使用结果，半截回复绝不外发。
+
 所有请求直连：不读取系统代理环境变量，也不跟随重定向（避免把密钥带到别的主机）。
 """
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -40,7 +45,7 @@ PROTOCOL_CHAT = 'chat/completions'
 
 REQUEST_TIMEOUT = 30.0        # 单次请求
 TOTAL_TIMEOUT = 50.0          # 一次生成（含降级）的总时限
-MIN_FALLBACK_SECONDS = 5.0    # 剩余时间不足时不再发起降级请求
+MIN_FALLBACK_SECONDS = 5.0    # 剩余时间不足时不再发起降级请求（可由 AIClient 参数覆盖）
 PROTOCOL_MEMORY_SECONDS = 30 * 60
 MAX_MODEL_PAGES = 5
 
@@ -56,7 +61,7 @@ class AIConfigError(ValueError):
 class AIRequestError(RuntimeError):
     """一次 AI 接口调用失败。status_code 为 None 表示没有拿到 HTTP 响应。
 
-    kind: http | timeout | network | format | refusal
+    kind: http | timeout | network | format | refusal | stream（流式响应中断或流式不被支持）
     """
 
     def __init__(self, message: str, *, status_code: Optional[int] = None,
@@ -211,6 +216,35 @@ def _forget_protocol(base_url: str, model: str) -> None:
         _protocol_memory.pop((base_url, model), None)
 
 
+# 只认单词 stream / streaming / 流式；网关错误里常见的 upstream 不是这个意思
+_STREAM_WORD = re.compile(r'\bstream(?:s|ing|ed)?\b|流式')
+
+_plain_memory: Dict[Tuple[str, str, str], float] = {}
+
+
+def _stream_disabled(base_url: str, model: str, protocol: str) -> bool:
+    """最近这个（地址, 模型, 协议）的流式请求失败、非流式成功过：一段时间内直接用非流式。"""
+    key = (base_url, model, protocol)
+    with _memory_lock:
+        expires = _plain_memory.get(key)
+        if expires and expires > time.monotonic():
+            return True
+        _plain_memory.pop(key, None)
+    return False
+
+
+def _disable_stream(base_url: str, model: str, protocol: str) -> None:
+    with _memory_lock:
+        _plain_memory.setdefault((base_url, model, protocol), time.monotonic() + PROTOCOL_MEMORY_SECONDS)
+
+
+def _stream_unsupported(exc: 'AIRequestError') -> bool:
+    """这次流式失败是不是「流式本身的问题」：是的话同一协议再用非流式试一次。"""
+    if exc.kind == 'stream':
+        return True
+    return exc.status_code in (400, 406, 415, 422) and bool(_STREAM_WORD.search(str(exc).lower()))
+
+
 def plan_protocols(base_url: str, model: str) -> List[str]:
     """本次调用依次尝试的协议。最近降级成功过就先用降级协议，失败再回到首选协议。"""
     preferred = preferred_protocol(model)
@@ -330,9 +364,13 @@ def extract_chat_text(response: Any, protocol: str = PROTOCOL_CHAT) -> str:
 def _extract_responses_text(data: Dict[str, Any]) -> str:
     texts: List[str] = []
     refused = False
-    for item in data.get('output') or []:
-        if not isinstance(item, dict) or item.get('type') != 'message':
-            continue  # reasoning 等其他输出项不是正文
+    # reasoning 等输出项不是正文；有 phase 的模型会先输出 commentary（过程说明），只有 final_answer 才是给买家的回复
+    messages = [item for item in data.get('output') or [] if isinstance(item, dict) and item.get('type') == 'message']
+    if any(item.get('phase') == 'final_answer' for item in messages):
+        messages = [item for item in messages if item.get('phase') == 'final_answer']
+    else:
+        messages = [item for item in messages if item.get('phase') != 'commentary']
+    for item in messages:
         for part in item.get('content') or []:
             if not isinstance(part, dict):
                 continue
@@ -416,6 +454,178 @@ def _clean_api_key(api_key: Optional[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# SSE 流式响应
+# ---------------------------------------------------------------------------
+
+_DONE = object()
+
+
+def _stream_error(message: str, protocol: str) -> 'AIRequestError':
+    message = redact_sensitive_text(message or 'AI 返回错误')[:200]
+    return AIRequestError(message, protocol=protocol, kind='stream' if _STREAM_WORD.search(message.lower()) else 'http')
+
+
+def _json_body(response: httpx.Response, protocol: str) -> Dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError:
+        raise AIRequestError('响应不是有效的 JSON', status_code=response.status_code,
+                             protocol=protocol, kind='format') from None
+    if not isinstance(data, dict):
+        raise AIRequestError('响应格式不正确', status_code=response.status_code, protocol=protocol, kind='format')
+    return data
+
+
+def _sse_events(lines: Iterator[str], deadline: float, protocol: str) -> Iterator[Tuple[Optional[str], str]]:
+    """把 SSE 文本行切成（事件名, data）。每行都检查总时限，慢吞吞地滴灌也会在时限到时中止。"""
+    event: Optional[str] = None
+    data: List[str] = []
+    for raw in lines:
+        if time.monotonic() > deadline:
+            raise AIRequestError('请求超时', protocol=protocol, kind='timeout')
+        line = raw.rstrip('\r')
+        if not line:
+            if data:
+                yield event, '\n'.join(data)
+            event, data = None, []
+        elif line.startswith(':'):
+            continue  # 注释行，常用作保活心跳
+        else:
+            field, _, value = line.partition(':')
+            value = value[1:] if value.startswith(' ') else value
+            if field == 'event':
+                event = value
+            elif field == 'data':
+                data.append(value)
+    if data:
+        yield event, '\n'.join(data)
+
+
+def _stream_objects(lines: Iterator[str], deadline: float, protocol: str) -> Iterator[Tuple[Optional[str], Any]]:
+    for event, data in _sse_events(lines, deadline, protocol):
+        if data.strip() == '[DONE]':
+            yield event, _DONE
+            return
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            yield event, obj
+
+
+def _incomplete(protocol: str) -> 'AIRequestError':
+    return AIRequestError('AI 流式响应中断，没有收到结束事件', protocol=protocol, kind='stream')
+
+
+def _collect_chat(stream: Iterator[Tuple[Optional[str], Any]]) -> Dict[str, Any]:
+    parts: List[str] = []
+    finish = None
+    terminal = False
+    for _, obj in stream:
+        if obj is _DONE:
+            terminal = True
+            break
+        if obj.get('error'):
+            raise _stream_error(_error_message(obj['error']), PROTOCOL_CHAT)
+        for choice in obj.get('choices') or []:
+            content = (choice.get('delta') or {}).get('content')  # reasoning_content 是思维链，永远不取
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                parts.extend(_text_of(_field(part, 'text')) for part in content)
+            finish = choice.get('finish_reason') or finish
+    if not (terminal or finish):
+        raise _incomplete(PROTOCOL_CHAT)
+    return {'choices': [{'message': {'content': ''.join(parts)}, 'finish_reason': finish}]}
+
+
+def _collect_responses(stream: Iterator[Tuple[Optional[str], Any]]) -> Dict[str, Any]:
+    items: Dict[int, Dict[str, Any]] = {}
+
+    def slot(index: Any) -> Dict[str, Any]:
+        return items.setdefault(index if isinstance(index, int) else 0,
+                                {'type': None, 'phase': None, 'text': [], 'done_text': None, 'refusal': False})
+
+    final: Optional[Dict[str, Any]] = None
+    for event, obj in stream:
+        kind = obj.get('type') or event or ''
+        if kind in ('response.output_item.added', 'response.output_item.done'):
+            item = obj.get('item') if isinstance(obj.get('item'), dict) else {}
+            entry = slot(obj.get('output_index'))
+            entry['type'] = item.get('type') or entry['type']
+            entry['phase'] = item.get('phase') or entry['phase']
+            if kind.endswith('.done') and isinstance(item.get('content'), list):
+                texts = [_text_of(part.get('text')) for part in item['content']
+                         if isinstance(part, dict) and part.get('type') in ('output_text', 'text')]
+                if texts:
+                    entry['done_text'] = ''.join(texts)
+        elif kind == 'response.output_text.delta':
+            slot(obj.get('output_index'))['text'].append(_text_of(obj.get('delta')))
+        elif kind == 'response.output_text.done':
+            slot(obj.get('output_index'))['done_text'] = _text_of(obj.get('text'))
+        elif kind.startswith('response.refusal.'):
+            slot(obj.get('output_index'))['refusal'] = True
+        elif kind in ('response.completed', 'response.incomplete', 'response.failed'):
+            final = obj.get('response') if isinstance(obj.get('response'), dict) else {}
+            break
+        elif kind == 'error':
+            raise _stream_error(_error_message(obj.get('error') or obj), PROTOCOL_RESPONSES)
+    if final is None:
+        raise _incomplete(PROTOCOL_RESPONSES)
+    output = []
+    for index in sorted(items):
+        entry = items[index]
+        if entry['type'] not in (None, 'message'):
+            continue  # reasoning 等不是正文
+        text = entry['done_text'] if entry['done_text'] is not None else ''.join(entry['text'])
+        content = [{'type': 'refusal'}] if entry['refusal'] and not text.strip() else [{'type': 'output_text', 'text': text}]
+        output.append({'type': 'message', 'role': 'assistant', 'phase': entry['phase'], 'content': content})
+    response: Dict[str, Any] = {key: final[key] for key in ('status', 'incomplete_details', 'error') if final.get(key)}
+    response['output'] = output
+    if not any(_text_of(part.get('text')).strip() for item in output for part in item['content']) and final.get('output'):
+        response['output'] = final['output']  # 个别中转站的流里没有文本事件，但最终 response 带完整输出
+    return response
+
+
+def _collect_messages(stream: Iterator[Tuple[Optional[str], Any]]) -> Dict[str, Any]:
+    blocks: Dict[int, Dict[str, Any]] = {}
+    stop = None
+    terminal = False
+    for event, obj in stream:
+        kind = obj.get('type') or event or ''
+        if kind == 'content_block_start':
+            block = obj.get('content_block') if isinstance(obj.get('content_block'), dict) else {}
+            blocks[obj.get('index', 0)] = {'type': block.get('type'), 'text': [_text_of(block.get('text'))]}
+        elif kind == 'content_block_delta':
+            delta = obj.get('delta') if isinstance(obj.get('delta'), dict) else {}
+            if delta.get('type') == 'text_delta':  # thinking_delta 等不是正文
+                blocks.setdefault(obj.get('index', 0), {'type': 'text', 'text': []})['text'].append(_text_of(delta.get('text')))
+        elif kind == 'message_delta':
+            stop = (obj.get('delta') or {}).get('stop_reason') or stop
+        elif kind == 'message_stop':
+            terminal = True
+            break
+        elif kind == 'error':
+            raise _stream_error(_error_message(obj.get('error') or obj), PROTOCOL_MESSAGES)
+    if not (terminal or stop):
+        raise _incomplete(PROTOCOL_MESSAGES)
+    content = [{'type': 'text', 'text': ''.join(block['text'])} for _, block in sorted(blocks.items())
+               if block['type'] == 'text']
+    return {'type': 'message', 'stop_reason': stop, 'content': content}
+
+
+def collect_stream(protocol: str, lines: Iterator[str], deadline: float) -> Dict[str, Any]:
+    """读完一条 SSE 流，整理成与非流式响应相同的结构，后面复用同一套正文提取规则。"""
+    stream = _stream_objects(lines, deadline, protocol)
+    if protocol == PROTOCOL_MESSAGES:
+        return _collect_messages(stream)
+    if protocol == PROTOCOL_RESPONSES:
+        return _collect_responses(stream)
+    return _collect_chat(stream)
+
+
+# ---------------------------------------------------------------------------
 # 客户端
 # ---------------------------------------------------------------------------
 
@@ -423,13 +633,15 @@ class AIClient:
     """面向一个中转站（地址 + 密钥）的无状态客户端；每次调用独立建立连接。"""
 
     def __init__(self, base_url: Optional[str], api_key: Optional[str], *, user_agent: str = '',
-                 timeout: float = REQUEST_TIMEOUT, total_timeout: float = TOTAL_TIMEOUT) -> None:
+                 timeout: float = REQUEST_TIMEOUT, total_timeout: float = TOTAL_TIMEOUT,
+                 min_fallback: float = MIN_FALLBACK_SECONDS) -> None:
         self.base_url = resolve_base_url(base_url)
         self.api_key = _clean_api_key(api_key)
         agent = (user_agent or '').encode('ascii', 'ignore').decode().strip()
         self.user_agent = agent or DEFAULT_USER_AGENT
         self.timeout = float(timeout)
         self.total_timeout = float(total_timeout)
+        self.min_fallback = float(min_fallback)
 
     # -- 内部 ------------------------------------------------------------
 
@@ -455,35 +667,71 @@ class AIClient:
             raise AIRequestError(f'网络错误（{type(exc).__name__}）', protocol=protocol, kind='network') from None
         if response.status_code >= 300:
             raise AIRequestError(describe_http_error(response), status_code=response.status_code, protocol=protocol)
+        return _json_body(response, protocol)
+
+    def _stream_request(self, protocol: str, url: str, body: Dict[str, Any], *, timeout: float,
+                        deadline: float) -> Dict[str, Any]:
+        """SSE 流式请求。服务端忽略 stream、直接返回 JSON 时，按普通响应处理。"""
+        headers = {**self._headers(anthropic=protocol == PROTOCOL_MESSAGES), 'Accept': 'text/event-stream'}
+        streaming = False
         try:
-            data = response.json()
-        except ValueError:
-            raise AIRequestError('响应不是有效的 JSON', status_code=response.status_code,
-                                 protocol=protocol, kind='format') from None
-        if not isinstance(data, dict):
-            raise AIRequestError('响应格式不正确', status_code=response.status_code, protocol=protocol, kind='format')
-        return data
+            with httpx.Client(trust_env=False, follow_redirects=False,
+                              timeout=httpx.Timeout(timeout, connect=min(10.0, timeout))) as client:
+                with client.stream('POST', url, headers=headers, json={**body, 'stream': True}) as response:
+                    if response.status_code >= 300:
+                        response.read()
+                        raise AIRequestError(describe_http_error(response), status_code=response.status_code,
+                                             protocol=protocol)
+                    if 'text/event-stream' not in response.headers.get('content-type', '').lower():
+                        response.read()
+                        return _json_body(response, protocol)
+                    streaming = True
+                    return collect_stream(protocol, response.iter_lines(), deadline)
+        except httpx.TimeoutException:
+            raise AIRequestError('请求超时', protocol=protocol, kind='timeout') from None
+        except httpx.HTTPError as exc:
+            # 已经开始收流再出网络错误属于流式中断；连接阶段的错误是普通网络故障
+            raise AIRequestError(f'网络错误（{type(exc).__name__}）', protocol=protocol,
+                                 kind='stream' if streaming else 'network') from None
 
     def _call(self, protocol: str, model: str, messages: Sequence[Dict[str, Any]], *,
-              max_tokens: int, temperature: float, timeout: float) -> str:
+              max_tokens: int, temperature: float, deadline: float) -> str:
         use_temperature = (self.base_url, model) not in _no_temperature
         body = build_body(protocol, model, messages, max_tokens=max_tokens,
                           temperature=temperature if use_temperature else None)
         url = f'{self.base_url}/{protocol}'
-        started = time.monotonic()
-        for attempt in (1, 2):
-            try:
-                data = self._request('POST', protocol, url, timeout=timeout,
-                                     anthropic=protocol == PROTOCOL_MESSAGES, json_body=body)
-                break
-            except AIRequestError as exc:
-                if attempt == 1 and exc.status_code == 400 and self._adjust_body(protocol, body, str(exc), model):
-                    continue  # 个别模型不接受 temperature / max_tokens，去掉或改名后重试一次
-                logger.warning(f'AI请求失败 协议=/{protocol} 模型={model} 原因={exc} 耗时={time.monotonic() - started:.1f}s')
-                raise
-        text = extract_text(protocol, data)
-        logger.info(f'AI请求成功 协议=/{protocol} 模型={model} 耗时={time.monotonic() - started:.1f}s')
-        return text
+        modes = ['plain'] if _stream_disabled(self.base_url, model, protocol) else ['stream', 'plain']
+        for position, mode in enumerate(modes):
+            label = '流式' if mode == 'stream' else '非流式'
+            adjusted = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AIRequestError('请求超时', protocol=protocol, kind='timeout')
+                started = time.monotonic()
+                timeout = min(self.timeout, remaining)
+                try:
+                    if mode == 'stream':
+                        data = self._stream_request(protocol, url, body, timeout=timeout, deadline=deadline)
+                    else:
+                        data = self._request('POST', protocol, url, timeout=timeout,
+                                             anthropic=protocol == PROTOCOL_MESSAGES, json_body=body)
+                    text = extract_text(protocol, data)
+                except AIRequestError as exc:
+                    if not adjusted and exc.status_code == 400 and self._adjust_body(protocol, body, str(exc), model):
+                        adjusted = True  # 个别模型不接受 temperature / max_tokens，去掉或改名后重试一次
+                        continue
+                    if mode == 'stream' and position + 1 < len(modes) and _stream_unsupported(exc):
+                        logger.warning(f'AI流式请求不成功，改用非流式 协议=/{protocol} 模型={model} 原因={exc}')
+                        break
+                    logger.warning(f'AI请求失败 协议=/{protocol} 方式={label} 模型={model} 原因={exc} '
+                                   f'耗时={time.monotonic() - started:.1f}s')
+                    raise
+                if mode == 'plain' and len(modes) == 2:
+                    _disable_stream(self.base_url, model, protocol)  # 流式不行、非流式行：记住一段时间
+                logger.info(f'AI请求成功 协议=/{protocol} 方式={label} 模型={model} 耗时={time.monotonic() - started:.1f}s')
+                return text
+        raise AIRequestError('AI 请求失败', protocol=protocol)
 
     def _adjust_body(self, protocol: str, body: Dict[str, Any], message: str, model: str) -> bool:
         lowered = message.lower()
@@ -510,11 +758,11 @@ class AIClient:
         failures: List[Tuple[str, Exception]] = []
         for index, protocol in enumerate(order):
             remaining = deadline - time.monotonic()
-            if index and remaining < MIN_FALLBACK_SECONDS:
+            if index and remaining < self.min_fallback:
                 break
             try:
                 text = self._call(protocol, model, messages, max_tokens=max_tokens,
-                                  temperature=temperature, timeout=min(self.timeout, remaining))
+                                  temperature=temperature, deadline=deadline)
             except (AIRequestError, ReasoningBudgetExhausted) as exc:
                 failures.append((protocol, exc))
                 if not _should_fallback(exc):
