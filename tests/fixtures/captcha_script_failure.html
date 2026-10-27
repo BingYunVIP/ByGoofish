@@ -1,0 +1,4 @@
+<!doctype html><meta charset="utf-8"><title>Local script/network error fixture</title>
+<div id="nocaptcha" style="width:320px;height:48px">加载中</div>
+<script src="/missing-script.js?sign=fixture-private"></script>
+<script>console.error('token=fixture-secret; local script failed'); throw new Error('fixture JavaScript failure');</script>

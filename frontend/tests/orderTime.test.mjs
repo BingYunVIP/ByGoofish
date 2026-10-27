@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import ts from 'typescript';
+const source=readFileSync(new URL('../lib/orderTime.ts',import.meta.url),'utf8');
+const js=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
+const {formatOrderTime}=await import('data:text/javascript;base64,'+Buffer.from(js).toString('base64'));
+process.env.TZ='Asia/Shanghai';
+assert.equal(formatOrderTime('2026-10-20 11:52:05'),'2026-10-20 19:52:05');
+assert.equal(formatOrderTime('2026-10-20T19:52:05+08:00'),'2026-10-20 19:52:05');
+assert.equal(formatOrderTime('2026-10-19 16:00:00'),'2026-10-20 00:00:00');
+assert.equal(formatOrderTime('not-a-date'),'not-a-date');
+assert.equal(formatOrderTime(null),'-');
+process.env.TZ='America/Los_Angeles';
+assert.equal(formatOrderTime('2026-10-20 11:52:05'),'2026-10-20 04:52:05');
+console.log('订单时间显示测试通过：UTC存储、浏览器时区、跨日边界和异常值');

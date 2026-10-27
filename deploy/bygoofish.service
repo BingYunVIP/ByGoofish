@@ -1,0 +1,32 @@
+[Unit]
+Description=ByGoofish service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/bygoofish
+# Headed Chromium is preferred for slider challenges. Give this system service a
+# virtual display even on servers without a desktop session; Docker has the same
+# Xvfb setup in entrypoint.sh. Install xvfb and xauth with the Playwright system deps.
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1920x1080x24" /opt/bygoofish/.venv/bin/python -u Start.py
+Environment=API_HOST=127.0.0.1
+Environment=API_PORT=8080
+Environment=WEB_CONCURRENCY=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=SQL_LOG_ENABLED=false
+EnvironmentFile=-/etc/bygoofish.env
+User=bygoofish
+Group=bygoofish
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGINT
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

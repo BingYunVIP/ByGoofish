@@ -1,0 +1,7 @@
+<!doctype html><meta charset="utf-8"><title>Local post-drag error fixture</title>
+<div id="nocaptcha" style="width:500px;height:48px;margin:50px;background:#eee">
+<button id="nc_slide" style="width:40px;height:40px">拖动</button></div>
+<script>
+const slider = document.getElementById('nc_slide');
+slider.addEventListener('mouseup', () => document.getElementById('nocaptcha').innerText = "Oops... something's wrong... (error:AfterDrag)");
+</script>
