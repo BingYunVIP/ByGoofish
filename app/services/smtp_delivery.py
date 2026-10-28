@@ -5,6 +5,10 @@ import time
 from email.utils import formataddr
 
 
+class MailNotConfigured(RuntimeError):
+    pass
+
+
 class TLSVerificationFailed(RuntimeError):
     pass
 

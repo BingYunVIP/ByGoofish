@@ -1,3 +1,4 @@
+import { clearAuthSession, loginIdentity, LogoutNotice } from './lib/authSession';
 import React, { Suspense, lazy, useState, useEffect } from 'react';
 import Sidebar from './components/Sidebar';
 import GlobalFeedback from './components/GlobalFeedback';
@@ -187,28 +188,56 @@ const App: React.FC = () => {
     }
   };
 
-  // Check auth on mount
+  // Verify current sessions only; neither old verification nor old 401 may undo a newer login.
   useEffect(() => {
+    let disposed = false;
+    let sequence = 0;
+    const resetLogin = (notice: LogoutNotice = {}) => {
+      sequence += 1;
+      setIsLoggedIn(false);
+      setIsAdmin(false);
+      setPassword('');
+      setRegForm({ username: '', email: '', password: '', code: '' });
+      loginCaptcha.setCode('');
+      loginCaptcha.setRequired(false);
+      setLoginError('');
+      setLoginNotice(notice.message || '已退出登录，请重新登录');
+      if (notice.identifier) setUsername(notice.identifier);
+      setAuthMode('login');
+      setCheckingAuth(false);
+    };
+    const check = (token: string) => {
+      const requestSequence = ++sequence;
+      verifyToken().then(result => {
+        if (disposed || requestSequence !== sequence || localStorage.getItem('auth_token') !== token) return;
+        if (!result.authenticated) {
+          clearAuthSession(token, { message: '登录状态已失效，请重新登录' });
+        } else {
+          setPassword('');
+          setIsAdmin(Boolean(result.is_admin));
+          setIsLoggedIn(true);
+        }
+      }).catch(() => {
+        if (!disposed && requestSequence === sequence) clearAuthSession(token);
+      }).finally(() => { if (!disposed) setCheckingAuth(false); });
+    };
+    const handleLogout = (event: Event) => resetLogin((event as CustomEvent<LogoutNotice>).detail);
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== 'auth_token' && event.key !== null) return;
       const token = localStorage.getItem('auth_token');
-      if (token) {
-          verifyToken()
-            .then(result => {
-              if (!result.authenticated) {
-                localStorage.removeItem('auth_token');
-                return;
-              }
-              setIsAdmin(Boolean(result.is_admin));
-              setIsLoggedIn(true);
-            })
-            .catch(() => localStorage.removeItem('auth_token'))
-            .finally(() => setCheckingAuth(false));
-      } else {
-          setCheckingAuth(false);
-      }
-      
-      const handleLogout = () => setIsLoggedIn(false);
-      window.addEventListener('auth:logout', handleLogout);
-      return () => window.removeEventListener('auth:logout', handleLogout);
+      if (token) check(token);
+      else resetLogin({ message: '登录状态已在其他页面更新，请重新登录' });
+    };
+    window.addEventListener('auth:logout', handleLogout);
+    window.addEventListener('storage', handleStorage);
+    const token = localStorage.getItem('auth_token');
+    if (token) check(token);
+    else setCheckingAuth(false);
+    return () => {
+      disposed = true;
+      window.removeEventListener('auth:logout', handleLogout);
+      window.removeEventListener('storage', handleStorage);
+    };
   }, []);
 
   useEffect(() => {
@@ -229,7 +258,7 @@ const App: React.FC = () => {
       try {
           // 连续失败被后端要求后，随请求带上图形验证码
           const res = await login({
-              username,
+              ...loginIdentity(username),
               password,
               ...(loginCaptcha.required ? {
                   captcha_session_id: loginCaptcha.sessionId,
@@ -240,6 +269,8 @@ const App: React.FC = () => {
               localStorage.setItem('auth_token', res.token);
               setIsAdmin(Boolean(res.is_admin));
               setIsLoggedIn(true);
+              setPassword('');
+              setLoginNotice('');
           } else {
               setLoginError(res.message || '账号或密码错误');
               if (res.captcha_required) {
@@ -327,7 +358,7 @@ const App: React.FC = () => {
                 <form onSubmit={handleLogin} className="space-y-5">
                   <div className="space-y-4">
                       <label className="block">
-                          <span className="mb-1.5 block text-xs font-bold text-gray-600">管理员账号</span>
+                          <span className="mb-1.5 block text-xs font-bold text-gray-600">账号或登录邮箱</span>
                           <div className="relative group">
                             <User className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400 group-focus-within:text-gray-700" />
                             <input
@@ -543,12 +574,10 @@ const App: React.FC = () => {
         onMobileClose={() => setMobileMenuOpen(false)}
         isAdmin={isAdmin}
         onLogout={async () => {
+          const token = localStorage.getItem('auth_token');
           try {
             await logout();
-            localStorage.removeItem('auth_token');
-            setPassword('');
-            setIsAdmin(false);
-            setIsLoggedIn(false);
+            clearAuthSession(token);
           } catch {
             notify('退出未完成，请检查本地服务连接后重试', 'error');
           }

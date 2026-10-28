@@ -4437,7 +4437,7 @@ class DBManager:
                 ''', (email, code, code_type, expires_at))
 
                 self.conn.commit()
-                logger.info(f"保存验证码成功: {email} ({code_type})")
+                logger.info("邮箱验证码已保存 type={}", code_type)
                 return True
             except Exception as e:
                 logger.error(f"保存验证码失败: {e}")
@@ -4529,7 +4529,7 @@ class DBManager:
             return None
         return {**config, 'smtp_port': port}
 
-    async def send_verification_email(self, email: str, code: str) -> bool:
+    async def send_verification_email(self, email: str, code: str, *, raise_errors: bool = False, request_id: str = None) -> bool:
         """发送验证码邮件，发信账号取自管理员的邮件通知渠道（见 get_mail_sender_config）。"""
         try:
             subject = "闲鱼超级管家 - 邮箱验证码"
@@ -4552,6 +4552,9 @@ class DBManager:
 
             config = self.get_mail_sender_config()
             if not config:
+                if raise_errors:
+                    from app.services.smtp_delivery import MailNotConfigured
+                    raise MailNotConfigured('邮件渠道未配置')
                 # 不回退到任何第三方邮件接口：那等于把用户邮箱发到站外服务器。
                 logger.warning(
                     f"没有可用的邮件渠道，无法发送验证码邮件: {email}。"
@@ -4559,7 +4562,7 @@ class DBManager:
                 )
                 return False
             port = config['smtp_port']
-            logger.info(f"使用邮件渠道发送验证码邮件: {email}")
+            logger.info('使用邮件渠道发送验证码 request_id={}', request_id or '-')
             return await self._send_email_via_smtp(
                 email, subject, text_content,
                 config['smtp_server'], port, config['email_user'], config['email_password'],
@@ -4568,6 +4571,8 @@ class DBManager:
                 bool(config.get('smtp_use_ssl', port == 465)),
             )
         except Exception as e:
+            if raise_errors:
+                raise
             logger.error(f"发送验证码邮件异常: {type(e).__name__}")
             return False
 
@@ -6688,8 +6693,9 @@ class DBManager:
                         write(cursor,cookie_id,item_id,item_detail,source='platform',
                               metadata=item_data.get('platform_metadata'))
                         if confirmed_on_sale:
-                            cursor.execute("UPDATE item_info SET listing_status='on_sale',last_seen_at=CURRENT_TIMESTAMP "
-                                           "WHERE cookie_id=? AND item_id=?", (cookie_id,item_id))
+                            cursor.execute("UPDATE item_info SET listing_status='on_sale',last_seen_at=CURRENT_TIMESTAMP, "
+                                           "item_title=?,item_category=CASE WHEN ?!='' THEN ? ELSE item_category END "
+                                           "WHERE cookie_id=? AND item_id=?", (item_title,item_category,item_category,cookie_id,item_id))
                         success_count += 1
 
                     except Exception as item_e:

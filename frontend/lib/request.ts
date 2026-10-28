@@ -1,3 +1,4 @@
+import { clearAuthSession } from './authSession';
 import axios, { AxiosError, AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
 
 const request: AxiosInstance = axios.create({
@@ -29,11 +30,10 @@ request.interceptors.response.use(
   (response: AxiosResponse) => response,
   (error: AxiosError) => {
     if (error.response?.status === 401) {
-      localStorage.removeItem('auth_token');
-      try {
-        window.dispatchEvent(new Event('auth:logout'));
-      } catch {
-        /* no-op (SSR) */
+      const sent = error.config?.headers?.Authorization;
+      const current = localStorage.getItem('auth_token');
+      if (current && sent === `Bearer ${current}`) {
+        clearAuthSession(current, { message: '登录状态已失效，请重新登录' });
       }
     }
     return Promise.reject(error);

@@ -18,6 +18,15 @@ export interface PaginatedResponse<T> {
 }
 
 // Auth
+export interface AccountProfile { user_id: number; username: string; email: string }
+export interface CredentialResult extends ApiResponse {
+  success: boolean;
+  error_code?: string;
+  request_id?: string;
+  reauth_required?: boolean;
+  profile?: AccountProfile;
+  retry_after_seconds?: number;
+}
 export interface LoginResponse {
   success: boolean;
   token?: string;

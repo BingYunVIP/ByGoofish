@@ -756,30 +756,8 @@ async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
 @app.post('/change-admin-password')
 async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict[str, Any] = Depends(verify_admin_token)):
     from app.db_manager import db_manager
-
-    try:
-        # 新密码强度校验（旧密码不校验格式，只验证正确性）
-        valid, reason = validate_password(request.new_password)
-        if not valid:
-            return {"success": False, "message": reason}
-
-        # 验证当前密码（使用用户表验证）
-        if not db_manager.verify_user_password('admin', request.current_password):
-            return {"success": False, "message": "当前密码错误"}
-
-        # 更新密码（使用用户表更新）
-        success = db_manager.update_user_password('admin', request.new_password)
-
-        if success:
-            SESSION_TOKENS.revoke_user(admin_user['user_id'])
-            logger.info('管理员密码已修改，既有会话已撤销')
-            return {"success": True, "message": "密码修改成功"}
-        else:
-            return {"success": False, "message": "密码修改失败"}
-
-    except Exception as e:
-        logger.error(f"修改管理员密码异常: {e}")
-        return {"success": False, "message": "系统错误"}
+    from app.services.account_credentials import change
+    return change(db_manager, admin_user['user_id'], request.current_password, new_password=request.new_password)
 
 
 @app.get('/account/profile')
@@ -797,36 +775,8 @@ def get_account_profile(current_user: Dict[str, Any] = Depends(get_current_user)
 @app.post('/change-password')
 async def change_user_password(request: ChangePasswordRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     from app.db_manager import db_manager
-
-    try:
-        username = current_user.get('username')
-        user_id = current_user.get('user_id')
-        
-        if not username:
-            return {"success": False, "message": "无法获取用户信息"}
-
-        # 新密码强度校验（旧密码不校验格式，只验证正确性）
-        valid, reason = validate_password(request.new_password)
-        if not valid:
-            return {"success": False, "message": reason}
-
-        # 验证当前密码
-        if not db_manager.verify_user_password(username, request.current_password):
-            return {"success": False, "message": "当前密码错误"}
-
-        # 更新密码
-        success = db_manager.update_user_password(username, request.new_password)
-
-        if success:
-            SESSION_TOKENS.revoke_user(user_id)
-            logger.info(f"【{username}#{user_id}】用户密码修改成功")
-            return {"success": True, "message": "密码修改成功"}
-        else:
-            return {"success": False, "message": "密码修改失败"}
-
-    except Exception as e:
-        logger.error(f"修改用户密码异常: {e}")
-        return {"success": False, "message": "系统错误"}
+    from app.services.account_credentials import change
+    return change(db_manager, current_user['user_id'], request.current_password, new_password=request.new_password)
 
 
 @app.post('/change-email/send-code')
@@ -834,40 +784,49 @@ async def send_change_email_code(
     request: EmailChangeCodeRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """向当前用户要替换的新邮箱发送一次性验证码。"""
+    """Send once; definite failure invalidates this code, ambiguous delivery remains usable."""
     from app.db_manager import db_manager
-
+    from app.services.account_credentials import result_error, invalidate_sent_code
+    from app.services.smtp_delivery import DeliveryUncertain, MailNotConfigured
+    request_id = secrets.token_hex(6)
     email = (request.email or '').strip().lower()
     valid, reason = validate_email(email)
     if not valid:
-        return {"success": False, "message": reason}
-
+        return result_error('email_invalid', reason, request_id=request_id)
     user = db_manager.get_user_by_id(current_user.get('user_id'))
     if not user:
-        return {"success": False, "message": "用户不存在"}
+        return result_error('user_unavailable', request_id=request_id)
     if not db_manager.verify_user_password(user['username'], request.current_password):
-        return {"success": False, "message": "当前密码错误"}
-    if email.lower() == str(user.get('email') or '').strip().lower():
-        return {"success": False, "message": "新邮箱不能与当前邮箱相同"}
+        return result_error('current_password_wrong', request_id=request_id)
+    if email == str(user.get('email') or '').strip().lower():
+        return result_error('email_unchanged', request_id=request_id)
     if db_manager.user_email_in_use(email):
-        return {"success": False, "message": "该邮箱已被其他用户使用"}
-    code_type = f"email_change:{user['id']}"
-
+        return result_error('email_in_use', request_id=request_id)
     wait_seconds = email_code_send_limiter.acquire(email)
     if wait_seconds is not None:
-        return {
-            "success": False,
-            "message": f"发送过于频繁，请 {wait_seconds // 60} 分钟后再试"
-            if wait_seconds >= 60 else f"发送过于频繁，请 {wait_seconds} 秒后再试",
-        }
-
+        return result_error('send_rate_limited', f'发送过于频繁，请 {wait_seconds} 秒后再试',
+                            request_id=request_id, retry_after_seconds=wait_seconds)
     code = db_manager.generate_verification_code()
-    if not db_manager.save_verification_code(email, code, code_type):
-        return {"success": False, "message": "验证码保存失败，请稍后重试"}
-    if not await db_manager.send_verification_email(email, code):
-        return {"success": False, "message": "验证码发送失败，请检查通知渠道配置"}
-    log_with_user('info', '登录邮箱变更验证码已发送', current_user)
-    return {"success": True, "message": "验证码已发送到新邮箱，请查收"}
+    if not db_manager.save_verification_code(email, code, f"email_change:{user['id']}"):
+        return result_error('code_save_failed', '验证码保存失败，请稍后重试', request_id=request_id, retry_after_seconds=60)
+    try:
+        sent = await db_manager.send_verification_email(email, code, raise_errors=True, request_id=request_id)
+        if not sent:
+            raise RuntimeError('mail rejected')
+    except DeliveryUncertain:
+        logger.warning('登录邮箱验证码提交结果未知 request_id={}', request_id)
+        return result_error('delivery_uncertain', '邮件提交结果未确认，请先查收收件箱或垃圾邮件，不要立即重复发送',
+                            request_id=request_id, retry_after_seconds=60)
+    except Exception as exc:
+        invalidate_sent_code(db_manager, email, user['id'], code)
+        category = 'mail_not_configured' if isinstance(exc, MailNotConfigured) else 'mail_send_failed'
+        logger.warning('登录邮箱验证码发送未完成 error={} request_id={}', type(exc).__name__, request_id)
+        return result_error(category, '没有可用的邮件渠道，请在通知与日志中配置并启用邮箱渠道' if category == 'mail_not_configured'
+                            else '验证码发送失败，请检查邮件渠道配置或稍后重试',
+                            request_id=request_id, retry_after_seconds=60)
+    logger.info('登录邮箱验证码已提交至邮件服务 request_id={}', request_id)
+    return {'success': True, 'message': '验证码已提交至新邮箱，请查收收件箱或垃圾邮件',
+            'retry_after_seconds': 60, 'request_id': request_id}
 
 
 @app.post('/change-email')
@@ -875,34 +834,10 @@ async def change_user_email(
     request: ChangeEmailRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """验证当前密码和新邮箱验证码后替换登录邮箱，并撤销旧会话。"""
     from app.db_manager import db_manager
-
-    email = (request.new_email or '').strip().lower()
-    valid, reason = validate_email(email)
-    if not valid:
-        return {"success": False, "message": reason}
-    username = current_user.get('username')
-    user_id = current_user.get('user_id')
-    if not username or not user_id:
-        return {"success": False, "message": "无法获取用户信息"}
-    if not db_manager.verify_user_password(username, request.current_password):
-        return {"success": False, "message": "当前密码错误"}
-    if db_manager.user_email_in_use(email, exclude_user_id=user_id):
-        return {"success": False, "message": "该邮箱已被其他用户使用"}
-    own = db_manager.get_user_by_id(user_id)
-    if own and email.lower() == str(own.get('email') or '').strip().lower():
-        return {"success": False, "message": "新邮箱不能与当前邮箱相同"}
-    if not db_manager.verify_email_code(email, request.verification_code, f"email_change:{user_id}"):
-        return {"success": False, "message": "邮箱验证码错误或已过期"}
-
-    if not db_manager.update_user_email(user_id, email):
-        if db_manager.user_email_in_use(email, exclude_user_id=user_id):
-            return {"success": False, "message": "该邮箱已被其他用户使用"}
-        return {"success": False, "message": "登录邮箱修改失败，请稍后重试"}
-    SESSION_TOKENS.revoke_user(user_id)
-    log_with_user('info', '用户登录邮箱修改成功，既有会话已撤销', current_user)
-    return {"success": True, "message": "登录邮箱已修改，请使用新邮箱重新登录"}
+    from app.services.account_credentials import change
+    return change(db_manager, current_user['user_id'], request.current_password,
+                  new_email=request.new_email, code=request.verification_code)
 
 
 # 检查是否使用默认密码
@@ -6893,6 +6828,11 @@ async def get_all_items_from_account(request: dict, current_user: Dict[str, Any]
         if cookie_id not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限操作该账号")
 
+        from app.services.auth_recovery import status as auth_status
+        recovery = auth_status(cookie_id)
+        if recovery['auth_paused']:
+            raise HTTPException(status_code=409, detail=recovery.get('recovery_detail') or '账号认证待处理，请先按账号页提示恢复')
+
         # 获取指定账号的cookie信息
         cookie_info = db_manager.get_cookie_by_id(cookie_id)
         if not cookie_info:
@@ -9294,7 +9234,7 @@ async def import_orders(
 # 定义后端 API 的一级路径。未匹配的 API 路径必须返回 JSON 404，不能回退到 SPA。
 API_ROOTS = {
     'admin', 'ai-models', 'ai-reply-settings', 'ai-reply-test', 'analytics', 'api', 'backup',
-    'cards', 'change-admin-password', 'change-password', 'cookie', 'cookies',
+    'cards', 'account', 'change-email', 'change-admin-password', 'change-password', 'cookie', 'cookies',
     'blacklist', 'debug', 'default-replies', 'delivery-block-rules', 'delivery-rules', 'face-verification',
     'generate-captcha', 'geetest', 'health', 'item-reply', 'itemReplays', 'items',
     'item-delivery-configs',

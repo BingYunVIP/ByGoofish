@@ -62,6 +62,16 @@ class OnSaleItemsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.state(item),('unknown',None))
         self.assertEqual(self.db.get_items_by_cookie('sale-fixture',listing_status='on_sale'),[])
 
+    async def test_authoritative_sync_updates_title_and_price_without_overwriting_manual_prose(self):
+        self.save()
+        self.db.update_item_detail('sale-fixture','live','人工正文')
+        self.db.batch_save_item_basic_info([{'cookie_id':'sale-fixture','item_id':'live',
+            'item_title':'平台最新标题','item_price':'2.00','item_detail':'自动正文'}],confirmed_on_sale=True)
+        item=self.db.get_item_info('sale-fixture','live')
+        self.assertEqual(item['item_title'],'平台最新标题')
+        self.assertEqual(item['item_price'],'2.00')
+        self.assertEqual(item['item_detail'],'人工正文')
+
     async def test_one_confirmed_and_four_history_items_count_as_one(self):
         for item in ['live']+[f'history-{i}' for i in range(4)]:self.save(item)
         self.db.batch_save_item_basic_info([{'cookie_id':'sale-fixture','item_id':'live','item_title':'live'}],confirmed_on_sale=True)

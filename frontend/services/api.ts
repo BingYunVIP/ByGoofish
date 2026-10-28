@@ -1,4 +1,4 @@
-import type { AccountRecoveryStatus, CaptchaDiagnostic } from '../types';
+import type { AccountRecoveryStatus, CaptchaDiagnostic, CredentialResult } from '../types';
 import { get, post, put, del, patch } from '../lib/request';
 import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
@@ -74,17 +74,17 @@ export const logout = async (): Promise<ApiResponse> => {
   return post('/logout', {});
 };
 
-export const changePassword = async (currentPassword: string, newPassword: string): Promise<ApiResponse> => {
+export const changePassword = async (currentPassword: string, newPassword: string): Promise<CredentialResult> => {
   return post('/change-password', { current_password: currentPassword, new_password: newPassword });
 };
 
 export const getAccountProfile = async (): Promise<{ user_id: number; username: string; email: string }> =>
   get('/account/profile');
 
-export const sendChangeEmailCode = async (email: string, currentPassword: string): Promise<ApiResponse> =>
-  post('/change-email/send-code', { email, current_password: currentPassword });
+export const sendChangeEmailCode = async (email: string, currentPassword: string): Promise<CredentialResult> =>
+  post('/change-email/send-code', { email, current_password: currentPassword }, { timeout: 45000 });
 
-export const changeEmail = async (currentPassword: string, newEmail: string, verificationCode: string): Promise<ApiResponse> =>
+export const changeEmail = async (currentPassword: string, newEmail: string, verificationCode: string): Promise<CredentialResult> =>
   post('/change-email', {
     current_password: currentPassword,
     new_email: newEmail,

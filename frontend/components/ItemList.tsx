@@ -184,6 +184,9 @@ const ItemList: React.FC = () => {
   const [items, setItems] = useState<Item[]>([]);
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
   const rootRef = useRef<HTMLDivElement>(null);
+  const refreshSequence = useRef(0);
+  const refreshInFlight = useRef(false);
+  const syncingRef = useRef(false);
   const [cards, setCards] = useState<Card[]>([]);
   const [shippingRules, setShippingRules] = useState<ShippingRule[]>([]);
   const [deliveryConfigs, setDeliveryConfigs] = useState<ItemDeliveryConfigSummary[]>([]);
@@ -319,52 +322,75 @@ const ItemList: React.FC = () => {
   };
 
   useEffect(() => {
-    void loadData();
-
-    // App 用 hidden 属性切换页面，组件挂载后不会卸载，只在挂载时拉一次的话，
-    // 在别的页面新增账号或卡密后，这里的下拉框始终是旧数据，必须刷新浏览器才更新。
-    const syncSharedData = () => {
-      getAccountDetails().then(setAccounts).catch(() => undefined);
-      getCards().then(setCards).catch(() => undefined);
-      getItemDeliveryConfigs().then(setDeliveryConfigs).catch(() => undefined);
+    let disposed = false;
+    let initialized = false;
+    void loadData().finally(() => { initialized = true; });
+    const visible = () => document.visibilityState === 'visible' &&
+      !!rootRef.current && rootRef.current.getClientRects().length > 0;
+    const refresh = async () => {
+      if (!initialized || !visible() || refreshInFlight.current || syncingRef.current) return;
+      refreshInFlight.current = true;
+      const sequence = ++refreshSequence.current;
+      try {
+        // These are local database reads, never platform synchronization requests.
+        const [accountData, itemData, cardData, configData] = await Promise.all([
+          getAccountDetails(), getItems('on_sale'), getCards(), getItemDeliveryConfigs(),
+        ]);
+        if (disposed || sequence !== refreshSequence.current) return;
+        setAccounts(accountData);
+        setItems(itemData);
+        setCards(cardData);
+        setDeliveryConfigs(configData);
+      } catch { /* Retain the last known list on a transient local-service error. */ }
+      finally { refreshInFlight.current = false; }
     };
-
-    // 兜底轮询
-    const timer = setInterval(syncSharedData, 30000);
-
-    // 切回本页时立即同步：刚在卡密库存加完卡密就切过来的场景，等 30 秒太久。
-    // hidden 切换不触发挂载，因此监听自身可见性变化。
     const node = rootRef.current;
-    let observer: IntersectionObserver | undefined;
-    if (node) {
-      observer = new IntersectionObserver(entries => {
-        if (entries.some(e => e.isIntersecting)) syncSharedData();
-      });
-      observer.observe(node);
-    }
-
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) void refresh();
+    });
+    if (node) observer.observe(node);
+    const onVisible = () => { if (visible()) void refresh(); };
+    const timer = window.setInterval(onVisible, 15000);
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
     return () => {
-      clearInterval(timer);
-      observer?.disconnect();
+      disposed = true;
+      refreshSequence.current += 1;
+      window.clearInterval(timer);
+      observer.disconnect();
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
     };
   }, []);
 
   const handleSync = async () => {
-    if (!selectedAccount) {
-      setNotice({ type: 'error', message: '请先选择需要同步的账号' });
-      return;
-    }
-
+    if (syncingRef.current) return;
+    const targets = selectedAccount ? [selectedAccount] : accounts.map(account => account.id);
+    if (!targets.length) return;
+    syncingRef.current = true;
+    refreshSequence.current += 1;
     setSyncing(true);
     setNotice(null);
+    const errors: string[] = [];
+    let succeeded = 0;
     try {
-      const result = await syncItemsFromAccount(selectedAccount);
-      if (result?.success === false) throw new Error(result.message || '同步失败');
+      for (const accountId of targets) {
+        try {
+          const result = await syncItemsFromAccount(accountId);
+          if (result?.success !== true) throw new Error(result?.message || '同步未完成');
+          succeeded += 1;
+        } catch (error) {
+          errors.push(`${accountNames.get(accountId) || accountId}：${describeApiError(error, '同步失败')}`);
+        }
+      }
       setItems(await getItems('on_sale'));
-      setNotice({ type: 'success', message: result?.message || '商品同步完成' });
+      setNotice(errors.length
+        ? { type: 'error', message: `已同步 ${succeeded}/${targets.length} 个账号；${errors.join('；')}` }
+        : { type: 'success', message: `在售商品已更新（${succeeded} 个账号）` });
     } catch (error) {
-      setNotice({ type: 'error', message: describeApiError(error, '同步失败') });
+      setNotice({ type: 'error', message: describeApiError(error, '商品列表读取失败') });
     } finally {
+      syncingRef.current = false;
       setSyncing(false);
     }
   };
@@ -427,6 +453,7 @@ const ItemList: React.FC = () => {
     setSavingKey(key);
     try {
       await updateItemDetail(detailItem.cookie_id, detailItem.item_id, itemDetail);
+      refreshSequence.current += 1;
       setItems(current => current.map(item =>
         itemKey(item) === key ? { ...item, item_detail: itemDetail, detail_source: 'manual', detail_status: 'ready', detail_failure: '', detail_updated_at: Date.now() / 1000 } : item,
       ));
@@ -732,7 +759,7 @@ const ItemList: React.FC = () => {
               <button
                 type="button"
                 onClick={handleSync}
-                disabled={syncing || !selectedAccount}
+                disabled={syncing || !accounts.length}
                 className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm"
                 title={selectedAccount ? '从闲鱼拉取该账号的在售商品' : '请先在左侧选择账号'}
               >

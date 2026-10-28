@@ -1,3 +1,4 @@
+import { clearAuthSession, isUnconfirmedRequest } from '../lib/authSession';
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Database,
@@ -167,8 +168,18 @@ const Settings: React.FC = () => {
   const [emailForm, setEmailForm] = useState({ currentPassword: '', newEmail: '', verificationCode: '' });
   const [sendingEmailCode, setSendingEmailCode] = useState(false);
   const [changingEmail, setChangingEmail] = useState(false);
+  const [emailCodeCountdown, setEmailCodeCountdown] = useState(0);
+  const credentialsBusy = changingPassword || changingEmail || sendingEmailCode;
+  const credentialLock = useRef(false);
+  useEffect(() => {
+    if (emailCodeCountdown <= 0) return;
+    const timer = window.setTimeout(() => setEmailCodeCountdown(value => Math.max(0, value - 1)), 1000);
+    return () => window.clearTimeout(timer);
+  }, [emailCodeCountdown]);
+
 
   const handleChangePassword = async () => {
+    if (credentialLock.current) return;
     const { current, next, confirm } = passwordForm;
     if (!current || !next) {
       notify('请填写当前密码和新密码');
@@ -189,26 +200,28 @@ const Settings: React.FC = () => {
       return;
     }
 
+    const startingToken = localStorage.getItem('auth_token');
+    credentialLock.current = true;
     setChangingPassword(true);
     try {
       const result = await changePassword(current, next);
       // 后端对「当前密码错误」这类校验失败也返回 200，要看 success 字段
-      if (result?.success === false) {
-        notify(result.message || '密码修改失败');
+      if (result?.success !== true) {
+        notify(result?.message || '密码修改结果未确认，请用新密码重新登录确认', 'error');
         return;
       }
       setPasswordForm({ current: '', next: '', confirm: '' });
-      notify('密码已修改，请重新登录', 'success');
-      localStorage.removeItem('auth_token');
-      window.dispatchEvent(new Event('auth:logout'));
+      clearAuthSession(startingToken, { message: result.message || '密码已修改，请使用新密码重新登录', identifier: result.profile?.username, credentialsChanged: true });
     } catch (error) {
-      notify(`密码修改失败：${(error as Error).message}`);
+      notify(isUnconfirmedRequest(error) ? '密码修改结果未确认，请用新密码重新登录确认，不要重复提交' : `密码修改失败：${describeApiError(error)}`, 'error');
     } finally {
+      credentialLock.current = false;
       setChangingPassword(false);
     }
   };
 
   const handleSendEmailCode = async () => {
+    if (credentialLock.current || emailCodeCountdown > 0) return;
     const email = emailForm.newEmail.trim();
     const [emailOk, emailReason] = validateEmail(email);
     if (!emailOk) {
@@ -219,22 +232,27 @@ const Settings: React.FC = () => {
       notify('请填写当前密码');
       return;
     }
+    credentialLock.current = true;
     setSendingEmailCode(true);
     try {
       const result = await sendChangeEmailCode(email, emailForm.currentPassword);
-      if (result?.success === false) {
-        notify(result.message || '验证码发送失败');
+      setEmailCodeCountdown(result?.retry_after_seconds ?? (result?.success === false ? 0 : 60));
+      if (result?.success !== true) {
+        notify(result?.message || '验证码发送结果未确认，请先查收邮件', 'error');
         return;
       }
       notify(result.message || '验证码已发送到新邮箱', 'success');
     } catch (error) {
-      notify(`验证码发送失败：${describeApiError(error)}`, 'error');
+      setEmailCodeCountdown(60);
+      notify(isUnconfirmedRequest(error) ? '验证码发送结果未确认，请先查收邮箱，不要立即重复发送' : `验证码发送失败：${describeApiError(error)}`, 'error');
     } finally {
+      credentialLock.current = false;
       setSendingEmailCode(false);
     }
   };
 
   const handleChangeEmail = async () => {
+    if (credentialLock.current) return;
     const email = emailForm.newEmail.trim();
     const [emailOk, emailReason] = validateEmail(email);
     if (!emailOk) {
@@ -245,20 +263,22 @@ const Settings: React.FC = () => {
       notify('请填写当前密码和新邮箱验证码');
       return;
     }
+    const startingToken = localStorage.getItem('auth_token');
+    credentialLock.current = true;
     setChangingEmail(true);
     try {
       const result = await changeEmail(emailForm.currentPassword, email, emailForm.verificationCode.trim());
-      if (result?.success === false) {
-        notify(result.message || '登录邮箱修改失败');
+      if (result?.success !== true) {
+        notify(result?.message || '邮箱修改结果未确认，请用新邮箱重新登录确认', 'error');
         return;
       }
       setEmailForm({ currentPassword: '', newEmail: '', verificationCode: '' });
-      notify(result.message || '登录邮箱已修改，请重新登录', 'success');
-      localStorage.removeItem('auth_token');
-      window.dispatchEvent(new Event('auth:logout'));
+      setCurrentEmail(result.profile?.email || email);
+      clearAuthSession(startingToken, { message: result.message || '登录邮箱已修改，请使用新邮箱重新登录', identifier: result.profile?.email || email, credentialsChanged: true });
     } catch (error) {
-      notify(`登录邮箱修改失败：${describeApiError(error)}`, 'error');
+      notify(isUnconfirmedRequest(error) ? '邮箱修改结果未确认，请用新邮箱重新登录确认，不要重复提交' : `登录邮箱修改失败：${describeApiError(error)}`, 'error');
     } finally {
+      credentialLock.current = false;
       setChangingEmail(false);
     }
   };
@@ -414,7 +434,8 @@ const Settings: React.FC = () => {
                 <input
                   type="email"
                   value={emailForm.newEmail}
-                  onChange={event => setEmailForm({ ...emailForm, newEmail: event.target.value })}
+                  onChange={event => setEmailForm({ ...emailForm, newEmail: event.target.value, verificationCode: '' })}
+                  disabled={credentialsBusy}
                   autoComplete="email"
                   className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
                   placeholder="name@example.com"
@@ -435,18 +456,18 @@ const Settings: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => void handleSendEmailCode()}
-                  disabled={sendingEmailCode || !emailForm.currentPassword || !emailForm.newEmail.trim()}
+                  disabled={credentialsBusy || emailCodeCountdown > 0 || !emailForm.currentPassword || !emailForm.newEmail.trim()}
                   className="ios-btn-secondary flex min-h-11 items-center justify-center gap-2 rounded-md px-4 py-2 text-sm disabled:opacity-50"
                 >
                   {sendingEmailCode ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Mail className="h-4 w-4" />}
-                  {sendingEmailCode ? '发送中' : '发送验证码'}
+                  {sendingEmailCode ? '发送中' : emailCodeCountdown > 0 ? `${emailCodeCountdown}秒后重发` : '发送验证码'}
                 </button>
               </div>
               <div className="flex justify-end">
                 <button
                   type="button"
                   onClick={() => void handleChangeEmail()}
-                  disabled={changingEmail || !emailForm.currentPassword || !emailForm.verificationCode.trim()}
+                  disabled={credentialsBusy || !emailForm.currentPassword || !emailForm.verificationCode.trim()}
                   className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm disabled:opacity-60"
                 >
                   <Mail className="h-4 w-4" />
@@ -493,7 +514,7 @@ const Settings: React.FC = () => {
                     value={passwordForm.next}
                     onChange={e => setPasswordForm({ ...passwordForm, next: e.target.value })}
                     autoComplete="new-password"
-                    placeholder="至少 6 位"
+                    placeholder="8–64位，包含字母和数字"
                     className="ios-input w-full rounded-md px-3 py-2.5 text-sm"
                   />
                 </label>
@@ -514,7 +535,7 @@ const Settings: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => void handleChangePassword()}
-                  disabled={changingPassword}
+                  disabled={credentialsBusy}
                   className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm disabled:opacity-60"
                 >
                   <KeyRound className="h-4 w-4" />
