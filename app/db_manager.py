@@ -87,6 +87,8 @@ class DBManager:
         initialize_account_offline(self)
         from app.services.event_journal import initialize as initialize_event_journal
         initialize_event_journal(self)
+        from app.services.item_details import initialize as initialize_item_details
+        initialize_item_details(self)
     
     def init_db(self):
         """初始化数据库表结构"""
@@ -5675,10 +5677,13 @@ class DBManager:
                                                created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ''', (cookie_id, item_id, item_title or '', item_description or '',
-                      item_category or '', item_price or '', item_image or '', item_detail or ''))
+                      item_category or '', item_price or '', item_image or '', ''))
 
+                from app.services.item_details import write
+                inserted = cursor.rowcount > 0
+                write(cursor, cookie_id, item_id, item_detail, source='platform')
                 # 如果是新插入的记录，直接返回成功
-                if cursor.rowcount > 0:
+                if inserted:
                     self.conn.commit()
                     logger.info(f"新增商品基本信息: {item_id} - {item_title}")
                     return True
@@ -5707,11 +5712,6 @@ class DBManager:
                 if item_image:
                     update_parts.append("item_image = ?")
                     params.append(item_image)
-
-                # 对于item_detail，只有在现有值为空时才更新
-                if item_detail:
-                    update_parts.append("item_detail = CASE WHEN (item_detail IS NULL OR item_detail = '' OR TRIM(item_detail) = '') THEN ? ELSE item_detail END")
-                    params.append(item_detail)
 
                 if update_parts:
                     update_parts.append("updated_at = CURRENT_TIMESTAMP")
@@ -5762,118 +5762,37 @@ class DBManager:
             self.conn.rollback()
             return False
 
-    def save_item_info(self, cookie_id: str, item_id: str, item_data = None) -> bool:
-        """保存或更新商品信息
-
-        Args:
-            cookie_id: Cookie ID
-            item_id: 商品ID
-            item_data: 商品详情数据，可以是字符串或字典，也可以为None
-
-        Returns:
-            bool: 操作是否成功
-        """
-        try:
-            # 验证：如果只有商品ID，没有商品详情数据，则不插入数据库
-            if not item_data:
-                logger.debug(f"跳过保存商品信息：缺少商品详情数据 - {item_id}")
-                return False
-
-            # 如果是字典类型，检查是否有标题信息
-            if isinstance(item_data, dict):
-                title = item_data.get('title', '').strip()
-                if not title:
-                    logger.debug(f"跳过保存商品信息：缺少商品标题 - {item_id}")
-                    return False
-
-            # 如果是字符串类型，检查是否为空
-            if isinstance(item_data, str) and not item_data.strip():
-                logger.debug(f"跳过保存商品信息：商品详情为空 - {item_id}")
-                return False
-
-            with self.lock:
-                cursor = self.conn.cursor()
-
-                # 检查商品是否已存在
-                cursor.execute('''
-                SELECT id, item_detail FROM item_info
-                WHERE cookie_id = ? AND item_id = ?
-                ''', (cookie_id, item_id))
-
-                existing = cursor.fetchone()
-
-                if existing:
-                    # 如果传入的商品详情有值，则用最新数据覆盖
-                    if item_data is not None and item_data:
-                        # 处理字符串类型的详情数据
-                        if isinstance(item_data, str):
-                            cursor.execute('''
-                            UPDATE item_info SET
-                                item_detail = ?, updated_at = CURRENT_TIMESTAMP
-                            WHERE cookie_id = ? AND item_id = ?
-                            ''', (item_data, cookie_id, item_id))
-                        else:
-                            # 处理字典类型的详情数据（向后兼容）
-                            cursor.execute('''
-                            UPDATE item_info SET
-                                item_title = ?, item_description = ?, item_category = ?,
-                                item_price = ?, item_image = ?, item_detail = ?,
-                                updated_at = CURRENT_TIMESTAMP
-                            WHERE cookie_id = ? AND item_id = ?
-                            ''', (
-                                item_data.get('title', ''),
-                                item_data.get('description', ''),
-                                item_data.get('category', ''),
-                                item_data.get('price', ''),
-                                item_data.get('item_image', ''),
-                                (
-                                    item_data.get('item_detail')
-                                    if 'item_detail' in item_data
-                                    else json.dumps(item_data, ensure_ascii=False)
-                                ),
-                                cookie_id, item_id
-                            ))
-                        logger.info(f"更新商品信息（覆盖）: {item_id}")
-                    else:
-                        # 如果商品详情没有数据，则不更新，只记录存在
-                        logger.debug(f"商品信息已存在，无新数据，跳过更新: {item_id}")
-                        return True
+    def save_item_info(self, cookie_id: str, item_id: str, item_data=None) -> bool:
+        """Save product fields and prose without converting a platform object into prose."""
+        from app.services import item_details
+        if not item_data or (isinstance(item_data, dict) and not str(item_data.get('title', '')).strip()):
+            return False
+        with self.lock:
+            try:
+                c = self.conn.cursor()
+                c.execute("INSERT OR IGNORE INTO item_info(cookie_id,item_id) VALUES(?,?)", (cookie_id,item_id))
+                if isinstance(item_data, dict):
+                    for column, key in [('item_title','title'),('item_description','description'),
+                                        ('item_category','category'),('item_price','price'),('item_image','item_image')]:
+                        value = item_data.get(key)
+                        if value:
+                            c.execute(f"UPDATE item_info SET {column}=? WHERE cookie_id=? AND item_id=?", (value,cookie_id,item_id))
+                    manual = (item_data.get('detail_source') == 'manual' if 'detail_source' in item_data else
+                              item_data.get('source') == 'manual' or 'item_detail' in item_data)
+                    text = item_data.get('item_detail', item_data.get('description', ''))
+                    item_details.write(c,cookie_id,item_id,text,source='manual' if manual else 'platform',
+                                       metadata=item_data,explicit=manual)
+                elif isinstance(item_data, str):
+                    item_details.write(c,cookie_id,item_id,item_data,source='platform')
                 else:
-                    # 新增商品信息
-                    if isinstance(item_data, str):
-                        # 直接保存字符串详情
-                        cursor.execute('''
-                        INSERT INTO item_info (cookie_id, item_id, item_detail)
-                        VALUES (?, ?, ?)
-                        ''', (cookie_id, item_id, item_data))
-                    else:
-                        # 处理字典类型的详情数据（向后兼容）
-                        cursor.execute('''
-                        INSERT INTO item_info (cookie_id, item_id, item_title, item_description,
-                                             item_category, item_price, item_image, item_detail)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            cookie_id, item_id,
-                            item_data.get('title', '') if item_data else '',
-                            item_data.get('description', '') if item_data else '',
-                            item_data.get('category', '') if item_data else '',
-                            item_data.get('price', '') if item_data else '',
-                            item_data.get('item_image', '') if item_data else '',
-                            (
-                                item_data.get('item_detail')
-                                if 'item_detail' in item_data
-                                else json.dumps(item_data, ensure_ascii=False)
-                            ) if item_data else ''
-                        ))
-                    logger.info(f"新增商品信息: {item_id}")
-
+                    self.conn.rollback()
+                    return False
                 self.conn.commit()
                 return True
-
-        except Exception as e:
-            logger.error(f"保存商品信息失败: {e}")
-            self.conn.rollback()
-            return False
+            except Exception:
+                self.conn.rollback()
+                logger.warning('保存商品信息失败，原数据已保留')
+                return False
 
     def get_item_info(self, cookie_id: str, item_id: str) -> Optional[Dict]:
         """获取商品信息
@@ -5898,13 +5817,8 @@ class DBManager:
                     columns = [description[0] for description in cursor.description]
                     item_info = dict(zip(columns, row))
 
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
-                    logger.info(f"item_info: {item_info}")
+                    item_info.pop('platform_metadata', None)
+
                     return item_info
                 return None
 
@@ -6603,12 +6517,7 @@ class DBManager:
                 for row in cursor.fetchall():
                     item_info = dict(zip(columns, row))
 
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
+                    item_info.pop('platform_metadata', None)
 
                     items.append(item_info)
 
@@ -6638,12 +6547,7 @@ class DBManager:
                 for row in cursor.fetchall():
                     item_info = dict(zip(columns, row))
 
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
+                    item_info.pop('platform_metadata', None)
 
                     items.append(item_info)
 
@@ -6653,39 +6557,19 @@ class DBManager:
             logger.error(f"获取所有商品信息失败: {e}")
             return []
 
-    def update_item_detail(self, cookie_id: str, item_id: str, item_detail: str) -> bool:
-        """更新商品详情（不覆盖商品标题等基本信息）
-
-        Args:
-            cookie_id: Cookie ID
-            item_id: 商品ID
-            item_detail: 商品详情JSON字符串
-
-        Returns:
-            bool: 操作是否成功
-        """
-        try:
-            with self.lock:
-                cursor = self.conn.cursor()
-                # 只更新item_detail字段，不影响其他字段
-                cursor.execute('''
-                UPDATE item_info SET
-                    item_detail = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE cookie_id = ? AND item_id = ?
-                ''', (item_detail, cookie_id, item_id))
-
-                if cursor.rowcount > 0:
-                    self.conn.commit()
-                    logger.info(f"更新商品详情成功: {item_id}")
-                    return True
-                else:
-                    logger.warning(f"未找到要更新的商品: {item_id}")
-                    return False
-
-        except Exception as e:
-            logger.error(f"更新商品详情失败: {e}")
-            self.conn.rollback()
-            return False
+    def update_item_detail(self, cookie_id: str, item_id: str, item_detail: str, *, source='manual') -> bool:
+        """Explicit manual edits, including empty values, survive automated acquisition."""
+        from app.services.item_details import write
+        with self.lock:
+            try:
+                changed = write(self.conn.cursor(),cookie_id,item_id,item_detail,
+                                source=source,explicit=source == 'manual')
+                self.conn.commit()
+                return changed
+            except Exception:
+                self.conn.rollback()
+                logger.warning('商品正文保存失败，原数据已保留')
+                return False
 
     def update_item_title_only(self, cookie_id: str, item_id: str, item_title: str) -> bool:
         """仅更新商品标题（并发安全）
@@ -6777,7 +6661,7 @@ class DBManager:
                                                        created_at, updated_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                         ''', (cookie_id, item_id, item_title, item_description,
-                              item_category, item_price, item_image, item_detail))
+                              item_category, item_price, item_image, ''))
 
                         if cursor.rowcount == 0:
                             # 记录已存在，进行条件更新
@@ -6788,7 +6672,6 @@ class DBManager:
                                 item_category = CASE WHEN (item_category IS NULL OR item_category = '') AND ? != '' THEN ? ELSE item_category END,
                                 item_price = CASE WHEN ? != '' THEN ? ELSE item_price END,
                                 item_image = CASE WHEN ? != '' THEN ? ELSE item_image END,
-                                item_detail = CASE WHEN (item_detail IS NULL OR item_detail = '' OR TRIM(item_detail) = '') AND ? != '' THEN ? ELSE item_detail END,
                                 updated_at = CURRENT_TIMESTAMP
                             WHERE cookie_id = ? AND item_id = ?
                             '''
@@ -6798,10 +6681,12 @@ class DBManager:
                                 item_category, item_category,
                                 item_price, item_price,
                                 item_image, item_image,
-                                item_detail, item_detail,
                                 cookie_id, item_id
                             ))
 
+                        from app.services.item_details import write
+                        write(cursor,cookie_id,item_id,item_detail,source='platform',
+                              metadata=item_data.get('platform_metadata'))
                         if confirmed_on_sale:
                             cursor.execute("UPDATE item_info SET listing_status='on_sale',last_seen_at=CURRENT_TIMESTAMP "
                                            "WHERE cookie_id=? AND item_id=?", (cookie_id,item_id))

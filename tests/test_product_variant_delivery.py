@@ -468,6 +468,8 @@ class ProductVariantDeliveryTests(unittest.TestCase):
             contents = asyncio.run(acquire_all())
 
         self.assertEqual(["CODE-1", "CODE-2", "CODE-3", "CODE-4"], contents)
+        live.save_item_info_to_db.assert_not_awaited()
+        self.assertEqual('detail', self.manager.get_item_info('seller-1','item-1')['item_detail'])
         self.assertEqual(4, delivery_context["batch_data_required_count"])
         self.assertEqual([], delivery_context["batch_data_queue"])
         cursor.execute("SELECT data_content FROM cards WHERE id = ?", (card_id,))

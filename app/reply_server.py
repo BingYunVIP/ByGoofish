@@ -5984,6 +5984,7 @@ def create_manual_item(
                 "item_image": item.image_url.strip(),
                 "item_detail": item.detail.strip(),
                 "source": "manual",
+                "detail_source": "manual" if item.detail.strip() else "unknown",
             },
         )
         if not saved:

@@ -165,6 +165,11 @@ export interface Item {
   item_title?: string;
   item_description?: string;
   item_detail?: string;
+  detail_source?: 'unknown' | 'manual' | 'platform';
+  detail_status?: 'missing' | 'fetching' | 'ready' | 'failed' | 'blocked';
+  detail_updated_at?: number | null;
+  detail_retry_at?: number | null;
+  detail_failure?: string;
   item_price?: string;
   item_image?: string; // Inferred from common usage, though not explicitly in list model sometimes
   item_category?: string;

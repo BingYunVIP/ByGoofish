@@ -428,7 +428,7 @@ const ItemList: React.FC = () => {
     try {
       await updateItemDetail(detailItem.cookie_id, detailItem.item_id, itemDetail);
       setItems(current => current.map(item =>
-        itemKey(item) === key ? { ...item, item_detail: itemDetail } : item,
+        itemKey(item) === key ? { ...item, item_detail: itemDetail, detail_source: 'manual', detail_status: 'ready', detail_failure: '', detail_updated_at: Date.now() / 1000 } : item,
       ));
       setDetailItem(null);
       setNotice({ type: 'success', message: '商品详情已保存' });
@@ -908,8 +908,8 @@ const ItemList: React.FC = () => {
                             避免和操作按钮挤在同一格造成表头与内容错位 */}
                         <div className="flex items-center justify-between gap-3">
                           <span className="text-xs font-semibold text-gray-600">本地详情</span>
-                          <span className={`text-xs font-bold ${item.item_detail ? 'text-gray-800' : 'text-gray-400'}`}>
-                            {item.item_detail ? '已维护' : '暂无'}
+                          <span className={`text-xs font-bold ${item.detail_status === 'failed' || item.detail_status === 'blocked' ? 'text-amber-700' : item.detail_source === 'manual' || item.item_detail ? 'text-gray-800' : 'text-gray-400'}`}>
+                            {item.detail_source === 'manual' ? '人工维护' : item.item_detail ? '平台获取' : item.detail_status === 'failed' || item.detail_status === 'blocked' ? '获取失败' : item.detail_status === 'fetching' ? '获取中' : '未获取'}
                           </span>
                         </div>
                       </div>
@@ -1269,13 +1269,22 @@ const ItemList: React.FC = () => {
             </div>
             <div className="modal-body">
               <label className="mb-2 block text-sm font-bold text-gray-700" htmlFor="item-detail">本地商品详情</label>
+              {(detailItem.detail_status === 'failed' || detailItem.detail_status === 'blocked') && !detailItem.item_detail && (
+                <p className="mb-3 text-xs leading-5 text-amber-700" role="status">
+                  {detailItem.detail_failure === 'authentication_required'
+                    ? '平台要求登录或安全验证，已暂停自动获取。完成账号验证并检查连接后将自动补全。'
+                    : detailItem.detail_failure === 'browser_authentication_required'
+                      ? '官网商品页要求安全验证，已暂停浏览器补全；系统仍优先通过官方接口自动获取。'
+                      : '商品说明暂未自动获取，系统将在冷却后继续补全。'}
+                </p>
+              )}
               <AutoResizeTextarea
                 id="item-detail"
                 value={itemDetail}
                 onChange={event => setItemDetail(event.target.value)}
                 rows={3}
-                className="ios-input min-h-24 w-full resize-none overflow-hidden rounded-md p-3 font-mono text-sm"
-                placeholder="补充商品说明，供自动回复和发货逻辑读取。"
+                className="ios-input min-h-24 w-full resize-none overflow-hidden rounded-md p-3 text-sm"
+                placeholder="优先自动获取闲鱼商品说明；也可在此补充本地内容。"
               />
             </div>
             <div className="modal-footer flex justify-end gap-2">

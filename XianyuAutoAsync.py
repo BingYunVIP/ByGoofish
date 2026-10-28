@@ -3110,7 +3110,7 @@ class XianyuLive:
             from app.db_manager import db_manager
 
             # 使用专门的详情更新方法
-            success = db_manager.update_item_detail(self.cookie_id, item_id, item_detail)
+            success = db_manager.update_item_detail(self.cookie_id, item_id, item_detail, source='platform')
 
             if success:
                 logger.info(f"商品详情已更新: {item_id}")
@@ -3124,56 +3124,48 @@ class XianyuLive:
             return False
 
     async def fetch_item_detail_from_api(self, item_id: str) -> str:
-        """获取商品详情（使用浏览器获取，支持24小时缓存）
-
-        Args:
-            item_id: 商品ID
-
-        Returns:
-            str: 商品详情文本，获取失败返回空字符串
-        """
+        """Acquire only missing platform prose, with persistent six-hour failure cooldown."""
+        from app.db_manager import db_manager
+        from app.services import item_details, auth_recovery
+        from app.config import config
+        if not config.get('ITEM_DETAIL', {}).get('auto_fetch', {}).get('enabled', True):
+            return ''
+        if auth_recovery.auth_paused(self.cookie_id):
+            item_details.failure(db_manager,self.cookie_id,item_id,'authentication_required')
+            return ''
+        if not item_details.claim(db_manager,self.cookie_id,item_id):
+            return ''
         try:
-            # 检查是否启用自动获取功能
-            from app.config import config
-            auto_fetch_config = config.get('ITEM_DETAIL', {}).get('auto_fetch', {})
-
-            if not auto_fetch_config.get('enabled', True):
-                logger.warning(f"自动获取商品详情功能已禁用: {item_id}")
-                return ""
-
-            # 1. 首先检查缓存（24小时有效）
-            async with self._item_detail_cache_lock:
-                if item_id in self._item_detail_cache:
-                    cache_data = self._item_detail_cache[item_id]
-                    cache_time = cache_data['timestamp']
-                    current_time = time.time()
-
-                    # 检查缓存是否在24小时内
-                    if current_time - cache_time < self._item_detail_cache_ttl:
-                        # 更新访问时间（用于LRU）
-                        cache_data['access_time'] = current_time
-                        logger.info(f"从缓存获取商品详情: {item_id}")
-                        return cache_data['detail']
-                    else:
-                        # 缓存过期，删除
-                        del self._item_detail_cache[item_id]
-                        logger.warning(f"缓存已过期，删除: {item_id}")
-
-            # 2. 尝试使用浏览器获取商品详情
-            detail_from_browser = await self._fetch_item_detail_from_browser(item_id)
-            if detail_from_browser:
-                # 保存到缓存（带大小限制）
-                await self._add_to_item_cache(item_id, detail_from_browser)
-                logger.info(f"成功通过浏览器获取商品详情: {item_id}, 长度: {len(detail_from_browser)}")
-                return detail_from_browser
-
-            # 浏览器获取失败
-            logger.warning(f"浏览器获取商品详情失败: {item_id}")
-            return ""
-
-        except Exception as e:
-            logger.error(f"获取商品详情异常: {item_id}, 错误: {self._safe_str(e)}")
-            return ""
+            result = await self.get_item_info(item_id)
+            if result.get('error_code'):
+                raise item_details.DetailFetchError(result['error_code'])
+            text = item_details.api_description(result, item_id)
+            if not text:
+                current = db_manager.get_item_info(self.cookie_id,item_id) or {}
+                if current.get('detail_browser_blocked'):
+                    raise item_details.DetailFetchError('browser_authentication_required')
+                try:
+                    text = await self._fetch_item_detail_from_browser(item_id)
+                except item_details.DetailFetchError as browser_error:
+                    if browser_error.category == 'authentication_required':
+                        item_details.block_browser(db_manager,self.cookie_id,item_id)
+                        raise item_details.DetailFetchError('browser_authentication_required') from None
+                    raise
+            if not item_details.prose(text):
+                raise item_details.DetailFetchError('description_not_found')
+            # Recheck override in the atomic write: a user may have edited during navigation.
+            saved = await self.save_item_detail_only(item_id,text)
+            return text if saved else ''
+        except asyncio.CancelledError:
+            item_details.failure(db_manager,self.cookie_id,item_id,'interrupted')
+            raise
+        except Exception as exc:
+            category = (exc.category if isinstance(exc, item_details.DetailFetchError) else
+                        'timeout' if isinstance(exc, TimeoutError) or type(exc).__name__ == 'TimeoutError' else
+                        'network_error' if 'net::ERR_' in str(exc) else 'browser_error')
+            item_details.failure(db_manager,self.cookie_id,item_id,category)
+            logger.warning(f'商品正文获取未完成: {item_id}; category={category}')
+            return ''
 
     async def _add_to_item_cache(self, item_id: str, detail: str):
         """添加商品详情到缓存，实现LRU策略和大小限制
@@ -3679,7 +3671,7 @@ class XianyuLive:
 
             # 设置Cookie
             cookies = []
-            for cookie_pair in self.cookies_str.split('; '):
+            for cookie_pair in self.cookies_str.split(';'):
                 if '=' in cookie_pair:
                     name, value = cookie_pair.split('=', 1)
                     cookies.append({
@@ -3699,35 +3691,22 @@ class XianyuLive:
             item_url = f"https://www.goofish.com/item?id={item_id}"
             logger.info(f"访问商品页面: {item_url}")
 
-            # 访问页面
-            await page.goto(item_url, wait_until='networkidle', timeout=30000)
-
-            # 等待页面完全加载
-            await asyncio.sleep(3)
-
-            # 获取商品详情内容
-            detail_text = ""
+            from app.services.item_details import extract_page_description, DetailFetchError
+            from app.config import config
+            timeout = int(config.get('ITEM_DETAIL', {}).get('auto_fetch', {}).get('timeout', 30)) * 1000
+            response = await page.goto(item_url, wait_until='domcontentloaded', timeout=timeout)
+            if response is not None and response.status >= 400:
+                raise DetailFetchError('http_error')
+            # A single bounded wait for product prose or an explicit authentication surface.
             try:
-                # 等待目标元素出现
-                await page.wait_for_selector('.desc--GaIUKUQY', timeout=10000)
-
-                # 获取商品详情文本
-                detail_element = await page.query_selector('.desc--GaIUKUQY')
-                if detail_element:
-                    detail_text = await detail_element.inner_text()
-                    logger.info(f"成功获取商品详情: {item_id}, 长度: {len(detail_text)}")
-                    return detail_text.strip()
-                else:
-                    logger.warning(f"未找到商品详情元素: {item_id}")
-
-            except Exception as e:
-                logger.warning(f"获取商品详情元素失败: {item_id}, 错误: {self._safe_str(e)}")
-
-            return ""
-
-        except Exception as e:
-            logger.error(f"浏览器获取商品详情异常: {item_id}, 错误: {self._safe_str(e)}")
-            return ""
+                await page.wait_for_selector(
+                    '[class^="desc--"], [class*=" desc--"], [data-testid="item-description"], '
+                    '#nocaptcha, #nc_1_wrapper, iframe[src*="captcha"], iframe[src*="punish"]',
+                    timeout=min(timeout, 15000))
+            except Exception:
+                # Inspect the final URL as well, to classify login redirects accurately.
+                pass
+            return await extract_page_description(page)
         finally:
             # 确保资源被正确清理
             try:
@@ -3763,7 +3742,7 @@ class XianyuLive:
                 if not item_id or item_id.startswith('auto_'):
                     continue
 
-                # 构造商品详情数据
+                # 卡片元数据独立保存，不能作为商品正文。
                 item_detail = {
                     'title': item.get('title', ''),
                     'price': item.get('price', ''),
@@ -3782,7 +3761,7 @@ class XianyuLive:
 
                 # 检查数据库中是否已有详情
                 existing_item = db_manager.get_item_info(self.cookie_id, item_id)
-                has_detail = existing_item and existing_item.get('item_detail') and existing_item['item_detail'].strip()
+                has_detail = existing_item and (existing_item.get('detail_source') == 'manual' or bool(existing_item.get('item_detail', '').strip()) or float(existing_item.get('detail_retry_at') or 0) > time.time())
 
                 batch_data.append({
                     'cookie_id': self.cookie_id,
@@ -3792,7 +3771,8 @@ class XianyuLive:
                     'item_category': str(item.get('category_id', '')),
                     'item_price': item.get('price_text', ''),
                     'item_image': item.get('item_image', ''),
-                    'item_detail': json.dumps(item_detail, ensure_ascii=False)
+                    'item_detail': '',
+                    'platform_metadata': item_detail
                 })
 
                 # 如果没有详情，添加到需要获取详情的列表
@@ -3829,160 +3809,87 @@ class XianyuLive:
             return 0
 
     async def _fetch_missing_item_details(self, items_need_detail):
-        """批量获取缺失的商品详情
-
-        Args:
-            items_need_detail: 需要获取详情的商品列表
-
-        Returns:
-            int: 成功获取详情的商品数量
-        """
+        from app.db_manager import db_manager
+        from app.config import config
         success_count = 0
-
-        try:
-            from app.config import config
-
-            # 从配置获取并发数量和延迟时间
-            auto_fetch_config = config.get('ITEM_DETAIL', {}).get('auto_fetch', {})
-            max_concurrent = auto_fetch_config.get('max_concurrent', 3)
-            retry_delay = auto_fetch_config.get('retry_delay', 0.5)
-
-            # 限制并发数量，避免对API服务器造成压力
-            semaphore = asyncio.Semaphore(max_concurrent)
-
-            async def fetch_single_item_detail(item_info):
-                async with semaphore:
-                    try:
-                        item_id = item_info['item_id']
-                        item_title = item_info['item_title']
-
-                        # 获取商品详情
-                        item_detail_text = await self.fetch_item_detail_from_api(item_id)
-
-                        if item_detail_text:
-                            # 保存详情到数据库
-                            success = await self.save_item_detail_only(item_id, item_detail_text)
-                            if success:
-                                logger.info(f"✅ 成功获取并保存商品详情: {item_id} - {item_title}")
-                                return 1
-                            else:
-                                logger.warning(f"❌ 获取详情成功但保存失败: {item_id}")
-                        else:
-                            logger.warning(f"❌ 未能获取商品详情: {item_id} - {item_title}")
-
-                        # 添加延迟，避免请求过于频繁
-                        await asyncio.sleep(retry_delay)
-                        return 0
-
-                    except Exception as e:
-                        logger.error(f"获取单个商品详情异常: {item_info.get('item_id', 'unknown')}, 错误: {self._safe_str(e)}")
-                        return 0
-
-            # 并发获取所有商品详情
-            tasks = [fetch_single_item_detail(item_info) for item_info in items_need_detail]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # 统计成功数量
-            for result in results:
-                if isinstance(result, int):
-                    success_count += result
-                elif isinstance(result, Exception):
-                    logger.error(f"获取商品详情任务异常: {result}")
-
-            return success_count
-
-        except Exception as e:
-            logger.error(f"批量获取商品详情异常: {self._safe_str(e)}")
-            return success_count
+        for index, item in enumerate(items_need_detail):
+            if index:
+                await asyncio.sleep(max(1.0, float(config.get('ITEM_DETAIL', {}).get('auto_fetch', {}).get('retry_delay', 1))))
+            text = await self.fetch_item_detail_from_api(item['item_id'])
+            success_count += bool(text)
+            current = db_manager.get_item_info(self.cookie_id,item['item_id']) or {}
+            if current.get('detail_failure') in ('authentication_required','browser_authentication_required'):
+                break
+        return success_count
 
     async def get_item_info(self, item_id, retry_count=0):
-        """获取商品信息，自动处理token失效的情况"""
-        if retry_count >= 4:  # 最多重试3次
-            logger.error("获取商品信息失败，重试次数过多")
-            return {"error": "获取商品信息失败，重试次数过多"}
-
-        # 确保session已创建
+        """Official PC detail read, once only. A challenge never triggers browser/login retries."""
+        from app.services import auth_recovery
+        from utils import risk_control
+        from app.services.account_auth_client import save_cookie_delta
+        from app.db_manager import db_manager
+        guard = risk_control.registry.get(self.cookie_id)
+        if auth_recovery.auth_paused(self.cookie_id):
+            return {'error_code': 'authentication_required'}
+        if guard.is_blocked:
+            return {'error_code': 'rate_limited'}
+        expected_cookies = self.cookies_str
+        token = trans_cookies(expected_cookies).get('_m_h5_tk', '').split('_')[0]
+        if not token:
+            return {'error_code': 'credentials_missing'}
         if not self.session:
             await self.create_session()
-
+        payload = json.dumps({'itemId': str(item_id)}, separators=(',', ':'))
+        timestamp = str(int(time.time() * 1000))
         params = {
-            'jsv': '2.7.2',
-            'appKey': '34839810',
-            't': str(int(time.time() * 1000)),
-            'sign': '',
-            'v': '1.0',
-            'type': 'originaljson',
-            'accountSite': 'xianyu',
-            'dataType': 'json',
-            'timeout': '20000',
-            'api': 'mtop.taobao.idle.pc.detail',
-            'sessionOption': 'AutoLoginOnly',
-            'spm_cnt': 'a21ybx.im.0.0',
+            'jsv': '2.7.3', 'appKey': '34839810', 't': timestamp,
+            'sign': generate_sign(timestamp, token, payload), 'v': '1.0',
+            'type': 'originaljson', 'accountSite': 'xianyu', 'dataType': 'json',
+            'timeout': '20000', 'api': 'mtop.taobao.idle.pc.detail',
+            'sessionOption': 'AutoLoginOnly', 'spm_cnt': 'a21ybx.item.0.0',
         }
-
-        data_val = '{"itemId":"' + item_id + '"}'
-        data = {
-            'data': data_val,
-        }
-
-        # 始终从最新的cookies中获取_m_h5_tk token（刷新后cookies会被更新）
-        token = trans_cookies(self.cookies_str).get('_m_h5_tk', '').split('_')[0] if trans_cookies(self.cookies_str).get('_m_h5_tk') else ''
-
-        if token:
-            logger.info("获取商品详情，_m_h5_tk字段存在")
-        else:
-            logger.warning("cookies中没有找到_m_h5_tk token")
-
-        from utils.xianyu_utils import generate_sign
-        sign = generate_sign(params['t'], token, data_val)
-        params['sign'] = sign
-
-        try:
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/1.0/',
-                params=params,
-                data=data
-            ) as response:
-                res_json = await response.json()
-
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self.update_config_cookies()
-                        logger.warning("已更新Cookie到数据库")
-
-                logger.warning(f"商品信息获取成功: {res_json}")
-                # 检查返回状态
-                if isinstance(res_json, dict):
-                    ret_value = res_json.get('ret', [])
-                    # 检查ret是否包含成功信息
-                    if not any('SUCCESS::调用成功' in ret for ret in ret_value):
-                        logger.warning(f"商品信息API调用失败，错误信息: {ret_value}")
-
-                        await asyncio.sleep(0.5)
-                        return await self.get_item_info(item_id, retry_count + 1)
-                    else:
-                        logger.warning(f"商品信息获取成功: {item_id}")
-                        return res_json
-                else:
-                    logger.error(f"商品信息API返回格式异常: {res_json}")
-                    return await self.get_item_info(item_id, retry_count + 1)
-
-        except Exception as e:
-            logger.error(f"商品信息API请求异常: {self._safe_str(e)}")
-            await asyncio.sleep(0.5)
-            return await self.get_item_info(item_id, retry_count + 1)
+        await guard.acquire()
+        logger.info(f'商品正文优先请求官方详情接口: {item_id}')
+        async with self.session.post(
+            'https://h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/1.0/',
+            params=params, data={'data': payload}, allow_redirects=False,
+            headers={'origin': 'https://www.goofish.com',
+                     'referer': f'https://www.goofish.com/item?id={item_id}'},
+            timeout=aiohttp.ClientTimeout(total=25),
+        ) as response:
+            if 300 <= response.status < 400 or response.status in (401, 403):
+                return {'error_code': 'authentication_required'}
+            if response.status == 429:
+                return {'error_code': 'rate_limited'}
+            if response.status >= 400:
+                return {'error_code': 'http_error'}
+            result = await response.json(content_type=None)
+            updates = {}
+            if 'set-cookie' in response.headers:
+                for header in response.headers.getall('set-cookie', []):
+                    first = header.split(';', 1)[0]
+                    if '=' in first:
+                        key, value = first.split('=', 1)
+                        updates[key.strip()] = value.strip()
+        if not isinstance(result, dict):
+            return {'error_code': 'invalid_response'}
+        ret = ';'.join(str(v) for v in result.get('ret', []))
+        if any(marker in ret.upper() for marker in ('USER_VALIDATE', 'CAPTCHA', 'SESSION_EXPIRED', 'NEED_LOGIN', 'LOGIN_REQUIRED')):
+            return {'error_code': 'authentication_required'}
+        if risk_control.is_risk_control_error(ret):
+            return {'error_code': 'rate_limited'}
+        if not any(str(v).startswith('SUCCESS') for v in result.get('ret', [])):
+            return {'error_code': 'platform_error'}
+        updates = {key: value for key, value in updates.items()
+                   if key in ('_m_h5_tk','_m_h5_tk_enc','cookie2','sgcookie','unb')}
+        if updates:
+            value = save_cookie_delta(db_manager,self.cookie_id,expected_cookies,updates)
+            latest = value or db_manager.get_cookie(self.cookie_id)
+            if latest:
+                self.cookies_str = latest
+                self.cookies = trans_cookies(latest)
+                self.session.headers['cookie'] = latest
+        return result
 
     def extract_item_id_from_message(self, message):
         from utils.message_identity import extract_item_id
@@ -5389,23 +5296,6 @@ class XianyuLive:
                         "spec_payload": spec_payload,
                         "platform_sku_id": platform_sku_id,
                     })
-
-            # 保存商品信息到数据库（需要有商品标题才保存）
-            # 尝试获取商品标题
-            item_title_for_save = None
-            try:
-                from app.db_manager import db_manager
-                db_item_info = db_manager.get_item_info(self.cookie_id, item_id)
-                if db_item_info:
-                    item_title_for_save = db_item_info.get('item_title', '').strip()
-            except:
-                pass
-
-            # 如果有商品标题，则保存商品信息
-            if item_title_for_save:
-                await self.save_item_info_to_db(item_id, search_text, item_title_for_save)
-            else:
-                logger.warning(f"跳过保存商品信息：缺少商品标题 - {item_id}")
 
             # 详细的匹配结果日志
             if rule.get('is_multi_spec'):

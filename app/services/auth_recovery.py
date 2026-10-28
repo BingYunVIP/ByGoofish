@@ -185,6 +185,9 @@ def set_state(db, cookie_id, state, category="", expected_attempt=None, *, stage
             attempt_id=excluded.attempt_id,token_claimed=0,updated_at=excluded.updated_at,
             incident_id=excluded.incident_id,auth_stage=excluded.auth_stage""",
             (cookie_id, state, category, attempt, time.time(), incident_id, auth_stage))
+        if state == 'recovered' and old['auth_paused']:
+            from app.services.item_details import resume_after_auth
+            resume_after_auth(db, cookie_id)
         db.conn.commit()
         from app.services import event_journal
         if starts_incident:
