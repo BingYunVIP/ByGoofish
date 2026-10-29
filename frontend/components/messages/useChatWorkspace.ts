@@ -80,6 +80,18 @@ export default function useChatWorkspace(isActive: boolean) {
   }, [scope]);
   const key = owner && accountId && cid ? draftKey(owner, accountId, cid) : '';
   const draft = key ? (draftState.key === key ? draftState.value : readDraft(key)) : '';
+  const [replyState, setReplyState] = useState<{ key: string; value?: ChatMessage }>({ key: '' });
+  const replyKey = key ? key + ':reference' : '';
+  let reference: ChatMessage | undefined;
+  if (replyKey) {
+    if (replyState.key === replyKey) reference = replyState.value;
+    else { try { reference = JSON.parse(readDraft(replyKey) || 'null') || undefined; } catch {} }
+  }
+  const setReference = (value?: ChatMessage) => {
+    if (!replyKey) return;
+    setReplyState({ key: replyKey, value });
+    try { if (value) localStorage.setItem(replyKey, JSON.stringify(value)); else localStorage.removeItem(replyKey); } catch {}
+  };
   const setDraft = (value: string) => {
     if (!key) return;
     setDraftState({ key, value });
@@ -205,6 +217,7 @@ export default function useChatWorkspace(isActive: boolean) {
         );
       }
       setMessageError('');
+      return r.messages || [];
     } catch (e) {
       if (a === current.current.accountId && c === current.current.cid) setMessageError(fail(e));
     } finally {
@@ -452,7 +465,9 @@ export default function useChatWorkspace(isActive: boolean) {
       c = cid,
       target = conversation?.otherUserId,
       text = draft.trim(),
-      savedKey = key;
+      savedKey = key,
+      savedReplyKey = replyKey,
+      replying = reference;
     if (!a || !c || !target || sending || (!text && !file)) return { ok: false, imageSent: false };
     setSending(true);
     let imageSent = false;
@@ -462,7 +477,7 @@ export default function useChatWorkspace(isActive: boolean) {
         const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
           .map((x) => x.toString(16).padStart(2, '0'))
           .join('');
-        const operationKey = savedKey + ':' + kind + ':' + digest;
+        const operationKey = savedKey + ':' + kind + ':' + digest + ':' + (replying?.messageId || '');
         let id = pendingOps.current[operationKey] || readDraft(operationKey);
         if (!id) {
           id = crypto.randomUUID();
@@ -483,6 +498,7 @@ export default function useChatWorkspace(isActive: boolean) {
           images: [],
           time: Date.now(),
           send_status: 'sending',
+          reply: replying ? { messageId: replying.messageId, senderId: replying.senderId, senderName: replying.senderName, time: replying.time, text: replying.text, images: replying.images, type: replying.type } : undefined,
         };
         if (current.current.accountId === a && current.current.cid === c) {
           if (kind === 'image') {
@@ -501,6 +517,7 @@ export default function useChatWorkspace(isActive: boolean) {
             form.append('cid', c);
             form.append('to_user_id', target);
             form.append('client_request_id', id);
+            if (replying) form.append('reply_to_message_id', replying.messageId);
             r = await post(`/chat/send-image/${encodeURIComponent(a)}`, form, { timeout: 60000 });
           } else
             r = await post(`/chat/send/${encodeURIComponent(a)}`, {
@@ -508,6 +525,7 @@ export default function useChatWorkspace(isActive: boolean) {
               to_user_id: target,
               text,
               client_request_id: id,
+              reply_to_message_id: replying?.messageId,
             });
         } catch (e) {
           const state =
@@ -552,6 +570,8 @@ export default function useChatWorkspace(isActive: boolean) {
       if (current.current.accountId === a && current.current.cid === c) {
         await Promise.all([loadMessages(), loadConversations(), loadContext()]);
       }
+      try { localStorage.removeItem(savedReplyKey); } catch {}
+      if (current.current.accountId === a && current.current.cid === c) setReplyState({ key: savedReplyKey });
       return { ok: true, imageSent };
     } catch (e) {
       notify(errorText(e), 'error');
@@ -611,6 +631,8 @@ export default function useChatWorkspace(isActive: boolean) {
     send,
     draft,
     setDraft,
+    reference,
+    setReference,
     stream,
     updateState,
     markViewed,

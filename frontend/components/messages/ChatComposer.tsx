@@ -3,24 +3,9 @@ import { ImagePlus, Smile, Zap, Send, X, Loader2, Search } from 'lucide-react';
 import type { QuickPhrase } from '../../types';
 import { notify } from '../../services/feedback';
 import { useQuickPhrase } from '../../services/api';
-const EMOJI = [
-  '[微笑]',
-  '[可爱]',
-  '[哈哈]',
-  '[大笑]',
-  '[害羞]',
-  '[亲亲]',
-  '[爱心]',
-  '[握手]',
-  '[强]',
-  '[抱拳]',
-  '[谢谢]',
-  '[玫瑰]',
-  '[开心]',
-  '[调皮]',
-  '[鼓掌]',
-  '[呲牙]',
-];
+import type { ChatMessage } from '../../types';
+import { EmojiIcon, MessageText, type OfficialEmoji } from './OfficialEmoji';
+const COMMON = ['[微笑]','[可爱]','[哈哈]','[大笑]','[害羞]','[亲亲]','[爱心]','[握手]','[强]','[抱拳]','[谢谢]','[玫瑰]','[开心]','[调皮]','[鼓掌]','[呲牙]'];
 export default function ChatComposer({
   draft,
   setDraft,
@@ -28,6 +13,9 @@ export default function ChatComposer({
   disabled,
   sending,
   phrases,
+  emojis,
+  reference,
+  cancelReference,
 }: {
   key?: string;
   draft: string;
@@ -36,6 +24,9 @@ export default function ChatComposer({
   disabled: boolean;
   sending: boolean;
   phrases: QuickPhrase[];
+  emojis: OfficialEmoji[];
+  reference?: ChatMessage;
+  cancelReference: () => void;
 }) {
   const input = useRef<HTMLTextAreaElement>(null),
     picker = useRef<HTMLInputElement>(null);
@@ -50,6 +41,7 @@ export default function ChatComposer({
       el.style.height = `${Math.min(180, Math.max(64, el.scrollHeight))}px`;
     }
   }, [draft]);
+  useEffect(() => { if (reference) input.current?.focus(); }, [reference?.messageId]);
   useEffect(() => {
     if (!file) {
       setUrl('');
@@ -61,6 +53,7 @@ export default function ChatComposer({
   }, [file]);
   const choose = (value?: File) => {
     if (!value) return;
+    if (reference) { notify('引用回复暂仅支持文字，请先取消引用再添加图片', 'warning'); return; }
     if (
       !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(value.type) ||
       value.size > 5 * 1024 * 1024
@@ -111,6 +104,7 @@ export default function ChatComposer({
   };
   const submit = async () => {
     if (disabled || sending || (!draft.trim() && !file)) return;
+    if (reference && file) { notify('引用回复暂仅支持文字，请先移除图片或取消引用', 'warning'); return; }
     const result = await send(file);
     if (result.imageSent) setFile(undefined);
   };
@@ -123,6 +117,14 @@ export default function ChatComposer({
         if (!disabled) choose(e.dataTransfer.files[0]);
       }}
     >
+      {reference && <div className="mb-3 flex min-w-0 items-center gap-2 rounded-md border-l-4 border-[var(--brand)] bg-[var(--surface-subtle)] px-3 py-2" aria-label="正在引用回复">
+        <div className="min-w-0 flex-1 text-xs text-[var(--text-muted)]">
+          <strong>{reference.isSelf ? '我方' : reference.senderName || reference.senderId}</strong>
+          <p className="truncate"><MessageText text={reference.text || '[图片]'} emojis={emojis} /></p>
+        </div>
+        {reference.images[0] && <img src={reference.images[0]} alt="被引用的图片" className="h-10 w-10 rounded object-cover" />}
+        <button type="button" className="chat-icon" aria-label="取消引用回复" onClick={cancelReference}><X size={16} /></button>
+      </div>}
       <div className="flex items-center gap-1.5 text-[var(--text-muted)]">
         <button
           type="button"
@@ -179,13 +181,15 @@ export default function ChatComposer({
           </div>
           {panel === 'emoji' ? (
             <div className="grid grid-cols-4 gap-1">
-              {EMOJI.map((s) => (
+              {(emojis.length ? emojis : COMMON.map(alias => ({ alias, name: alias.slice(1,-1), url: '' }))).map((item) => (
                 <button
-                  key={s}
+                  key={item.alias}
+                  title={item.name}
+                  aria-label={`表情 ${item.name}`}
                   className="rounded-md p-2 text-xs hover:bg-[var(--surface-hover)]"
-                  onClick={() => insert(s)}
+                  onClick={() => insert(item.alias)}
                 >
-                  {s}
+                  <EmojiIcon item={item} />
                 </button>
               ))}
             </div>

@@ -26,6 +26,13 @@ class HandoverUpdate(BaseModel):
     action: str = Field(..., pattern="^(pause|resume)$")
 
 
+class ForwardRequest(BaseModel):
+    source_cid: str = Field(..., min_length=1, max_length=200)
+    message_id: str = Field(..., min_length=1, max_length=200)
+    target_cid: str = Field(..., min_length=1, max_length=200)
+    client_request_id: str = Field(..., min_length=8, max_length=120)
+
+
 def conversation(db, user_id, cookie_id, cid, recipient=None):
     s = store.state(db, user_id, cookie_id, cid)
     if s is None:
@@ -370,10 +377,15 @@ def create_chat_workspace_router(
         to_user_id: str = Form(..., max_length=100),
         client_request_id: str = Form(..., min_length=8, max_length=120),
         image: UploadFile = File(...),
+        reply_to_message_id: Optional[str] = Form(None, max_length=200),
         user=Depends(get_user),
     ):
         uid = owned(cookie_id, user)
         conversation(db, uid, cookie_id, cid, to_user_id)
+        from app.services.message_actions import resolve_source, send_reply
+        if reply_to_message_id:
+            raise HTTPException(400,'尚未验证原生图片回复；请取消引用后发送图片',headers={'X-Chat-Send-Status':'not_sent'})
+        source = await run_account(cookie_id,lambda instance:resolve_source(instance,cid,reply_to_message_id,to_user_id)) if reply_to_message_id else None
         if image.content_type not in (
             "image/jpeg",
             "image/png",
@@ -416,6 +428,8 @@ def create_chat_workspace_router(
                     url = await uploader.upload_image(str(path))
                 if not url:
                     raise RuntimeError("图片上传未成功")
+                if source:
+                    return await send_reply(instance,cid,to_user_id,source,image={"url":url,"width":width,"height":height,"type":0})
                 return await instance.send_im_image(cid, to_user_id, url, width, height)
 
         return await send_once(
@@ -426,10 +440,46 @@ def create_chat_workspace_router(
             to_user_id,
             client_request_id,
             "image",
-            raw,
+            raw + (reply_to_message_id or "").encode(),
             run_account,
             operation,
         )
+
+    @router.get('/chat/capabilities/{cookie_id}')
+    async def native_capabilities(cookie_id: str, user=Depends(get_user)):
+        owned(cookie_id,user)
+        from app.services.native_capabilities import capabilities
+        return capabilities(db)
+
+    @router.get('/chat/emojis/{cookie_id}')
+    async def emoji_directory(cookie_id: str, user=Depends(get_user)):
+        owned(cookie_id,user)
+        from app.services.chat_emojis import cached, refresh
+        items,updated,retry=cached(db,cookie_id)
+        if time.time()<max(updated+86400,retry):
+            return {'items':items,'stale':time.time()>=updated+86400}
+        try:
+            return await run_account(cookie_id,lambda instance:refresh(instance,db))
+        except Exception:
+            return {'items':items,'stale':True}
+
+    @router.post('/chat/forward/{cookie_id}')
+    async def forward_message(cookie_id: str, body: ForwardRequest, user=Depends(get_user)):
+        uid=owned(cookie_id,user)
+        source_state=conversation(db,uid,cookie_id,body.source_cid)
+        target_state=conversation(db,uid,cookie_id,body.target_cid)
+        recipient=str(target_state['snapshot'].get('otherUserId') or '')
+        if not recipient:raise HTTPException(400,'转发目标缺少参与者信息')
+        from app.services.message_actions import resolve_source, forward
+        source=await run_account(cookie_id,lambda instance:resolve_source(instance,body.source_cid,body.message_id,str(source_state['snapshot'].get('otherUserId') or ''),allow_quote=True))
+        from app.services.native_capabilities import require
+        require(db,uid,recipient,'forward_image' if source[1]['type']=='image' else 'forward_text')
+        result=await send_once(db,uid,cookie_id,body.target_cid,recipient,body.client_request_id,'text',
+            json.dumps(['forward',body.source_cid,body.message_id,body.target_cid]).encode(),run_account,
+            lambda instance:forward(instance,body.target_cid,recipient,source,db=db,client_request_id=body.client_request_id))
+        if invalidate_account:invalidate_account(cookie_id)
+        store.events.publish(cookie_id,'outgoing',body.target_cid)
+        return result
 
     @router.get("/chat/events/{cookie_id}")
     async def event_stream(cookie_id: str, request: Request, user=Depends(get_user)):

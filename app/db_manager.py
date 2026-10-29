@@ -91,6 +91,10 @@ class DBManager:
         initialize_item_details(self)
         from app.services.auto_reply import initialize as initialize_auto_reply
         initialize_auto_reply(self)
+        from app.services.chat_emojis import initialize as initialize_emojis
+        initialize_emojis(self)
+        from app.services.native_capabilities import initialize as initialize_native_capabilities
+        initialize_native_capabilities(self)
     
     def init_db(self):
         """初始化数据库表结构"""

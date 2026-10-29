@@ -518,6 +518,9 @@ export interface ChatConversation {
 }
 
 export interface ChatMessage {
+  canReference?: boolean;
+  canForward?: boolean;
+  reply?: { messageId: string; senderId: string; senderName: string; time: number; text: string; images: string[]; type: string } | null;
   event_type?: string | null;
   event_actor_role?: string;
   event_label?: string;

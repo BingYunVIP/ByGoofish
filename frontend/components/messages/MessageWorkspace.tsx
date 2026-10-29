@@ -2,7 +2,7 @@ import { createPortal } from 'react-dom';
 import { useModalFocus } from '../../lib/useModalFocus';
 import HandoverBanner from './HandoverBanner';
 import ConversationSearch from './ConversationSearch';
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   ArrowDown,
@@ -22,10 +22,16 @@ import {
   Wifi,
   X,
   PauseCircle,
+  MoreHorizontal,
 } from 'lucide-react';
 import { PageTabs } from '../ui';
 import { accountDisplayName } from '../../lib/accountDisplay';
-import { renderRichText } from '../../lib/emojiMap';
+import { MessageText, type OfficialEmoji } from './OfficialEmoji';
+import { MessageMenu, ForwardDialog, type MenuTarget } from './MessageActions';
+import type { ChatMessage } from '../../types';
+import type { OutgoingMessage } from './workspaceTypes';
+import { get } from '../../lib/request';
+import { notify } from '../../services/feedback';
 import { formatOrderTime } from '../../lib/orderTime';
 import { StatusBadge } from '../OrderDialogs';
 import ChatComposer from './ChatComposer';
@@ -83,6 +89,48 @@ export default function MessageWorkspace({
     listPosition = useRef(0);
   const drawerRef = useRef<HTMLElement>(null),
     imageRef = useRef<HTMLDivElement>(null);
+  const [menu,setMenu] = useState<MenuTarget | null>(null);
+  const [forwarding,setForwarding] = useState<ChatMessage>();
+  const [capabilities,setCapabilities] = useState<Record<string,{supported:boolean;reason:string}>>({});
+  const [emojiState,setEmojiState] = useState<{ account: string; items: OfficialEmoji[] }>({account:'',items:[]});
+  const emojis = emojiState.account === w.accountId ? emojiState.items : [];
+  const closeMenu = useCallback(() => setMenu(null), []);
+  useEffect(() => { setMenu(null);setForwarding(undefined); }, [w.accountId,w.cid,isActive]);
+  useEffect(() => {
+    if (!isActive || !w.accountId) return;
+    let active = true;
+    setCapabilities({});
+    get<Record<string,{supported:boolean;reason:string}>>(`/chat/capabilities/${encodeURIComponent(w.accountId)}`).then(result => { if (active) setCapabilities(result); }).catch(() => {});
+    get<{items: OfficialEmoji[]}>(`/chat/emojis/${encodeURIComponent(w.accountId)}`,undefined,{timeout:60000})
+      .then(result => { if (active) setEmojiState({ account:w.accountId,items:result.items || [] }); }).catch(() => {});
+    return () => { active = false; };
+  }, [isActive,w.accountId]);
+  const openMenu = (event: React.MouseEvent<HTMLElement>, message: OutgoingMessage, fromButton=false) => {
+    event.preventDefault();event.stopPropagation();
+    const selection = window.getSelection();
+    let selected = '';
+    if (selection && selection.rangeCount && event.currentTarget.contains(selection.anchorNode) && event.currentTarget.contains(selection.focusNode)) {
+      const fragment = selection.getRangeAt(0).cloneContents();
+      fragment.querySelectorAll('img[alt]').forEach(image => image.replaceWith(document.createTextNode(image.getAttribute('alt') || '')));
+      selected = fragment.textContent || '';
+    }
+    const box = event.currentTarget.getBoundingClientRect();
+    setMenu({message,x:!fromButton && Number.isFinite(event.clientX)?event.clientX:box.left,y:!fromButton && Number.isFinite(event.clientY)?event.clientY:box.bottom,selection:selected,anchor:event.currentTarget});
+  };
+  const locateReference = async (id: string) => {
+    if (!id) return;
+    const selection = selectionRef.current;
+    for (let page=0;page<=5;page++) {
+      const node = scroller.current?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`);
+      if (node) { node.scrollIntoView({block:'center',behavior:'smooth'});node.animate([{outline:'2px solid var(--brand)'},{outline:'2px solid transparent'}],{duration:1800});return; }
+      if (page===5) break;
+      const loaded = await w.loadMessages(true);
+      if (selection!==selectionRef.current) return;
+      if (!loaded?.length) break;
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }
+    notify('原消息未在已加载的记录中找到，可继续加载更早消息', 'warning');
+  };
   const [workspaceWidth, setWorkspaceWidth] = useState(0);
   useEffect(() => {
     if (!shell.current) return;
@@ -112,6 +160,11 @@ export default function MessageWorkspace({
     const el = listScroll.current;
     if (el && w.pane === 'list') el.scrollTop = listPosition.current;
   }, [w.pane]);
+  const resolvedMessage = (message: OutgoingMessage): OutgoingMessage => {
+    if (!message.reply || message.reply.type!=='unknown') return message;
+    const source = w.messages.find(other => other.messageId===message.reply!.messageId);
+    return source ? { ...message, reply: { messageId:source.messageId,senderId:source.senderId,senderName:source.senderName,time:source.time,text:source.text,images:source.images,type:source.type } } : message;
+  };
   const latest = w.messages[w.messages.length - 1],
     latestKey = latest ? `${latest.messageId}:${latest.time}` : '';
   useLayoutEffect(() => {
@@ -320,7 +373,7 @@ export default function MessageWorkspace({
                   </div>
                   <div className="mt-1 flex items-center gap-2">
                     <p className="min-w-0 flex-1 truncate text-xs text-[var(--text-muted)]">
-                      {renderRichText(v.lastMessageSummary || '暂无消息')}
+                      <MessageText text={v.lastMessageSummary || '暂无消息'} emojis={emojis} />
                     </p>
                     {unread(v) > 0 && (
                       <span className="rounded-full bg-[var(--unread-badge)] px-1.5 text-[10px] leading-4 text-white">
@@ -449,6 +502,7 @@ export default function MessageWorkspace({
                 ref={scroller}
                 className="relative min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6"
                 onScroll={(e) => {
+                  setMenu(null);
                   const el = e.currentTarget;
                   nearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
                   if (nearBottom.current) {
@@ -473,8 +527,12 @@ export default function MessageWorkspace({
                   </div>
                 ) : (
                   <div className="mx-auto max-w-3xl space-y-4">
-                    {messages.map((m, i) => (
-                      <div key={m.client_request_id || m.messageId || `${m.time}:${i}`} data-message-id={m.messageId}>
+                    {messages.map((rawMessage, i) => { const m = resolvedMessage(rawMessage); return (
+                      <div key={m.client_request_id || m.messageId || `${m.time}:${i}`} data-message-id={m.messageId}
+                        className="message-action-row group relative" tabIndex={0} aria-label="聊天消息"
+                        onContextMenu={event => openMenu(event,m)}
+                        onKeyDown={event => { if (event.key==='ContextMenu' || (event.shiftKey && event.key==='F10')) { event.preventDefault();const box=event.currentTarget.getBoundingClientRect();setMenu({message:m,x:box.left+20,y:box.top+20,selection:'',anchor:event.currentTarget}); } }}>
+                        <button type="button" className={`message-more chat-icon ${m.isSelf?'left-0':'right-0'}`} aria-label="消息更多操作" onClick={event => openMenu(event,m,true)}><MoreHorizontal size={16} /></button>
                         {(!i || m.time - messages[i - 1].time > 300000) && (
                           <p className="mb-4 text-center text-[10px] text-[var(--text-soft)]">
                             {new Date(m.time).toLocaleString('zh-CN')}
@@ -500,6 +558,11 @@ export default function MessageWorkspace({
                             )}
                             <div className="min-w-0 w-fit max-w-[80%]">
                             <div className={`chat-bubble ${m.isSelf ? 'own' : ''}`}>
+                              {m.reply && <button type="button" className="message-quote" aria-label="定位引用原消息" onClick={() => void locateReference(m.reply!.messageId)}>
+                                <strong className="block truncate">{m.reply.senderId===w.account?.xianyuUserId?'我方':m.reply.senderName || m.reply.senderId || '原消息'}</strong>
+                                <span className="line-clamp-2 whitespace-pre-wrap"><MessageText text={m.reply.text || '[图片]'} emojis={emojis} /></span>
+                                {m.reply.images[0] && <img src={m.reply.images[0]} alt="引用图片" className="mt-1 h-12 w-12 rounded object-cover" />}
+                              </button>}
                               {m.images.map((url) => (
                                 <button
                                   type="button"
@@ -521,7 +584,7 @@ export default function MessageWorkspace({
                                 </button>
                               ))}
                               {m.text && (
-                                <div className="whitespace-pre-wrap">{renderRichText(m.text)}</div>
+                                <div className="whitespace-pre-wrap"><MessageText text={m.text} emojis={emojis} /></div>
                               )}
                               {m.type === 'card' &&
                                 (m.card?.kind === 'order' ? (
@@ -558,7 +621,7 @@ export default function MessageWorkspace({
                           </div>
                         )}
                       </div>
-                    ))}
+                    ); })}
                     {!messages.length && !w.messageLoading && (
                       <div className="chat-empty">
                         <MessageCircle size={28} />
@@ -587,6 +650,9 @@ export default function MessageWorkspace({
                 sending={w.sending}
                 disabled={!w.account?.connected || !!w.account?.authPaused || !w.owner}
                 phrases={w.phrases}
+                emojis={emojis}
+                reference={w.reference}
+                cancelReference={() => w.setReference(undefined)}
               />
             </>
           ) : (
@@ -861,6 +927,9 @@ export default function MessageWorkspace({
           </div>,
           document.body
         )}
+      {menu && <MessageMenu target={menu} capabilities={capabilities} close={closeMenu} quote={() => w.setReference(menu.message)} forward={() => setForwarding(menu.message)} />}
+      {forwarding && <ForwardDialog owner={w.owner} account={w.accountId} sourceCid={w.cid} message={forwarding} conversations={w.conversations} emojis={emojis}
+        close={() => setForwarding(undefined)} sent={target => { void w.loadConversations();if (target===w.cid) void w.loadMessages(); }} />}
     </div>
   );
 }

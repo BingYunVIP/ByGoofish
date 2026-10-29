@@ -150,6 +150,11 @@ def extract_message_summary(message: Dict[str, Any]) -> str:
             return text[:80]
         if images or msg_type == "image":
             return "[图片]"
+    if content.get('contentType') in (1,2,10):
+        from app.services.message_actions import native_display
+        inner = _as_dict(content.get('replyContent')).get('replyContent') if content.get('contentType')==10 else content
+        view = native_display(inner)
+        if view:return str(view['text'] or ('[图片]' if view['images'] else ''))[:80]
     return ""
 
 
@@ -171,8 +176,8 @@ def parse_conversation(raw: Dict[str, Any], my_id: str) -> Optional[Dict[str, An
         last_message_wrapper = _as_dict(raw.get("lastMessage"))
         last_message = _as_dict(last_message_wrapper.get("message"))
         last_extension = _as_dict(last_message.get("extension"))
-        sender_id = _strip_domain(last_extension.get("senderUserId"))
         parsed_last = parse_message(last_message_wrapper, my_id)
+        sender_id = (parsed_last or {}).get("senderId") or _strip_domain(last_extension.get("senderUserId"))
         sender_name = ""
         if sender_id == other_id:
             candidates = [last_extension.get("senderNick"), last_extension.get("senderNickName"),
@@ -231,7 +236,8 @@ def parse_message(model: Dict[str, Any], my_id: str) -> Optional[Dict[str, Any]]
     try:
         message = _as_dict(model.get("message"))
         extension = _as_dict(message.get("extension"))
-        sender_id = _strip_domain(extension.get("senderUserId"))
+        sender = message.get("sender")
+        sender_id = _strip_domain(extension.get("senderUserId") or (sender.get("uid") if isinstance(sender,dict) else sender))
         content = _as_dict(message.get("content"))
         custom = _as_dict(content.get("custom"))
         decoded = _load_content(custom.get("data"))
@@ -241,6 +247,21 @@ def parse_message(model: Dict[str, Any], my_id: str) -> Optional[Dict[str, Any]]
         message_type = "system"
         if decoded:
             text, images, message_type = _interpret_content(decoded)
+        quote = None
+        if content.get('contentType') == 10:
+            from app.services.message_actions import native_display, reference_view
+            quote = reference_view(content)
+            view = native_display(_as_dict(content.get('replyContent')).get('replyContent'))
+            if view:
+                text, images, message_type = view['text'], view['images'], view['type']
+        elif content.get('contentType') in (1,2) and not decoded:
+            from app.services.message_actions import native_display
+            view = native_display(content)
+            if view:
+                text, images, message_type = view['text'], view['images'], view['type']
+        app_reply_id = str(extension.get('replyMessageId') or _as_dict(extension.get('extJson')).get('replyMessageId') or '')
+        if app_reply_id and len(app_reply_id)<=200 and not quote:
+            quote = {'messageId':app_reply_id,'senderId':'','senderName':'','time':0,'text':'原消息未加载','images':[],'type':'unknown'}
         if not text and not images:
             text = str(custom.get("summary") or custom.get("degrade") or "[系统消息]")
         if not message_type:
@@ -286,6 +307,9 @@ def parse_message(model: Dict[str, Any], my_id: str) -> Optional[Dict[str, Any]]
             card = {"kind": "order", "orderId": order_id}
         result = {
             "messageId": str(message.get("messageId") or ""),
+            "reply": quote,
+            "canForward": bool(message.get("messageId") and not event_type and message_type in ("text","image") and content.get("contentType") in (1,2,101,10)),
+            "canReference": bool(message.get("messageId") and not quote and not event_type and message_type in ("text","image") and content.get("contentType") in (1,2,101)),
             "card": card,
             "senderId": sender_id,
             "senderName": sender_name,
@@ -304,3 +328,15 @@ def parse_message(model: Dict[str, Any], my_id: str) -> Optional[Dict[str, Any]]
         return result
     except (TypeError, ValueError):
         return None
+
+
+def hydrate_replies(messages):
+    """Resolve native App references only by exact message ID in the same loaded thread."""
+    lookup = {message['messageId']:message for message in messages if message.get('messageId')}
+    for message in messages:
+        quote = message.get('reply')
+        original = lookup.get((quote or {}).get('messageId'))
+        if not quote or not original or original is message:
+            continue
+        message['reply'] = {key:original.get(key) for key in ('messageId','senderId','senderName','time','text','images','type')}
+    return messages

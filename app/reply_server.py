@@ -1301,6 +1301,7 @@ class ChatSendMessageRequest(BaseModel):
     to_user_id: str = Field(..., min_length=1, max_length=100)
     text: str = Field(..., min_length=1, max_length=2000)
     client_request_id: Optional[str] = Field(None, min_length=8, max_length=120)
+    reply_to_message_id: Optional[str] = Field(None, min_length=1, max_length=200)
 
 
 def verify_api_key(api_key: str, cookie_id: str = '') -> bool:
@@ -1576,6 +1577,8 @@ async def get_chat_messages(
         if parsed:
             messages.append(parsed)
     messages.reverse()
+    from app.xianyu_im import hydrate_replies
+    hydrate_replies(messages)
     from app.services.chat_workspace import observe_messages, associate_transaction_events
     associate_transaction_events(db_manager, cookie_id, cid, messages, current_user["user_id"], my_id)
     observe_messages(db_manager,current_user["user_id"],cookie_id,cid,messages)
@@ -1597,7 +1600,8 @@ async def send_chat_message(
 ):
     _get_owned_chat_account(cookie_id, current_user)
     from app.routers.chat_workspace import conversation,send_once
-    if not request.client_request_id:
+    from app.services.message_actions import resolve_source, send_reply
+    if not request.client_request_id and not request.reply_to_message_id:
         async def legacy(instance):
             from XianyuAutoAsync import pause_manager
             pause_manager.pause_chat(request.cid.strip(),cookie_id)
@@ -1606,12 +1610,22 @@ async def send_chat_message(
         body=result.get('body',{}) if isinstance(result,dict) else {}
         return {'success':True,'message':'发送成功','data':{'messageId':str(body.get('messageId') or body.get('msgId') or '')}}
     conversation(db_manager,current_user['user_id'],cookie_id,request.cid,request.to_user_id)
+    source = None
+    if request.reply_to_message_id:
+        from app.services.native_capabilities import require
+        require(db_manager,current_user['user_id'],request.to_user_id,'reply_text')
+        source = await _run_on_account_loop(cookie_id, lambda instance: resolve_source(instance,request.cid,request.reply_to_message_id,request.to_user_id))
+    async def operation(instance):
+        if source:
+            return await send_reply(instance,request.cid,request.to_user_id,source,text=request.text.strip(),db=db_manager,request_id=request.client_request_id or "")
+        return await instance.send_im_text(request.cid.strip(),request.to_user_id.strip(),request.text.strip())
+    payload = json.dumps([request.text.strip(),request.reply_to_message_id],ensure_ascii=False).encode() if source else request.text.strip().encode()
     return await send_once(
         db_manager,current_user['user_id'],cookie_id,request.cid.strip(),request.to_user_id.strip(),
-        request.client_request_id or str(uuid.uuid4()),'text',request.text.strip().encode(),
-        _run_on_account_loop,
-        lambda instance: instance.send_im_text(request.cid.strip(),request.to_user_id.strip(),request.text.strip()),
+        request.client_request_id or str(uuid.uuid4()),'text',payload,
+        _run_on_account_loop,operation,
     )
+
 
 
 from app.routers.chat_workspace import create_chat_workspace_router

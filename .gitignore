@@ -823,3 +823,5 @@ frontend/coverage/
 # Wrangler 本地缓存（Cloudflare Worker 部署产生）
 .wrangler/
 deploy/.wrangler/
+
+/static/chat-emojis/
