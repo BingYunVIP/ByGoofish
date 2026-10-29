@@ -15,6 +15,7 @@ readonly ROOT HELPER
 STATE="$ROOT/.local/bygoofish"
 SERVICE=bygoofish.service
 REMOTE=https://github.com/BingYunVIP/ByGoofish.git
+MIN_SWAP_MB=1900
 RED='' GREEN='' YELLOW='' CYAN='' RESET=''
 if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
     RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m' CYAN=$'\033[36m' RESET=$'\033[0m'
@@ -120,7 +121,9 @@ check_capacity() {
     info "检测：${CPUS}核 / ${MEMORY}MB内存 / ${SWAP}MB Swap / ${DISK}MB可用磁盘"
     (( MEMORY >= 960 )) || die "内存不足1GB，无法可靠运行应用和浏览器；请升级配置。"
     (( DISK >= 6144 )) || die "至少需要6GB可用磁盘用于依赖、构建和回退。"
-    if (( MEMORY < 2048 && SWAP < 2048 )); then
+    # Linux commonly reports a nominal 2GiB swap file as 2047MB after unit conversion.
+    # Treat that normal rounding as sufficient so updates do not ask to recreate it.
+    if (( MEMORY < 2048 && SWAP < MIN_SWAP_MB )); then
         warn "当前内存较小，安装和浏览器运行可能需要 Swap。"
         if confirm "是否创建专用2GB Swap"; then
             (( DISK >= 8192 )) || die "创建 Swap 并完成安装需要至少8GB可用磁盘。"
@@ -141,7 +144,14 @@ check_capacity() {
 }
 create_swap() {
     local swapfile=/var/lib/bygoofish/swapfile filesystem
-    [[ ! -e $swapfile ]] || die "专用 Swap 文件已存在；请检查后重试，不会覆盖。"
+    if [[ -e $swapfile ]]; then
+        if swapon --show=NAME --noheadings 2>/dev/null | awk '{$1=$1; print}' | grep -Fxq "$swapfile" &&
+            (( $(stat -c %s "$swapfile" 2>/dev/null || printf 0) >= MIN_SWAP_MB * 1024 * 1024 )); then
+            ok "专用 Swap 已存在且正在使用，跳过创建。"
+            return
+        fi
+        die "专用 Swap 文件已存在但未达到可复用条件；请检查 /var/lib/bygoofish/swapfile 和 swapon 状态，不会覆盖。"
+    fi
     filesystem=$(findmnt -n -o FSTYPE -T /var/lib)
     [[ $filesystem == ext4 || $filesystem == xfs ]] || die "当前文件系统不支持此自动 Swap 流程；请手动配置 Swap。"
     mkdir -p /var/lib/bygoofish
