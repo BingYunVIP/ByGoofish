@@ -659,7 +659,7 @@ class EntryPointTests(Fixture, IsolatedAsyncioTestCase):
         live.get_ai_reply = AsyncMock(return_value=None)
         live.get_default_reply = AsyncMock(
             return_value={
-                "image_url": "https://fixture.example/image.jpg",
+                "image_url": "https://img.alicdn.com/fixture.jpg",
                 "text": "示例回复",
             }
         )
@@ -672,11 +672,11 @@ class EntryPointTests(Fixture, IsolatedAsyncioTestCase):
             return 20, 10
 
         live._get_image_size_from_url = AsyncMock(side_effect=image_size)
-        live.send_im_text = AsyncMock()
+        live.send_im_text = AsyncMock(return_value={"code":200,"body":{"messageId":"fixture-text"}})
         live.send_im_image = AsyncMock()
         with patch("XianyuAutoAsync.AUTO_REPLY", {"api": {"enabled": False}}):
             await self.invoke_reply(live)
-        live.send_im_text.assert_not_awaited()
+        live.send_im_text.assert_awaited_once()
         live.send_im_image.assert_not_awaited()
         self.assertEqual(
             self.db.get_auto_reply_logs(self.uid)[0]["decision_reason"],

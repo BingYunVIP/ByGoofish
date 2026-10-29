@@ -27,7 +27,7 @@ class AutoReplyFlow(unittest.IsolatedAsyncioTestCase):
                         patch('app.cookie_manager.manager', None)]
         for p in self.patches:p.start()
         self.live = self.instance()
-        self.db.save_default_reply(ACCOUNT, True, '配置的回复 {send_user_name}', False, 'https://images.example.test/reply.png')
+        self.db.save_default_reply(ACCOUNT, True, '配置的回复 {send_user_name}', False, 'https://img.alicdn.com/fixture-reply.png')
         self.msg = {'cid':'notification-fixture-chat','senderId':BUYER,'senderName':'测试买家',
                     'text':'问一下','time':int((time.time()+1)*1000),'messageId':'manual-1','type':'text','itemId':ITEM}
 
@@ -150,7 +150,7 @@ class AutoReplyFlow(unittest.IsolatedAsyncioTestCase):
             return 100,100
         self.live._get_image_size_from_url.side_effect=slow_image
         await replies.accept(self.live,self.db,self.msg);await self.drain()
-        self.live.send_im_image.assert_not_awaited();self.live.send_im_text.assert_not_awaited()
+        self.live.send_im_image.assert_not_awaited();self.live.send_im_text.assert_awaited_once()
         self.assertEqual(self.last()['decision_reason'],'chat_paused_before_send')
 
     async def test_existing_pause_and_reply_once_have_explicit_reasons(self):
@@ -173,12 +173,12 @@ class AutoReplyFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.last()['image_send_status'],self.last()['text_send_status']),('failed','success'))
         self.assertEqual(self.last()['decision_reason'],'image_prepare_failed')
 
-    async def test_timeout_unknown_never_retries_or_consumes_reply_once(self):
+    async def test_timeout_unknown_never_retries_and_reserves_single_attempt(self):
         self.db.save_default_reply(ACCOUNT,True,'一次',True,'')
         self.live.send_im_text.side_effect=TimeoutError()
         await replies.accept(self.live,self.db,self.msg);await self.drain()
         self.assertEqual(self.last()['process_status'],'unknown')
-        self.assertFalse(self.db.has_default_reply_record(ACCOUNT,self.msg['cid']))
+        self.assertTrue(self.db.has_default_reply_record(ACCOUNT,self.msg['cid']))
         await replies.accept(self.live,self.db,self.msg,'history');await self.drain()
         self.live.send_im_text.assert_awaited_once()
 
@@ -248,7 +248,7 @@ class AutoReplyFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.conn.execute('SELECT platform_id FROM auto_reply_outbound').fetchone()[0],'real-protocol-id')
 
     async def test_image_only_and_empty_enabled_config(self):
-        self.db.save_default_reply(ACCOUNT,True,'',False,'https://images.example.test/reply.png')
+        self.db.save_default_reply(ACCOUNT,True,'',False,'https://img.alicdn.com/fixture-reply.png')
         await replies.accept(self.live,self.db,self.msg);await self.drain()
         self.live.send_im_image.assert_awaited_once();self.live.send_im_text.assert_not_awaited()
         self.assertEqual(self.last()['process_status'],'success')
@@ -262,7 +262,7 @@ class AutoReplyFlow(unittest.IsolatedAsyncioTestCase):
             return 100,100
         self.live._get_image_size_from_url.side_effect=image
         await replies.accept(self.live,self.db,self.msg);await self.drain()
-        self.live.send_im_image.assert_not_awaited();self.live.send_im_text.assert_not_awaited()
+        self.live.send_im_image.assert_not_awaited();self.live.send_im_text.assert_awaited_once()
         self.assertEqual(self.last()['decision_reason'],'auto_reply_disabled')
 
     async def test_disabled_incoming_has_clear_reason_without_sending(self):

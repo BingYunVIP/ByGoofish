@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import json
+import io
 import os
 from pathlib import Path
 import socket
@@ -11,7 +12,7 @@ import threading
 import time
 from types import SimpleNamespace
 from urllib.parse import urlsplit
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 
 def main():
@@ -32,6 +33,11 @@ def main():
     from app.services.chat_workspace import set_handover
     from XianyuAutoAsync import XianyuLive, ConnectionState
     from utils.direct_network import direct_browser_options
+    from PIL import Image
+    raw=io.BytesIO();Image.new('RGB',(100,100),'yellow').save(raw,format='PNG')
+    image_patches=[patch('app.services.reply_images.download',AsyncMock(return_value=raw.getvalue())),
+                   patch('utils.image_uploader.ImageUploader.upload_image',AsyncMock(return_value='https://img.alicdn.com/fixture-upload.jpg'))]
+    for image_patch in image_patches:image_patch.start()
     uid=db.get_user_by_username('admin')['id']
     account='fixture-reply-shop'
     for name in (account,'fixture-reply-peer'):
@@ -41,6 +47,7 @@ def main():
     db.save_default_reply(account,True,'初始文案',False,'https://fixture.example/reply.png')
     live=XianyuLive.__new__(XianyuLive)
     live.cookie_id=live.myid=account
+    live.cookies_str='unb=synthetic'
     live.connection_state=ConnectionState.CONNECTED
     live.background_tasks=set();live.message_debounce_delay=0
     live.get_ai_reply=AsyncMock(return_value=None)
@@ -85,6 +92,8 @@ def main():
             expect(activity.get_by_text('正常来信',exact=True)).to_be_visible()
             expect(activity.get_by_text('平台已确认发送',exact=True)).to_be_visible()
             page.get_by_title('编辑默认回复',exact=True).first.click()
+            expect(page.get_by_text('每个对话仅触发一次，首次回复等待5秒。',exact=True)).to_be_visible()
+            page.get_by_role('switch',name='每个会话只回复一次',exact=True).click()
             page.get_by_placeholder('输入默认回复内容').fill('浏览器保存的新文案')
             page.get_by_placeholder('https://example.com/image.jpg').fill('https://fixture.example/latest.png')
             def save(route):
@@ -136,6 +145,7 @@ def main():
             browser.close()
     finally:
         server.should_exit=True;thread.join(timeout=10);sock.close()
+        for image_patch in image_patches:image_patch.stop()
     print('auto_reply_browser_acceptance_passed')
 
 

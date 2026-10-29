@@ -139,7 +139,7 @@ class ImageUploader:
             async with self.session.post(self.upload_url, data=data, headers=headers) as response:
                 if response.status == 200:
                     response_text = await response.text()
-                    logger.debug(f"上传响应: {response_text}")
+                    logger.debug(f"图片上传响应: HTTP {response.status}")
                     
                     # 解析响应获取图片URL
                     image_url = self._parse_upload_response(response_text)
@@ -178,7 +178,7 @@ class ImageUploader:
                     logger.error("   4. 复制完整的Cookie字符串，更新配置文件中的Cookie")
                     return None
                 else:
-                    logger.error(f"收到HTML响应而非JSON，可能是Cookie失效: {response_text[:500]}")
+                    logger.error("图片上传返回HTML，未取得有效图片地址")
                     return None
             
             # 尝试解析JSON响应
@@ -211,12 +211,12 @@ class ImageUploader:
                 if 'file_url' in data:
                     return data['file_url']
             
-            logger.error(f"无法从响应中提取图片URL: {response_data}")
+            logger.error("无法从上传响应中提取图片URL")
             return None
             
         except json.JSONDecodeError:
             # 如果不是JSON格式，尝试其他解析方式
-            logger.error(f"响应不是有效的JSON格式，可能是Cookie失效: {response_text[:200]}...")
+            logger.error("图片上传响应不是有效JSON")
             return None
         except Exception as e:
             logger.error(f"解析上传响应异常: {e}")

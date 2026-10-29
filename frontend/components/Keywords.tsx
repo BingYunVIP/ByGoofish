@@ -805,7 +805,7 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
                 <div className="flex items-center justify-between rounded-md border border-gray-200 bg-gray-50 p-4">
                   <div>
                     <p className="text-sm font-bold text-gray-800">单会话一次</p>
-                    <p className="mt-1 text-xs text-gray-500">每个对话仅触发一次。</p>
+                    <p className="mt-1 text-xs text-gray-500">每个对话仅触发一次，首次回复等待5秒。</p>
                   </div>
                   {renderStatusSwitch(
                     defaultForm.reply_once,

@@ -8,7 +8,6 @@ import hashlib
 import json
 import sqlite3
 import time
-from pathlib import Path
 from loguru import logger
 
 LOOKBACK = 300
@@ -44,7 +43,12 @@ def initialize(db):
                 db.conn.execute(f'ALTER TABLE auto_reply_message_logs ADD COLUMN {name} {definition}')
         db.conn.execute("UPDATE auto_reply_receipts SET state='unknown' WHERE state='queued'")
         db.conn.execute("UPDATE auto_reply_message_logs SET process_status='unknown',decision_reason='result_unconfirmed',send_status='unknown',text_send_status=CASE WHEN text_send_status='sending' THEN 'unknown' ELSE text_send_status END,image_send_status=CASE WHEN image_send_status='sending' THEN 'unknown' ELSE image_send_status END WHERE process_status='pending'")
+        # One-time upgrade only. Clearing reply records must remain effective after restart.
+        if not db.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='auto_reply_image_cache'").fetchone():
+            db.conn.execute("INSERT OR IGNORE INTO default_reply_records(cookie_id,chat_id) SELECT l.cookie_id,l.chat_id FROM auto_reply_message_logs l JOIN default_replies r ON r.cookie_id=l.cookie_id AND r.reply_once=1 WHERE l.reply_strategy='default' AND l.chat_id IS NOT NULL AND (l.text_send_status='success' OR l.image_send_status='success')")
         db.conn.commit()
+        from app.services.reply_images import initialize as initialize_images
+        initialize_images(db)
         for (account,) in db.conn.execute('SELECT id FROM cookies').fetchall():
             activation(db, account)
 
@@ -223,6 +227,7 @@ async def accept(instance, db, msg, source='push'):
     msg['senderId'] = str(msg.get('senderId') or '').split('@')[0]
     msg['text'] = str(msg.get('text') or ('[图片]' if msg.get('type') == 'image' else ''))
     msg['time'] = stamp_ms(msg.get('time'))
+    msg['_received_at'] = time.monotonic()
     if (not msg['cid'] or not msg['senderId'] or msg['senderId'] in ('unknown', '0', str(instance.myid))
             or msg.get('type', 'text') not in ('text', 'image') or msg.get('event_type')
             or not msg['text'] or AIReplyEngine.is_system_or_order_event(msg['text'])):
@@ -280,26 +285,9 @@ async def accept(instance, db, msg, source='push'):
     return True
 
 
-async def prepare_image(instance, url):
-    """Prepare once without writing a generated CDN URL over the user's configuration."""
-    width, height = 800, 600
-    if url.startswith(('/static/uploads/', 'static/uploads/')):
-        root = Path('static/uploads').resolve()
-        path = Path(url.lstrip('/')).resolve()
-        if not path.is_relative_to(root) or not path.is_file():
-            raise ValueError('默认回复图片不存在或路径无效')
-        from utils.image_uploader import ImageUploader
-        async with ImageUploader(instance.cookies_str) as uploader:
-            result = await uploader.upload_image(str(path))
-        if not result:
-            raise ValueError('默认回复图片上传失败')
-        from utils.image_utils import image_manager
-        width, height = image_manager.get_image_size(str(path))
-        return result, width or 800, height or 600
-    if not url.startswith(('https://', 'http://')):
-        raise ValueError('回复图片地址无效')
-    actual_width, actual_height = await instance._get_image_size_from_url(url)
-    return url, actual_width or width, actual_height or height
+async def prepare_image(instance, url, db=None):
+    from app.services.reply_images import prepare
+    return await prepare(instance, url, db)
 
 
 async def process(instance, db, msg, source, key):
@@ -328,6 +316,7 @@ async def process(instance, db, msg, source, key):
     if matched:
         update(matched_keyword=matched); skip('skip_reply_filter'); return
     text, image, strategy = '', '', 'none'
+    default_once = False
     try:
         if AUTO_REPLY.get('api', {}).get('enabled', False):
             text = await instance.get_api_reply('', f'https://www.goofish.com/personal?userId={msg["senderId"]}',
@@ -352,6 +341,7 @@ async def process(instance, db, msg, source, key):
                     settings = db.get_default_reply(account) or {}
                     item = db.get_item_reply(account, msg.get('itemId')) if msg.get('itemId') else None
                     if not (item and item.get('reply_content')):
+                        default_once = bool(settings.get('reply_once'))
                         if not settings.get('enabled'):
                             skip('default_reply_disabled'); return
                         if settings.get('reply_once') and db.has_default_reply_record(account, msg['cid']):
@@ -369,9 +359,16 @@ async def process(instance, db, msg, source, key):
     except Exception as error:
         update(process_status='failed', decision_reason='reply_selection_failed', error_message=type(error).__name__)
         finish(db, account, key, 'failed'); return
+    if default_once:
+        update(decision_reason='waiting_first_reply')
+        remaining = max(0, 5 - (time.monotonic() - msg.get('_received_at', time.monotonic())))
+        await asyncio.sleep(remaining)
+        if db.has_default_reply_record(account, msg['cid']):
+            skip('reply_once'); return
+    once_reserved = False
     states = {'text': 'not_requested', 'image': 'not_requested'}
     errors = []
-    for kind, content in (('image', image), ('text', text)):
+    for kind, content in (('text', text), ('image', image)):
         if not content:
             continue
         if not configured(db, account):
@@ -383,12 +380,16 @@ async def process(instance, db, msg, source, key):
         row_id = None
         try:
             if kind == 'image':
-                url, width, height = await prepare_image(instance, content)
+                url, width, height = await prepare_image(instance, content, db)
             # The upload may have taken time; honor takeover immediately before sending.
             if not configured(db, account):
                 states[kind] = 'skipped'; errors.append('auto_reply_disabled'); continue
             if not available(instance, db) or pause_manager.is_chat_paused(msg['cid'], account):
                 states[kind] = 'skipped'; errors.append('chat_paused_before_send'); continue
+            if default_once and not once_reserved:
+                if not db.add_default_reply_record(account, msg['cid']):
+                    skip('reply_once'); return
+                once_reserved = True
             row_id = reserve_outbound(db, account, msg, '[图片]' if kind == 'image' else content)
             states[kind] = 'sending'
             update(**{f'{kind}_send_status': 'sending'})
@@ -409,7 +410,8 @@ async def process(instance, db, msg, source, key):
                 raise
         except Exception as error:
             states[kind] = 'failed'
-            errors.append('platform_rejected' if row_id else 'image_prepare_failed')
+            from app.services.reply_images import ReplyImageError
+            errors.append('platform_rejected' if row_id else (error.code if isinstance(error, ReplyImageError) else 'image_prepare_failed'))
             if row_id:
                 complete_outbound(db, row_id, 'failed')
         update(**{f'{kind}_send_status': states[kind]})

@@ -6,10 +6,10 @@ import { getAutoReplyLogs, getDefaultReply } from '../services/api';
 import { SectionHeader } from './ui';
 
 const reasons: Record<string, string> = {
-  selecting_reply: '正在选择回复', reply_sent: '平台已确认发送', auto_reply_disabled: '自动回复未开启',
+  waiting_first_reply: '首次咨询等待5秒', selecting_reply: '正在选择回复', reply_sent: '平台已确认发送', auto_reply_disabled: '自动回复未开启',
   default_reply_disabled: '账号默认回复未开启', chat_paused: '人工接管中', chat_paused_before_send: '发送前已人工接管',
-  skip_reply_filter: '命中过滤规则', empty_reply: '回复内容为空', reply_once: '此会话已回复过一次',
-  message_outside_window: '消息已超过本轮处理窗口', no_rule_matched: '没有匹配规则', image_prepare_failed: '图片处理失败', platform_rejected: '平台拒绝发送',
+  skip_reply_filter: '命中过滤规则', empty_reply: '回复内容为空', reply_once: '此会话已触发单次回复',
+  message_outside_window: '消息已超过本轮处理窗口', no_rule_matched: '没有匹配规则', image_prepare_failed: '图片处理失败', image_url_invalid: '图片链接无效', image_download_failed: '图片链接读取失败', image_too_large: '图片超过5MB', image_decode_failed: '图片格式或尺寸无效', image_file_missing: '本地图片不存在', image_upload_failed: '上传闲鱼图片服务器失败', platform_rejected: '平台拒绝发送',
   result_unconfirmed: '结果待核查，请勿重复发送', account_unavailable: '账号连接不可用',
   automation_echo: '本系统自动消息，不再互相回复', reply_selection_failed: '回复生成失败', send_failed: '发送失败',
 };

@@ -4135,32 +4135,8 @@ class XianyuLive:
             return f"抱歉，图片发送失败: {str(e)}"
 
     def _is_cdn_url(self, url: str) -> bool:
-        """检查URL是否是闲鱼CDN链接"""
-        if not url:
-            return False
-
-        # 闲鱼CDN域名列表
-        cdn_domains = [
-            'gw.alicdn.com',
-            'img.alicdn.com',
-            'cloud.goofish.com',
-            'goofish.com',
-            'taobaocdn.com',
-            'tbcdn.cn',
-            'aliimg.com'
-        ]
-
-        # 检查是否包含CDN域名
-        url_lower = url.lower()
-        for domain in cdn_domains:
-            if domain in url_lower:
-                return True
-
-        # 检查是否是HTTPS链接且包含图片特征
-        if url_lower.startswith('https://') and any(ext in url_lower for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-            return True
-
-        return False
+        from app.services.reply_images import is_platform_image_url
+        return is_platform_image_url(url)
 
     async def _get_image_size_from_url(self, image_url: str) -> tuple:
         """从URL获取图片尺寸
@@ -5990,7 +5966,7 @@ class XianyuLive:
         return response
 
     async def send_im_image(self,cid,toid,url,width,height):
-        content={"contentType":2,"image":{"pics":[{"url":url,"width":int(width),"height":int(height)}]}}
+        content={"contentType":2,"image":{"pics":[{"url":url,"width":int(width),"height":int(height),"type":0}]}}
         payload=base64.b64encode(json.dumps(content).encode()).decode()
         response=await self._send_im_request('/r/MessageSend/sendByReceiverScope',[
             {"uuid":generate_uuid(),"cid":f"{str(cid).split('@')[0]}@goofish","conversationType":1,

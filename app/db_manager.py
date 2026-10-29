@@ -3248,10 +3248,13 @@ class DBManager:
                 INSERT OR IGNORE INTO default_reply_records (cookie_id, chat_id)
                 VALUES (?, ?)
                 ''', (cookie_id, chat_id))
+                claimed = cursor.rowcount > 0
                 self.conn.commit()
                 logger.debug(f"记录默认回复: {cookie_id} -> {chat_id}")
+                return claimed
             except Exception as e:
-                logger.error(f"记录默认回复失败: {e}")
+                logger.error(f"记录默认回复失败: {type(e).__name__}")
+                raise
 
     def has_default_reply_record(self, cookie_id: str, chat_id: str) -> bool:
         """检查是否已经回复过该chat_id"""
