@@ -48,6 +48,7 @@ import {
   testEmailChannel,
   testMessageNotification,
   updateMessageNotificationRule,
+  acknowledgeNotification,
   updateNotificationChannel,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
@@ -194,6 +195,9 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
   const [ruleChannel, setRuleChannel] = useState('');
   const [ruleName, setRuleName] = useState('');
   const [ruleEventTypes, setRuleEventTypes] = useState<string[]>([]);
+  const [ruleReminders,setRuleReminders] = useState(2);
+  const [ruleInterval,setRuleInterval] = useState(5);
+  const [acknowledging,setAcknowledging] = useState<number | null>(null);
   const [savingRule, setSavingRule] = useState(false);
   const [riskLogs, setRiskLogs] = useState<RiskControlLog[]>([]);
   const [riskTotal, setRiskTotal] = useState(0);
@@ -397,6 +401,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
     setRuleAccount(accounts[0]?.id || '');
     setRuleChannel('');
     setRuleName('');
+    setRuleReminders(2);setRuleInterval(5);
     setRuleEventTypes(eventDefinitions.filter((item) => item.default_subscribed).map((item) => item.id));
     setRuleEditorOpen(true);
   };
@@ -406,6 +411,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
     setRuleAccount(binding.cookie_id);
     setRuleChannel(String(binding.channel_id));
     setRuleName(binding.name || '');
+    setRuleReminders(binding.reminder_limit ?? 2);setRuleInterval(binding.reminder_interval_minutes ?? 5);
     setRuleEventTypes(binding.event_types);
     setRuleEditorOpen(true);
   };
@@ -433,12 +439,16 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
   };
 
   const saveRule = async () => {
+    if (!Number.isInteger(ruleReminders) || ruleReminders < 1 || ruleReminders > 10 || !Number.isInteger(ruleInterval) || ruleInterval < 5 || ruleInterval > 1440) {
+      notify('提醒次数应为1–10次，间隔应为5–1440分钟');return;
+    }
     if (editingRule) {
       setSavingRule(true);
       try {
         await updateMessageNotificationRule(editingRule.id, {
           name: ruleName.trim(),
           eventTypes: ruleEventTypes,
+          reminderLimit: ruleReminders, reminderInterval: ruleInterval,
         });
         setRuleEditorOpen(false);
         await loadBaseData();
@@ -459,6 +469,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
       await setMessageNotification(ruleAccount, Number(ruleChannel), true, {
         name: ruleName.trim(),
         eventTypes: ruleEventTypes,
+        reminderLimit: ruleReminders, reminderInterval: ruleInterval,
       });
       setRuleEditorOpen(false);
       await loadBaseData();
@@ -765,6 +776,8 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                     <p className="mt-1 break-words text-xs text-gray-500">
                       通知内容：{ruleEventSummary(binding)}
                     </p>
+                    <p className="mt-1 text-xs text-gray-500">最多提醒{binding.reminder_limit ?? 2}次 · 间隔{binding.reminder_interval_minutes ?? 5}分钟
+                    </p>
                   </div>
                   <div className="flex min-w-0 flex-col gap-2 sm:w-full sm:max-w-[30rem] sm:shrink-0">
                     <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
@@ -929,6 +942,12 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                     <p className="mt-1 break-words text-xs text-red-600">{log.error_message}</p>
                   )}
                   {log.recommended_action && <p className="mt-2 rounded-md bg-gray-50 px-3 py-2 text-xs leading-5 text-gray-700">建议操作：{log.recommended_action}</p>}
+                  {log.notification_incident && <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                    <span>各规则合计尝试{log.notification_incident.attempts}次 · {log.notification_incident.resolved ? '已解决' : log.notification_incident.acknowledged ? '本轮提醒已停止' : '按规则提醒'}</span>
+                    {!log.notification_incident.resolved && !log.notification_incident.acknowledged && <button type="button" disabled={acknowledging===log.id}
+                      onClick={async()=>{setAcknowledging(log.id);try { await acknowledgeNotification(log.id);await loadRiskLogs();notify('已停止本轮后续提醒'); } catch { notify('操作失败，请重试'); } finally { setAcknowledging(null); }}}
+                      className="ios-btn-secondary rounded-md px-3 py-2 text-xs disabled:opacity-50">标记已处理</button>}
+                  </div>}
                   <button type="button" onClick={() => setDiagnosticLog(log)}
                     className="ios-btn-secondary mt-2 rounded-md px-3 py-2 text-xs">查看浏览器日志</button>
                 </div>
@@ -1192,6 +1211,19 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                   className="ios-input mt-2 w-full rounded-md px-3 py-2.5 font-normal"
                 />
               </label>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="block text-sm font-bold text-gray-700">提醒次数（含首次）
+                  <input type="number" min={1} max={10} step={1} value={ruleReminders} disabled={savingRule}
+                    onChange={event=>setRuleReminders(Number(event.target.value))}
+                    className="ios-input mt-2 w-full rounded-md px-3 py-2.5 font-normal" />
+                </label>
+                <label className="block text-sm font-bold text-gray-700">提醒间隔（分钟）
+                  <input type="number" min={5} max={1440} step={1} value={ruleInterval} disabled={savingRule}
+                    onChange={event=>setRuleInterval(Number(event.target.value))}
+                    className="ios-input mt-2 w-full rounded-md px-3 py-2.5 font-normal" />
+                </label>
+              </div>
+              <p className="text-xs leading-5 text-gray-500">每个事件独立计数，默认共2次、间隔5分钟。实际恢复或标记已处理后停止本轮提醒；新事件重新计数。发送结果不确定时不自动重发。</p>
               <div>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-sm font-bold text-gray-700">通知内容</span>
@@ -1241,7 +1273,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                                 aria-pressed={selected}
                                 onClick={() => toggleRuleEvent(event.id)}
                                 className={`flex items-start gap-2 rounded-md border p-3 text-left transition-colors ${
-                                  selected ? 'border-[#ffe100] bg-[#fffbe6]' : 'border-gray-200 bg-white hover:bg-gray-50'
+                                  selected ? 'border-[var(--brand)] bg-[var(--brand-soft)]' : 'border-[var(--border)] bg-[var(--surface)] hover:bg-[var(--surface-hover)]'
                                 }`}
                               >
                                 <span className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
@@ -1250,8 +1282,8 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                                   {selected && <Check className="h-3 w-3 text-gray-900" />}
                                 </span>
                                 <span className="min-w-0">
-                                  <span className="block text-sm font-bold text-gray-900">{event.label}</span>
-                                  <span className="mt-0.5 block text-xs text-gray-500">{event.description}</span>
+                                  <span className="block text-sm font-bold text-[var(--text)]">{event.label}</span>
+                                  <span className="mt-0.5 block text-xs text-[var(--text-muted)]">{event.description}</span>
                                 </span>
                               </button>
                             );

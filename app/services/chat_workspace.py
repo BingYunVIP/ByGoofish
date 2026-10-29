@@ -44,6 +44,8 @@ def initialize(cursor):
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS chat_send_by_conversation ON chat_send_attempts(user_id,cookie_id,cid,created_at)"
     )
+    if 'avatar_url' not in {r[1] for r in cursor.execute('PRAGMA table_info(chat_buyer_profiles)')}:
+        cursor.execute("ALTER TABLE chat_buyer_profiles ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''")
     # Old versions persisted notification headings as names. Repair only that cached field.
     for uid, account, cid, raw in cursor.execute(
         "SELECT user_id,cookie_id,cid,snapshot FROM chat_workspace_state"
@@ -73,7 +75,7 @@ def buyer_profile(db, user_id, cookie_id, buyer_id):
     with db.lock:
         row = _row(
             db,
-            "SELECT nickname,source,fetched_at,retry_after,fetch_started_at "
+            "SELECT nickname,source,fetched_at,retry_after,fetch_started_at,avatar_url "
             "FROM chat_buyer_profiles WHERE user_id=? AND cookie_id=? AND buyer_id=?",
             (user_id, cookie_id, buyer_id),
         )
@@ -87,6 +89,7 @@ def buyer_profile(db, user_id, cookie_id, buyer_id):
         row = None
     return row or {
         "nickname": "",
+        "avatar_url": "",
         "source": "",
         "fetched_at": 0,
         "retry_after": 0,
@@ -94,16 +97,18 @@ def buyer_profile(db, user_id, cookie_id, buyer_id):
     }
 
 
-def claim_buyer_profile_fetch(db, user_id, cookie_id, buyer_id, now=None):
+def claim_buyer_profile_fetch(db, user_id, cookie_id, buyer_id, now=None, *, need_avatar=False):
     now = float(now if now is not None else time.time())
     with db.lock:
         row = _row(
             db,
-            "SELECT nickname,retry_after,fetch_started_at FROM chat_buyer_profiles "
+            "SELECT nickname,retry_after,fetch_started_at,avatar_url,fetched_at FROM chat_buyer_profiles "
             "WHERE user_id=? AND cookie_id=? AND buyer_id=?",
             (user_id, cookie_id, buyer_id),
         )
-        if row and row["nickname"] and _valid_nickname(row["nickname"]):
+        if row and row["nickname"] and _valid_nickname(row["nickname"]) and not need_avatar:
+            return False
+        if need_avatar and row and row['avatar_url'] and row['fetched_at'] > now-86400:
             return False
         if row and float(row["retry_after"] or 0) > now:
             return False
@@ -128,28 +133,31 @@ def claim_buyer_profile_fetch(db, user_id, cookie_id, buyer_id, now=None):
 
 
 def finish_buyer_profile_fetch(
-    db, user_id, cookie_id, buyer_id, nickname="", now=None
+    db, user_id, cookie_id, buyer_id, nickname="", now=None, *, avatar_url=""
 ):
     now = float(now if now is not None else time.time())
     nickname = str(nickname or "").strip()[:120]
     if not _valid_nickname(nickname):
         nickname = ""
+    avatar_url = valid_avatar(avatar_url)
     with db.lock:
         db.conn.execute(
             """INSERT INTO chat_buyer_profiles
-            (user_id,cookie_id,buyer_id,nickname,source,fetched_at,retry_after,fetch_started_at)
-            VALUES(?,?,?,?,?,?,?,0)
+            (user_id,cookie_id,buyer_id,nickname,source,fetched_at,retry_after,fetch_started_at,avatar_url)
+            VALUES(?,?,?,?,?,?,?,0,?)
             ON CONFLICT(user_id,cookie_id,buyer_id) DO UPDATE SET
-                nickname=excluded.nickname,source=excluded.source,
-                fetched_at=excluded.fetched_at,retry_after=excluded.retry_after,fetch_started_at=0""",
+                nickname=CASE WHEN excluded.nickname<>'' THEN excluded.nickname ELSE chat_buyer_profiles.nickname END,
+                avatar_url=CASE WHEN excluded.avatar_url<>'' THEN excluded.avatar_url ELSE chat_buyer_profiles.avatar_url END,
+                source=excluded.source,fetched_at=excluded.fetched_at,retry_after=excluded.retry_after,fetch_started_at=0""",
             (
                 user_id,
                 cookie_id,
                 buyer_id,
                 nickname,
                 "public_profile" if nickname else "unavailable",
-                now if nickname else 0,
-                0 if nickname else now + BUYER_PROFILE_RETRY_SECONDS,
+                now if nickname or avatar_url else 0,
+                0 if avatar_url else now + BUYER_PROFILE_RETRY_SECONDS,
+                avatar_url,
             ),
         )
         db.conn.commit()
@@ -679,3 +687,17 @@ class EventHub:
 
 
 events = EventHub()
+
+
+def valid_avatar(value):
+    from urllib.parse import urlsplit
+    url=str(value or '').strip()
+    if url.startswith('//'):url='https:'+url
+    if url.startswith('http://'):url='https://'+url[7:]
+    try:
+        parts=urlsplit(url)
+        if (parts.scheme!='https' or parts.username or parts.password or len(url)>2048 or
+            not any((parts.hostname or '').endswith('.'+d) or parts.hostname==d
+                    for d in ('alicdn.com','taobaocdn.com','goofish.com','tbcdn.cn'))):return ''
+    except ValueError:return ''
+    return url

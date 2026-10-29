@@ -28,7 +28,7 @@ import {
 import { PageTabs } from '../ui';
 import { accountDisplayName } from '../../lib/accountDisplay';
 import { MessageText, type OfficialEmoji } from './OfficialEmoji';
-import { MessageMenu, ForwardDialog, type MenuTarget } from './MessageActions';
+import { MessageMenu, ChatAreaMenu, ForwardDialog, type AreaMenuTarget, type MenuTarget } from './MessageActions';
 import type { ChatMessage } from '../../types';
 import type { OutgoingMessage } from './workspaceTypes';
 import { get } from '../../lib/request';
@@ -91,12 +91,14 @@ export default function MessageWorkspace({
   const drawerRef = useRef<HTMLElement>(null),
     imageRef = useRef<HTMLDivElement>(null);
   const [menu,setMenu] = useState<MenuTarget | null>(null);
+  const [areaMenu,setAreaMenu] = useState<AreaMenuTarget | null>(null);
+  const closeAreaMenu=useCallback(()=>setAreaMenu(null),[]);
   const [forwarding,setForwarding] = useState<ChatMessage>();
   const [capabilities,setCapabilities] = useState<Record<string,{supported:boolean;reason:string}>>({});
   const [emojiState,setEmojiState] = useState<{ account: string; items: OfficialEmoji[] }>({account:'',items:[]});
   const emojis = emojiState.account === w.accountId ? emojiState.items : [];
   const closeMenu = useCallback(() => setMenu(null), []);
-  useEffect(() => { setMenu(null);setForwarding(undefined); }, [w.accountId,w.cid,isActive]);
+  useEffect(() => { setMenu(null);setAreaMenu(null);setForwarding(undefined); }, [w.accountId,w.cid,isActive]);
   useEffect(() => {
     if (!isActive || !w.accountId) return;
     let active = true;
@@ -107,7 +109,7 @@ export default function MessageWorkspace({
     return () => { active = false; };
   }, [isActive,w.accountId]);
   const openMenu = (event: React.MouseEvent<HTMLElement>, message: OutgoingMessage, fromButton=false) => {
-    event.preventDefault();event.stopPropagation();
+    event.preventDefault();event.stopPropagation();setAreaMenu(null);
     const selection = window.getSelection();
     let selected = '';
     if (selection && selection.rangeCount && event.currentTarget.contains(selection.anchorNode) && event.currentTarget.contains(selection.focusNode)) {
@@ -356,7 +358,7 @@ export default function MessageWorkspace({
               </div>
             )}
             {w.visibleConversations.map((v) => (
-              <div key={v.cid} className={`chat-conversation ${w.cid === v.cid ? 'selected' : ''}`}>
+              <div key={v.cid} data-conversation-id={v.cid} className={`chat-conversation ${w.cid === v.cid ? 'selected' : ''}`}>
                 <Avatar name={v.otherUserName || v.otherUserId} url={v.otherUserAvatar} />
                 <button
                   className="min-w-0 text-left"
@@ -423,7 +425,7 @@ export default function MessageWorkspace({
                 >
                   <ArrowLeft size={19} />
                 </button>
-                <Avatar name={c.otherUserName || c.otherUserId} url={c.otherUserAvatar} />
+                <Avatar name={c.otherUserName || c.otherUserId} url={ctx?.buyer.avatar_url || c.otherUserAvatar} />
                 <div className="min-w-0 flex-1">
                   <h2 className="truncate text-sm font-bold">{c.otherUserName || c.otherUserId}</h2>
                   <p className="mt-1 truncate text-[11px] text-[var(--text-soft)]">
@@ -500,10 +502,12 @@ export default function MessageWorkspace({
                 </div>
               )}
               <div
-                ref={scroller}
+                ref={scroller} aria-label="聊天消息区域" tabIndex={-1}
+                onContextMenuCapture={event=>{if(!(event.target as HTMLElement).closest('input,textarea,[contenteditable="true"]'))event.preventDefault();}}
+                onContextMenu={event=>{if((event.target as HTMLElement).closest('input,textarea,[contenteditable="true"]'))return;event.preventDefault();setMenu(null);setAreaMenu({x:event.clientX,y:event.clientY,anchor:event.currentTarget});}}
                 className="relative min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6"
                 onScroll={(e) => {
-                  setMenu(null);
+                  setMenu(null);setAreaMenu(null);
                   const el = e.currentTarget;
                   nearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
                   if (nearBottom.current) {
@@ -553,7 +557,7 @@ export default function MessageWorkspace({
                               <span className="hidden sm:block">
                                 <Avatar
                                   name={c.otherUserName || c.otherUserId}
-                                  url={c.otherUserAvatar}
+                                  url={ctx?.buyer.avatar_url || c.otherUserAvatar}
                                 />
                               </span>
                             )}
@@ -715,6 +719,7 @@ export default function MessageWorkspace({
                   <UserRound size={15} />
                   买家资料
                 </h3>
+                <div className="mb-3 flex items-center gap-3"><Avatar name={ctx?.buyer.nickname || c.otherUserName || c.otherUserId} url={ctx?.buyer.avatar_url || c.otherUserAvatar}/><span className="min-w-0 break-words text-sm font-bold">{ctx?.buyer.nickname || c.otherUserName || c.otherUserId}</span></div>
                 <dl className="chat-facts">
                   <dt>买家昵称</dt>
                   <dd>{ctx?.buyer.nickname || c.otherUserName || `闲鱼用户 ${ctx?.buyer.id || c.otherUserId}`} </dd>
@@ -928,6 +933,7 @@ export default function MessageWorkspace({
           </div>,
           document.body
         )}
+      {areaMenu && <ChatAreaMenu target={areaMenu} close={closeAreaMenu} bottom={()=>{const el=scroller.current;if(el)el.scrollTo({top:el.scrollHeight});}} refresh={()=>void w.loadMessages()} />}
       {menu && <MessageMenu target={menu} capabilities={capabilities} close={closeMenu} quote={() => w.setReference(menu.message)} forward={() => setForwarding(menu.message)} />}
       {forwarding && <ForwardDialog owner={w.owner} account={w.accountId} sourceCid={w.cid} message={forwarding}
         accountName={accountName} scopeKey={JSON.stringify([w.accountId,w.days,w.query,w.filter])}

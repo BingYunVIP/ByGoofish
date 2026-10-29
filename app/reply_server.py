@@ -1521,6 +1521,11 @@ async def get_chat_conversations(
         raw = item.get("singleChatUserConversation", item) if isinstance(item, dict) else {}
         parsed = parse_conversation(raw, my_id)
         if parsed:
+            from app.services.chat_workspace import buyer_profile, valid_avatar
+            cached=buyer_profile(db_manager,current_user['user_id'],cookie_id,parsed['otherUserId'])
+            parsed['otherUserAvatar']=valid_avatar(parsed.get('otherUserAvatar')) or valid_avatar(cached.get('avatar_url'))
+            if not parsed.get('otherUserName') and cached.get('nickname'):
+                parsed['otherUserName']=cached['nickname']
             conversations.append(parsed)
     from app.services.chat_workspace import observe_conversations
     observe_conversations(db_manager,current_user["user_id"],cookie_id,conversations)
@@ -1802,6 +1807,8 @@ class NotificationChannelUpdate(BaseModel):
 
 
 class MessageNotificationIn(BaseModel):
+    reminder_limit: int = Field(default=2, ge=1, le=10, strict=True)
+    reminder_interval_minutes: int = Field(default=5, ge=5, le=1440, strict=True)
     channel_id: int
     enabled: bool = True
     name: Optional[str] = None
@@ -1809,6 +1816,8 @@ class MessageNotificationIn(BaseModel):
 
 
 class MessageNotificationUpdate(BaseModel):
+    reminder_limit: Optional[int] = Field(default=None, ge=1, le=10, strict=True)
+    reminder_interval_minutes: Optional[int] = Field(default=None, ge=5, le=1440, strict=True)
     name: Optional[str] = None
     event_types: Optional[List[str]] = None
     enabled: Optional[bool] = None
@@ -3817,6 +3826,7 @@ def set_message_notification(cid: str, notification_data: MessageNotificationIn,
 
         rule_id = db_manager.create_notification_rule(
             cid, notification_data.channel_id, rule_name, rule_events, notification_data.enabled,
+            notification_data.reminder_limit, notification_data.reminder_interval_minutes,
         )
         return {'msg': 'message notification rule created', 'id': rule_id}
     except HTTPException:
@@ -3850,6 +3860,8 @@ def update_message_notification_rule(rule_id: int, rule_data: MessageNotificatio
             rule_events,
             rule_data.enabled if rule_data.enabled is not None else existing_rule['enabled'],
             user_id,
+            reminder_limit=rule_data.reminder_limit,
+            reminder_interval_minutes=rule_data.reminder_interval_minutes,
         )
         if success:
             return {'msg': 'message notification rule updated'}
@@ -6756,6 +6768,10 @@ async def get_risk_control_logs(
 
         log_with_user('info', f"风控日志查询成功，共 {len(logs)} 条记录，总计 {total_count} 条", current_user)
 
+        from app.services.event_journal import summaries
+        incident_summaries=summaries(db_manager,[v['id'] for v in logs])
+        for log in logs:
+            log['notification_incident']=incident_summaries.get(log['id'])
         return {
             "success": True,
             "data": logs,
@@ -6774,6 +6790,14 @@ async def get_risk_control_logs(
             "data": [],
             "total": 0
         }
+
+
+@app.post('/notification-incidents/{log_id}/acknowledge')
+def acknowledge_notification_incident(log_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    from app.services.event_journal import acknowledge
+    if not acknowledge(db_manager,current_user['user_id'],log_id):
+        raise HTTPException(404,'通知事件不存在或无权操作')
+    return {'success': True, 'message': '已停止本轮后续提醒；账号及订单实际状态未更改'}
 
 
 @app.delete("/risk-control-logs/{log_id}")

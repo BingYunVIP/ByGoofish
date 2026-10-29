@@ -973,3 +973,27 @@ class CardParsingTests(TestCase):
             }
         }
         self.assertEqual(parse_message(raw, "fixture-shop")["type"], "system")
+
+
+class BuyerAvatarCacheTests(TestCase):
+    def test_avatar_url_normalization_and_unsafe_sources(self):
+        from app.services.chat_workspace import valid_avatar
+        self.assertEqual(valid_avatar('//img.alicdn.com/fixture.png'),'https://img.alicdn.com/fixture.png')
+        self.assertEqual(valid_avatar('http://img.alicdn.com/fixture.png'),'https://img.alicdn.com/fixture.png')
+        for url in ('javascript:alert(1)','https://evil.test/a.png','https://alicdn.com.evil.test/a.png','https://user:pass@img.alicdn.com/a'):
+            self.assertEqual(valid_avatar(url),'')
+
+    def test_avatar_cache_shared_fetch_lease_and_account_isolation(self):
+        from app.services import chat_workspace as store
+        with tempfile.TemporaryDirectory() as folder:
+            db=DBManager(str(Path(folder)/'avatars.db'));uid=db.get_user_by_username('admin')['id']
+            for account in ('avatar-a','avatar-b'):db.save_cookie(account,'unb=fixture',uid)
+            self.assertTrue(store.claim_buyer_profile_fetch(db,uid,'avatar-a','buyer',need_avatar=True))
+            self.assertFalse(store.claim_buyer_profile_fetch(db,uid,'avatar-a','buyer',need_avatar=True))
+            store.finish_buyer_profile_fetch(db,uid,'avatar-a','buyer','买家昵称',avatar_url='https://img.alicdn.com/fixture.png')
+            self.assertEqual(store.buyer_profile(db,uid,'avatar-a','buyer')['avatar_url'],'https://img.alicdn.com/fixture.png')
+            self.assertFalse(store.claim_buyer_profile_fetch(db,uid,'avatar-a','buyer',need_avatar=True))
+            self.assertEqual(store.buyer_profile(db,uid,'avatar-b','buyer')['avatar_url'],'')
+            store.finish_buyer_profile_fetch(db,uid,'avatar-a','buyer','',avatar_url='')
+            self.assertEqual(store.buyer_profile(db,uid,'avatar-a','buyer')['nickname'],'买家昵称')
+            db.close()

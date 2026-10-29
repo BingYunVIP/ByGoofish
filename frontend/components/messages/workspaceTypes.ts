@@ -24,7 +24,7 @@ export type WorkspaceOrder = Order & {
 };
 export interface ConversationContext {
   owner_id: number;
-  buyer: { id: string; nickname: string; note: string; nickname_source?: string };
+  buyer: { id: string; nickname: string; note: string; nickname_source?: string; avatar_url?: string };
   item: { item_id?: string; item_title?: string; item_image?: string; item_price?: string };
   orders: WorkspaceOrder[];
   candidate_orders: WorkspaceOrder[];

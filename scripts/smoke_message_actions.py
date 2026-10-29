@@ -27,6 +27,13 @@ def main():
     uid=db.get_user_by_username('admin')['id'];account='actions-fixture'
     for name in (account,'other-fixture'):db.save_cookie(name,'unb=fixture',uid)
     db.conn.execute("UPDATE chat_native_capabilities SET status='verified',reason=''");db.conn.commit()
+    channel=db.create_notification_channel('提醒配置夹具','email','{}',uid)
+    rule=db.create_notification_rule(account,channel,'提醒规则夹具',event_types=['credentials_invalid'])
+    from app.services import event_journal
+    incident=event_journal.observe(db,account,'credentials_invalid','虚拟通知处理验收')
+    db.conn.execute("INSERT INTO operational_notices(incident_id,rule_id,status,updated_at,attempts) VALUES(?,?,'submitted',?,1)",(incident,rule,time.time()));db.conn.commit()
+    from app.services import chat_workspace as workspace_store
+    workspace_store.finish_buyer_profile_fetch(db,uid,account,'buyer','测试买家',avatar_url='https://img.alicdn.com/fixture-avatar.png')
     now=int(time.time()*1000)
     def message(mid,text,sender='buyer',cid='source-chat'):
         return {'message':{'messageId':mid,'cid':cid+'@goofish','sender':sender,'createAt':now-10000,
@@ -73,7 +80,8 @@ def main():
         with sync_playwright() as pw:
             browser=pw.chromium.launch(**direct_browser_options({'headless':True,'channel':'chromium'}));context=browser.new_context(viewport={'width':1280,'height':900},permissions=['clipboard-read','clipboard-write'])
             def restrict(route):
-                if urlsplit(route.request.url).hostname!='127.0.0.1':external.append('blocked');route.abort()
+                if route.request.url=='https://img.alicdn.com/fixture-avatar.png':route.fulfill(status=200,content_type='image/png',body=__import__('base64').b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aPZsAAAAASUVORK5CYII='))
+                elif urlsplit(route.request.url).hostname!='127.0.0.1':external.append('blocked');route.abort()
                 elif '/static/fixture-' in route.request.url:route.fulfill(status=200,content_type='image/png',body=__import__('base64').b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aPZsAAAAASUVORK5CYII='))
                 else:route.continue_()
             context.route('**/*',restrict)
@@ -84,6 +92,14 @@ def main():
             page.get_by_role('button',name='消息中心',exact=True).click()
             page.get_by_role('button',name='测试买家',exact=False).first.click()
             original_node=page.locator('[data-message-id="source"]');expect(original_node).to_be_visible()
+            area=page.get_by_label('聊天消息区域',exact=True)
+            prevented=area.evaluate("e=>!e.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:600,clientY:300}))")
+            assert prevented
+            background=page.get_by_role('menu',name='聊天区域操作');expect(background).to_be_visible()
+            page.keyboard.press('ArrowDown');assert background.evaluate('e=>e.contains(document.activeElement)')
+            page.keyboard.press('Escape');expect(background).to_be_hidden()
+            expect(page.locator('img[src="https://img.alicdn.com/fixture-avatar.png"]').first).to_be_visible()
+            checks.append('background context menu prevents browser default, keyboard/Escape, cached buyer avatar')
             expect(original_node.locator('img[alt="[微笑]"]')).to_be_visible()
             page.get_by_role('button',name='选择表情',exact=True).click()
             emoji=page.get_by_role('button',name='表情 微笑',exact=True);expect(emoji.locator('img')).to_be_visible();emoji.click()
@@ -186,6 +202,36 @@ def main():
 
             page.set_viewport_size({'width':1280,'height':900})
             event_node=page.locator('[data-message-id="event"]');event_node.click(button='right');expect(menu.get_by_role('menuitem',name='引用回复')).to_be_disabled();expect(menu.get_by_role('menuitem',name='转发')).to_be_disabled();page.keyboard.press('Escape')
+            page.get_by_role('button',name='通知与日志',exact=True).click()
+            page.get_by_role('tab',name='账号通知',exact=True).click()
+            page.get_by_role('button',name='新建规则',exact=True).click()
+            rule_dialog=page.get_by_role('dialog',name='新建通知规则')
+            expect(rule_dialog.get_by_label('提醒次数（含首次）')).to_have_value('2')
+            expect(rule_dialog.get_by_label('提醒间隔（分钟）')).to_have_value('5')
+            rule_dialog.get_by_role('button',name='取消',exact=True).click()
+            page.get_by_title('编辑规则').first.click()
+            rule_dialog=page.get_by_role('dialog',name='编辑通知规则')
+            rule_dialog.get_by_label('提醒次数（含首次）').fill('3')
+            rule_dialog.get_by_label('提醒间隔（分钟）').fill('7')
+            rule_dialog.get_by_role('button',name='保存',exact=True).click()
+            expect(rule_dialog).to_be_hidden()
+            page.get_by_title('编辑规则').first.click()
+            rule_dialog=page.get_by_role('dialog',name='编辑通知规则')
+            expect(rule_dialog.get_by_label('提醒次数（含首次）')).to_have_value('3')
+            expect(rule_dialog.get_by_label('提醒间隔（分钟）')).to_have_value('7')
+            for theme in ('light','dark'):
+                page.evaluate("t=>{document.documentElement.classList.toggle('dark',t==='dark');document.documentElement.dataset.theme=t}",theme)
+                for width in (375,768,1280):
+                    page.set_viewport_size({'width':width,'height':850})
+                    field=rule_dialog.get_by_label('提醒次数（含首次）');field.scroll_into_view_if_needed()
+                    box=field.bounding_box();assert box and box['x']>=0 and box['x']+box['width']<=width+1
+                    page.screenshot(path=str(args.output/f'reminders-{theme}-{width}.png'))
+            checks.append('reminder editor defaults, save/readback, 375/768/1280 light/dark; no test-email click')
+            rule_dialog.get_by_role('button',name='取消',exact=True).click()
+            page.get_by_role('tab',name='风控日志',exact=True).click()
+            page.get_by_role('button',name='标记已处理',exact=True).click()
+            expect(page.get_by_text('本轮提醒已停止',exact=False)).to_be_visible()
+            checks.append('owned event acknowledgement stops current reminders in real HTTP UI')
             assert not errors,errors;assert not external,external
             (args.output/'result.json').write_text(json.dumps({'checks':checks,'page_errors':errors,'external_requests':external,'simulated_native_sends':len(frames)},ensure_ascii=False,indent=2));browser.close()
     finally:server.should_exit=True;thread.join(timeout=10);sock.close()

@@ -1,7 +1,7 @@
 import { confirmedMessage } from '../../lib/chatWorkspace.mjs';
 import { createPortal } from 'react-dom';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Copy, Forward, Reply, X, Search } from 'lucide-react';
+import { Copy, Forward, Reply, X, Search, ArrowDown, RefreshCw } from 'lucide-react';
 import { post } from '../../lib/request';
 import { notify } from '../../services/feedback';
 import type { ChatMessage } from '../../types';
@@ -23,7 +23,7 @@ export function MessageMenu({ target, close, quote, forward, capabilities }: {
   useLayoutEffect(() => {
     const box = menu.current?.getBoundingClientRect();
     if (box) setPosition({ left: Math.max(8, Math.min(target.x, innerWidth - box.width - 8)), top: Math.max(8, Math.min(target.y, innerHeight - box.height - 8)) });
-    menu.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+    menu.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus({preventScroll:true});
   }, [target]);
   useEffect(() => {
     const dismiss = (event: PointerEvent) => { if (!menu.current?.contains(event.target as Node)) close(); };
@@ -38,7 +38,7 @@ export function MessageMenu({ target, close, quote, forward, capabilities }: {
   const allowed = actionable(target.message) && capabilities.reply_text?.supported;
   const canForward = Boolean(capabilities[target.message.type==='image'?'forward_image':'forward_text']?.supported && target.message.canForward && confirmedMessage(target.message));
   return createPortal(<div ref={menu} role="menu" aria-label="消息操作" className="message-context-menu" style={position}
-    onContextMenu={event => event.preventDefault()} onKeyDown={event => {
+    onContextMenu={event => { event.preventDefault();event.stopPropagation(); }} onKeyDown={event => {
       if (event.key === 'Escape') { event.preventDefault();close(); }
       if (['ArrowDown','ArrowUp','Home','End'].includes(event.key)) {
         event.preventDefault();const items = Array.from(menu.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || []) as HTMLButtonElement[];
@@ -54,6 +54,19 @@ export function MessageMenu({ target, close, quote, forward, capabilities }: {
     <button role="menuitem" disabled={!canForward} title={canForward ? '转发到当前账号的会话' : capabilities[target.message.type==='image'?'forward_image':'forward_text']?.reason || '此消息暂不支持转发'} onClick={() => { close();forward(); }}><Forward size={16} />转发</button>
     {!allowed && <p className="px-3 py-2 text-[11px] text-[var(--text-soft)]">{!capabilities.reply_text?.supported ? capabilities.reply_text?.reason || '原生引用验收中' : '仅支持有平台记录的文字与图片'}</p>}
     {fallback && <label className="block p-2 text-xs">剪贴板不可用，请选中复制<textarea autoFocus readOnly value={fallback} onFocus={e => e.currentTarget.select()} className="ios-input mt-2 w-full rounded p-2" /></label>}
+  </div>,document.body);
+}
+export type AreaMenuTarget = { x: number; y: number; anchor: HTMLElement };
+export function ChatAreaMenu({target,close,bottom,refresh}: {target:AreaMenuTarget;close:()=>void;bottom:()=>void;refresh:()=>void}) {
+  const ref=useRef<HTMLDivElement>(null);
+  const [position,setPosition]=useState({left:target.x,top:target.y});
+  useLayoutEffect(()=>{const box=ref.current?.getBoundingClientRect();if(box)setPosition({left:Math.max(8,Math.min(target.x,innerWidth-box.width-8)),top:Math.max(8,Math.min(target.y,innerHeight-box.height-8))});ref.current?.querySelector('button')?.focus({preventScroll:true});},[target]);
+  useEffect(()=>{const outside=(e:PointerEvent)=>{if(!ref.current?.contains(e.target as Node))close();};document.addEventListener('pointerdown',outside);window.addEventListener('resize',close);return()=>{document.removeEventListener('pointerdown',outside);window.removeEventListener('resize',close);target.anchor.focus({preventScroll:true});};},[target,close]);
+  return createPortal(<div ref={ref} role="menu" aria-label="聊天区域操作" className="message-context-menu" style={position}
+    onContextMenu={e=>{e.preventDefault();e.stopPropagation();}}
+    onKeyDown={e=>{if(e.key==='Escape'||e.key==='Tab'){close();return;}if(['ArrowDown','ArrowUp','Home','End'].includes(e.key)){e.preventDefault();const items=Array.from(ref.current?.querySelectorAll<HTMLButtonElement>('button')||[]) as HTMLButtonElement[];const i=items.indexOf(document.activeElement as HTMLButtonElement);items[e.key==='Home'?0:e.key==='End'?items.length-1:(i+1)%items.length]?.focus({preventScroll:true});}}}>
+    <button role="menuitem" onClick={()=>{close();bottom();}}><ArrowDown size={16}/>回到最新消息</button>
+    <button role="menuitem" onClick={()=>{close();refresh();}}><RefreshCw size={16}/>刷新消息</button>
   </div>,document.body);
 }
 export type ForwardRecipient = { cid: string; otherUserId: string; otherUserName: string; itemTitle: string; lastMessageTime: number };
@@ -100,7 +113,7 @@ export function ForwardDialog({ owner, account, accountName, scopeLabel, scopeKe
       </section>
       <label className="flex items-center gap-2"><Search size={16} className="shrink-0" /><input aria-label="搜索转发会话" disabled={busy || uncertain} className="ios-input min-w-0 w-full rounded-md px-3 py-2 text-sm" placeholder="在当前筛选结果中搜索联系人或商品" value={search} onChange={e => setSearch(e.target.value)} /></label>
       <div className="max-h-64 space-y-1 overflow-auto" role="listbox" aria-label="选择转发目标">
-        {candidates.map(c => <button type="button" role="option" aria-selected={target===c.cid} disabled={busy || uncertain} key={c.cid}
+        {candidates.map(c => <button type="button" role="option" aria-selected={target===c.cid} disabled={busy || uncertain} key={c.cid} data-conversation-id={c.cid}
           className={`block min-h-11 w-full rounded-md border px-3 py-2 text-left text-sm ${target===c.cid?'border-[var(--brand)] bg-[var(--brand-soft)]':'border-transparent hover:bg-[var(--surface-hover)]'}`}
           onClick={() => { setTarget(c.cid);request.current=crypto.randomUUID(); }}>
           <span className="block break-words font-bold">{c.otherUserName || c.otherUserId}{c.cid===sourceCid?'（当前会话）':''}</span>

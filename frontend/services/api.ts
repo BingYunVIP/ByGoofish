@@ -1126,6 +1126,8 @@ export const getMessageNotifications = async (): Promise<{ success: boolean; dat
           name: item.name ?? null,
           event_types: item.event_types ?? null,
           enabled: item.enabled,
+          reminder_limit: item.reminder_limit ?? 2,
+          reminder_interval_minutes: item.reminder_interval_minutes ?? 5,
         });
       }
     }
@@ -1137,23 +1139,25 @@ export const setMessageNotification = async (
   cookieId: string,
   channelId: number,
   enabled: boolean,
-  rule?: { name?: string; eventTypes?: string[] | null },
+  rule?: { name?: string; eventTypes?: string[] | null; reminderLimit?: number; reminderInterval?: number },
 ): Promise<ApiResponse & { id?: number }> => {
   return post(`/message-notifications/${cookieId}`, {
     channel_id: channelId,
     enabled,
-    ...(rule ? { name: rule.name ?? '', event_types: rule.eventTypes ?? [] } : {}),
+    ...(rule ? { name: rule.name ?? '', event_types: rule.eventTypes ?? [], reminder_limit: rule.reminderLimit ?? 2, reminder_interval_minutes: rule.reminderInterval ?? 5 } : {}),
   });
 }
 
 export const updateMessageNotificationRule = async (
   ruleId: string,
-  data: { name?: string; eventTypes?: string[]; enabled?: boolean },
+  data: { name?: string; eventTypes?: string[]; enabled?: boolean; reminderLimit?: number; reminderInterval?: number },
 ): Promise<ApiResponse> => {
   const payload: Record<string, unknown> = {};
   if (data.name !== undefined) payload.name = data.name;
   if (data.eventTypes !== undefined) payload.event_types = data.eventTypes;
   if (data.enabled !== undefined) payload.enabled = data.enabled;
+  if (data.reminderLimit !== undefined) payload.reminder_limit = data.reminderLimit;
+  if (data.reminderInterval !== undefined) payload.reminder_interval_minutes = data.reminderInterval;
   return put(`/message-notifications/rule/${ruleId}`, payload);
 }
 
@@ -1498,3 +1502,5 @@ export const createQuoteBook = async (file: File): Promise<{
 
 export const deleteQuoteBook = async (bookId: number): Promise<{ success: boolean }> =>
   del(`/api/logistics/quote-books/${bookId}`);
+
+export const acknowledgeNotification = (logId: number) => post(`/notification-incidents/${logId}/acknowledge`, {});

@@ -171,7 +171,9 @@ class NotificationTemplateTests(unittest.IsolatedAsyncioTestCase):
         instance._send_webhook_notification = AsyncMock()
         for event in ['delivery_timeout', 'buyer_message', 'credentials_invalid', 'delivery_failed']:
             self.db.set_user_setting(self.owner, PREFIX + event, f'定制{event} {{{{account}}}}')
-        channels = [{'id': 999, 'enabled': True, 'channel_type': 'webhook', 'channel_config': '{}'}]
+        channel=self.db.create_notification_channel('fixture','webhook','{}',self.owner)
+        self.db.create_notification_rule('template-account',channel,event_types=['delivery_timeout','buyer_message','credentials_invalid','delivery_failed'])
+        channels=self.db.get_account_notifications('template-account',self.owner)
         with patch.object(self.db, 'get_account_notifications', return_value=channels) as subscriptions:
             await instance.send_system_notification('original', 'delivery_timeout')
             await instance.send_notification('buyer', 'buyer-id', 'hello')
@@ -181,7 +183,7 @@ class NotificationTemplateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call.args[1] for call in instance._send_webhook_notification.await_args_list],
                          [f'定制{event} template-account' for event in ['delivery_timeout', 'buyer_message', 'credentials_invalid', 'delivery_failed']])
         self.assertEqual([call.kwargs['event_type'] for call in subscriptions.call_args_list],
-                         ['delivery_timeout', 'buyer_message', 'credentials_invalid', 'delivery_failed'])
+                         ['delivery_timeout', 'buyer_message', 'buyer_message', 'credentials_invalid', 'delivery_failed'])
 
     async def test_quick_phrase_image_upload_reference_is_validated_and_persisted(self):
         upload_root = Path(self.tmp.name) / 'uploads'
@@ -224,10 +226,11 @@ class NotificationTemplateTests(unittest.IsolatedAsyncioTestCase):
         import json
         from utils.slider_patch import send_notification
         self.db.set_user_setting(self.owner, PREFIX + 'login_verification_required', '请验证 {{account}}')
-        channels = [{'id': 999, 'enabled': True, 'channel_type': 'email', 'channel_config': json.dumps({
-            'smtp_server': 'smtp.example.test', 'smtp_port': 465, 'email_user': 'fixture@example.test',
-            'email_password': 'fixture', 'recipient_email': 'fixture@example.test',
-        })}]
+        channel=self.db.create_notification_channel('fixture','email',json.dumps({
+            'smtp_server':'smtp.example.test','smtp_port':465,'email_user':'fixture@example.test',
+            'email_password':'fixture','recipient_email':'fixture@example.test'}),self.owner)
+        self.db.create_notification_rule('template-account',channel,event_types=['login_verification_required'])
+        channels=self.db.get_account_notifications('template-account',self.owner)
         with patch.object(self.db, 'get_account_notifications', return_value=channels), \
              patch('app.services.smtp_delivery.send_message') as sender:
             sent = await asyncio.to_thread(send_notification, 'template-account', 'fixture', 'original',

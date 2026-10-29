@@ -393,6 +393,8 @@ export interface NotificationChannel {
 }
 
 export interface MessageNotification {
+  reminder_limit: number;
+  reminder_interval_minutes: number;
   id: string;
   cookie_id: string;
   channel_id: number;
@@ -425,6 +427,7 @@ export interface NotificationPriorityDefinition {
 }
 
 export interface RiskControlLog {
+  notification_incident?: { id: string; acknowledged: boolean; resolved: boolean; attempts: number } | null;
   id: number;
   cookie_id: string;
   cookie_name?: string;

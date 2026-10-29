@@ -3533,18 +3533,21 @@ class DBManager:
                 return False
 
     def create_notification_rule(self, cookie_id: str, channel_id: int, name: str = None,
-                                 event_types=None, enabled: bool = True) -> int:
+                                 event_types=None, enabled: bool = True, reminder_limit: int = 2,
+                                 reminder_interval_minutes: int = 5) -> int:
         """创建账号通知规则"""
         from app.notification_events import serialize_event_types
 
         serialized_event_types = serialize_event_types(event_types)
+        if type(reminder_limit) is not int or not 1 <= reminder_limit <= 10 or type(reminder_interval_minutes) is not int or not 5 <= reminder_interval_minutes <= 1440:
+            raise ValueError('提醒次数应为1–10次，间隔应为5–1440分钟')
         normalized_name = (name or '').strip() or None
         with self.lock:
             cursor = self.conn.cursor()
             cursor.execute('''
-            INSERT INTO message_notifications (cookie_id, channel_id, name, event_types, enabled)
-            VALUES (?, ?, ?, ?, ?)
-            ''', (cookie_id, channel_id, normalized_name, serialized_event_types, enabled))
+            INSERT INTO message_notifications (cookie_id, channel_id, name, event_types, enabled, reminder_limit, reminder_interval_minutes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (cookie_id, channel_id, normalized_name, serialized_event_types, enabled, reminder_limit, reminder_interval_minutes))
             self.conn.commit()
             rule_id = cursor.lastrowid
             logger.debug(f"创建通知规则: {cookie_id} -> {channel_id} (ID: {rule_id})")
@@ -3559,7 +3562,7 @@ class DBManager:
                 cursor = self.conn.cursor()
                 sql = '''
                 SELECT mn.id, mn.cookie_id, mn.channel_id, mn.name, mn.event_types,
-                       mn.enabled, nc.name, nc.type
+                       mn.enabled, nc.name, nc.type, mn.reminder_limit, mn.reminder_interval_minutes
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
                 WHERE mn.id = ?
@@ -3581,6 +3584,8 @@ class DBManager:
                     'enabled': bool(row[5]),
                     'channel_name': row[6],
                     'channel_type': row[7],
+                    'reminder_limit': row[8],
+                    'reminder_interval_minutes': row[9],
                 }
             except Exception as e:
                 logger.error(f"获取通知规则失败: {e}")
@@ -3631,27 +3636,31 @@ class DBManager:
                 return None
 
     def update_notification_rule(self, rule_id: int, name: str = None, event_types=None,
-                                 enabled: bool = True, user_id: int = None) -> bool:
+                                 enabled: bool = True, user_id: int = None, reminder_limit=None,
+                                 reminder_interval_minutes=None) -> bool:
         """更新通知规则的名称、订阅事件和启用状态"""
         from app.notification_events import serialize_event_types
 
         serialized_event_types = serialize_event_types(event_types)
         normalized_name = (name or '').strip() or None
+        for value,minimum,maximum in ((reminder_limit,1,10),(reminder_interval_minutes,5,1440)):
+            if value is not None and (type(value) is not int or not minimum<=value<=maximum):
+                raise ValueError('提醒设置超出范围')
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 if user_id is not None:
                     cursor.execute('''
                     UPDATE message_notifications
-                    SET name = ?, event_types = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+                    SET name = ?, event_types = ?, enabled = ?, reminder_limit=COALESCE(?,reminder_limit), reminder_interval_minutes=COALESCE(?,reminder_interval_minutes), updated_at = CURRENT_TIMESTAMP
                     WHERE id = ? AND cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)
-                    ''', (normalized_name, serialized_event_types, enabled, rule_id, user_id))
+                    ''', (normalized_name, serialized_event_types, enabled, reminder_limit, reminder_interval_minutes, rule_id, user_id))
                 else:
                     cursor.execute('''
                     UPDATE message_notifications
-                    SET name = ?, event_types = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+                    SET name = ?, event_types = ?, enabled = ?, reminder_limit=COALESCE(?,reminder_limit), reminder_interval_minutes=COALESCE(?,reminder_interval_minutes), updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                    ''', (normalized_name, serialized_event_types, enabled, rule_id))
+                    ''', (normalized_name, serialized_event_types, enabled, reminder_limit, reminder_interval_minutes, rule_id))
                 self.conn.commit()
                 logger.debug(f"更新通知规则: {rule_id}")
                 return cursor.rowcount > 0
@@ -3670,7 +3679,7 @@ class DBManager:
                 cursor = self.conn.cursor()
                 sql = '''
                 SELECT mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config,
-                       mn.name, mn.event_types
+                       mn.name, mn.event_types, mn.reminder_limit, mn.reminder_interval_minutes
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
                 JOIN cookies c ON mn.cookie_id = c.id
@@ -3699,6 +3708,8 @@ class DBManager:
                         'channel_config': row[5],
                         'name': row[6],
                         'event_types': rule_event_types,
+                        'reminder_limit': row[8],
+                        'reminder_interval_minutes': row[9],
                     })
 
                 return notifications
@@ -3715,7 +3726,7 @@ class DBManager:
                 cursor = self.conn.cursor()
                 sql = '''
                 SELECT mn.cookie_id, mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config,
-                       mn.name, mn.event_types, nc.enabled
+                       mn.name, mn.event_types, nc.enabled, mn.reminder_limit, mn.reminder_interval_minutes
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
                 JOIN cookies c ON mn.cookie_id = c.id
@@ -3745,6 +3756,8 @@ class DBManager:
                         'name': row[7],
                         'event_types': parse_event_types(row[8]),
                         'channel_enabled': bool(row[9]),
+                        'reminder_limit': row[10],
+                        'reminder_interval_minutes': row[11],
                     })
 
                 return result

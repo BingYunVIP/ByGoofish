@@ -4296,11 +4296,9 @@ class XianyuLive:
         return await event_journal.dispatch(db_manager,self,event_type,message,context=context)
 
     async def send_notification(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None, chat_id: str = None, *, message_time=None):
-        """Notify once per incoming message; no message body is persisted."""
+        """Claim each incoming message once; bounded reminders retain only event metadata."""
         from app.db_manager import db_manager
         from app.services import notification_reconciliation as receipts
-        from app.services.notification_templates import render_account_notification
-        from app.services.notification_delivery import deliver
         if send_message in ('发来一条消息', '发来一条新消息'):
             return 0
         notifications = db_manager.get_account_notifications(self.cookie_id, event_type='buyer_message')
@@ -4312,15 +4310,14 @@ class XianyuLive:
         if not receipts.claim(db_manager, self.cookie_id, chat_id or '', send_user_id, send_message, message_time):
             return 0
         key = receipts.message_key(chat_id or '', send_user_id, send_message, message_time)
-        from app.services.event_journal import observe
-        observe(db_manager,self.cookie_id,'buyer_message','收到买家私聊消息',context=key)
         message = (f'接收消息通知\n账号: {self.cookie_id}\n买家: {send_user_name} (ID: {send_user_id})\n'
                    f'商品ID: {item_id or "未知"}\n聊天ID: {chat_id or "未知"}\n消息内容: {send_message}\n'
                    f'时间: {time.strftime("%Y-%m-%d %H:%M:%S")}')
         try:
-            message = render_account_notification(db_manager, self.cookie_id, 'buyer_message', message,
-                        buyer=send_user_name, buyer_id=send_user_id, item_id=item_id or '', chat_id=chat_id or '')
-            sent = await deliver(self, notifications, 'buyer_message', message)
+            from app.services.event_journal import dispatch
+            sent = await dispatch(db_manager,self,'buyer_message',message,context=key,
+                reminder_detail='收到买家私聊消息，尚未确认人工回复或处理；请在消息中心查看原消息。',
+                values={'buyer':send_user_name,'buyer_id':send_user_id,'item_id':item_id or '', 'chat_id':chat_id or ''})
         except BaseException:
             receipts.finish(db_manager, self.cookie_id, key, 'unknown')
             raise
@@ -4694,7 +4691,7 @@ class XianyuLive:
             logger.error(f"发送Telegram通知异常: {self._safe_str(e)}")
 
     async def send_token_refresh_notification(self, error_message: str, notification_type: str = "transient_warning", chat_id: str = None, attachment_path: str = None, verification_url: str = None, *, event_context=None):
-        """Record the explicit event and deliver once per incident and subscribed rule."""
+        """Record the explicit event and apply the subscribed rule reminder budget."""
         from app.db_manager import db_manager
         from app.notification_events import get_event, resolve_event_type
         from app.services import auth_recovery, event_journal
@@ -4708,18 +4705,25 @@ class XianyuLive:
             context = recovery.get('incident_id') or str(time.time_ns())
         # The body is rendered once using catalog metadata and the user template.
         # The journal stores only a redacted diagnostic, never buyer message text.
+        notification_values={'chat_id': chat_id or ''}
+        if event_type in ('buyer_interaction_failed','buyer_info_incomplete') and event_context:
+            parts=str(event_context).split(':',1)
+            notification_values['order_id']=parts[0]
+            if len(parts)>1:notification_values['interaction_action']=parts[1]
         return await event_journal.dispatch(db_manager, self, event_type, error_message,
             context=context, attachment_path=attachment_path,
-            verification_url=verification_url or '', values={'chat_id': chat_id or ''})
+            verification_url=verification_url or '', values=notification_values)
 
     async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str, item_id: str, error_message: str, chat_id: str = None, *, event_type: str = 'delivery_failed', order_id: str = ''):
         """按实际发货结果事件投递通知。"""
         from app.db_manager import db_manager
         from app.services import event_journal
         detail = f"买家：{send_user_name}\n商品ID：{item_id}\n结果：{error_message}"
-        context = order_id or f"{chat_id or ''}:{item_id}:{error_message}"
+        context = order_id or f"{chat_id or ''}:{item_id}"
+        if event_type=='delivery_success' and order_id:
+            event_journal.resolve_order(db_manager,self.cookie_id,order_id,'shipped')
         return await event_journal.dispatch(db_manager,self,event_type,detail,context=context,
-            values={'buyer':send_user_name,'buyer_id':send_user_id,'item_id':item_id or '','chat_id':chat_id or ''})
+            values={'buyer':send_user_name,'buyer_id':send_user_id,'item_id':item_id or '','chat_id':chat_id or '', 'order_id':order_id})
 
     async def auto_confirm(self, order_id, item_id=None, retry_count=0):
         """自动确认发货 - 使用加密模块，不包含延时处理（延时已在_auto_delivery中处理）"""
@@ -6701,19 +6705,13 @@ class XianyuLive:
         if not alerts:
             return 0
 
-        lines = [f"⚠️ 发货超时提醒（账号 {self.cookie_id}）", ""]
-        for label, parsed in alerts:
-            lines.append(
-                f"[{label}] 订单 {parsed['order_id']}\n"
-                f"  商品: {parsed.get('item_title') or '未知'}\n"
-                f"  金额: {parsed.get('amount') or '未知'}\n"
-                f"  下单: {parsed.get('created_at') or '未知'}"
-            )
-        lines.append("")
-        lines.append("请尽快处理，超时未发货会被平台处罚。")
-
-        message = "\n".join(lines)
-        sent = await self.send_system_notification(message)
+        from app.db_manager import db_manager
+        from app.services.event_journal import dispatch
+        sent=0
+        for label,parsed in alerts:
+            sent += await dispatch(db_manager,self,'delivery_timeout',
+                f"[{label}] 订单 {parsed['order_id']}；请核对平台状态，及时处理。",
+                context=parsed['order_id'],values={'order_id':parsed['order_id']})
         logger.warning(
             f"【{self.cookie_id}】发货超时告警: {len(alerts)} 个订单，已推送 {sent} 个渠道"
         )

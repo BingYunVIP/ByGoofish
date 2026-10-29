@@ -41,13 +41,13 @@ class AccountOfflineTests(unittest.IsolatedAsyncioTestCase):
     async def check(self,seconds=0):
         return await offline.check_once(self.db,self.manager,self.now+seconds)
 
-    async def test_persistent_offline_incident_notifies_once_and_survives_restart(self):
+    async def test_persistent_offline_incident_has_two_reminders_and_survives_restart(self):
         self.assertEqual(await self.check(91),1)
-        self.assertEqual(await self.check(391),0)
+        self.assertEqual(await self.check(390),0)
+        self.assertEqual(await self.check(392),1)
         self.db.close();self.db=DBManager(self.path)
-        self.assertEqual(await self.check(691),0)
-        self.assertEqual(self.email.await_count,1)
-        self.email.assert_awaited_once()
+        self.assertEqual(await self.check(9999),0)
+        self.assertEqual(self.email.await_count,2)
         self.assertTrue(self.email.await_args.kwargs['strict'])
 
     async def test_transient_disconnect_has_grace(self):
@@ -86,19 +86,21 @@ class AccountOfflineTests(unittest.IsolatedAsyncioTestCase):
         await self.check(91);await self.check(121)
         self.assertEqual(self.email.await_count,1)
         await self.check(392);await self.check(1000);await self.check(9999)
-        self.assertEqual(self.email.await_count,3)
-        self.assertEqual(self.db.conn.execute('SELECT status FROM account_offline_notices').fetchone()[0],'failed')
+        self.assertEqual(self.email.await_count,2)
+        self.assertEqual(self.db.conn.execute('SELECT status FROM operational_notices').fetchone()[0],'failed')
 
     async def test_unknown_submission_is_not_retried(self):
         self.email.side_effect=DeliveryUncertain('fixture')
         await self.check(91);await self.check(9999)
         self.assertEqual(self.email.await_count,1)
-        self.assertEqual(self.db.conn.execute('SELECT status FROM account_offline_notices').fetchone()[0],'unknown')
+        self.assertEqual(self.db.conn.execute('SELECT status FROM operational_notices').fetchone()[0],'unknown')
 
     async def test_inflight_restart_claim_becomes_unknown(self):
         self.db.conn.execute('INSERT OR REPLACE INTO account_offline_incidents VALUES(?,?,?,?,NULL)',('offline-fixture','incident',self.now,'message_verification_required'))
         self.db.conn.execute('INSERT INTO account_offline_notices VALUES(?,?,?,?,?,?,?)',('offline-fixture','incident',self.rule,'sending',1,0,self.now));self.db.conn.commit()
-        offline.initialize(self.db)
+        from app.services import event_journal
+        incident=event_journal.observe(self.db,'offline-fixture','account_offline','fixture',context='incident')
+        event_journal.initialize(self.db)
         await self.check(999)
         self.email.assert_not_awaited()
 

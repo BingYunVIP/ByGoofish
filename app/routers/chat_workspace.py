@@ -81,40 +81,34 @@ async def buyer_identity(db, uid, cookie_id, buyer, snapshot, run_account, cid="
     cached = store.buyer_profile(db, uid, cookie_id, buyer)
     if cached["nickname"]:
         return cached["nickname"], "public_profile_cache"
+    cached=await fetch_buyer_profile(db,uid,cookie_id,buyer,run_account)
+    return cached['nickname'], 'public_profile' if cached['nickname'] else 'unavailable'
+
+
+async def fetch_buyer_profile(db,uid,cookie_id,buyer,run_account,*,need_avatar=False):
     from app.services.auth_recovery import auth_paused
     from utils.risk_control import registry
-
-    if (not buyer or not db.get_cookie_status(cookie_id) or auth_paused(cookie_id)
-            or registry.get(cookie_id).is_blocked):
-        return "", "unavailable"
-    if not store.claim_buyer_profile_fetch(db, uid, cookie_id, buyer):
-        return "", "unavailable"
-    nickname = ""
+    if (not buyer or not db.get_cookie_status(cookie_id) or auth_paused(cookie_id) or registry.get(cookie_id).is_blocked):
+        return store.buyer_profile(db,uid,cookie_id,buyer)
+    if not store.claim_buyer_profile_fetch(db,uid,cookie_id,buyer,need_avatar=need_avatar):
+        return store.buyer_profile(db,uid,cookie_id,buyer)
+    profile={}
     try:
         async def read(instance):
             from utils.xianyu_seller_api import XianyuSellerAPI, parse_user_profile
-
-            original = instance.cookies_str
-            async with XianyuSellerAPI(cookie_id, original) as api:
-                profile = parse_user_profile(await api.get_user_profile(buyer))
-                # A concurrent login must not be overwritten by this older request.
-                if instance.cookies_str == original and api.cookies_str != original:
+            original=instance.cookies_str
+            async with XianyuSellerAPI(cookie_id,original) as api:
+                result=parse_user_profile(await api.get_user_profile(buyer))
+                if instance.cookies_str==original and api.cookies_str!=original:
                     from utils.xianyu_utils import trans_cookies
-                    instance.cookies_str = api.cookies_str
-                    instance.cookies = trans_cookies(api.cookies_str)
-                return profile.get("nickname") or ""
-
-        nickname = str(await asyncio.wait_for(run_account(cookie_id, read), timeout=8)).strip()
-        if not store._valid_nickname(nickname):
-            nickname = ""
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        # A failed profile lookup must not hide the existing conversation/order context.
-        pass
+                    instance.cookies_str=api.cookies_str;instance.cookies=trans_cookies(api.cookies_str)
+                return result
+        profile=await asyncio.wait_for(run_account(cookie_id,read),timeout=8)
+    except asyncio.CancelledError:raise
+    except Exception:pass
     finally:
-        store.finish_buyer_profile_fetch(db, uid, cookie_id, buyer, nickname)
-    return nickname, "public_profile" if nickname else "unavailable"
+        store.finish_buyer_profile_fetch(db,uid,cookie_id,buyer,profile.get('nickname',''),avatar_url=profile.get('avatar_url',''))
+    return store.buyer_profile(db,uid,cookie_id,buyer)
 
 
 async def send_once(
@@ -160,6 +154,7 @@ async def send_once(
         return response(row)
     status = "unknown"
     message_id = ""
+    reply_started_at = time.time()
     try:
 
         async def run(instance):
@@ -189,6 +184,12 @@ async def send_once(
         if not isinstance(result, dict) or (str(code) != "200" and not message_id):
             raise RuntimeError("缺少消息服务成功回执")
         status = "sent"
+        try:
+            from app.services.event_journal import resolve_chat
+            resolve_chat(db,cookie_id,cid,reply_started_at)
+        except Exception:
+            from loguru import logger
+            logger.warning('消息已确认发送，通知处理状态更新未完成')
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -301,6 +302,10 @@ def create_chat_workspace_router(
             snap.get("itemId") or "", [*exact, *candidates]
         )
         store.repair_buyer_nickname(db, uid, cookie_id, cid, buyer, nickname)
+        avatar=store.valid_avatar(snap.get('otherUserAvatar'))
+        if not avatar:
+            profile=await fetch_buyer_profile(db,uid,cookie_id,buyer,run_account,need_avatar=True)
+            avatar=store.valid_avatar(profile.get('avatar_url'))
         expires = store.handover(db, cookie_id, cid)
         return {
             "success": True,
@@ -310,6 +315,7 @@ def create_chat_workspace_router(
                     "id": buyer,
                     "nickname": nickname,
                     "nickname_source": nickname_source,
+                    "avatar_url": avatar,
                     "note": s.get("note", ""),
                 },
                 "item": {

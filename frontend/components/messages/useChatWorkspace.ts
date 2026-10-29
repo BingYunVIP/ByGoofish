@@ -241,8 +241,8 @@ export default function useChatWorkspace(isActive: boolean) {
         setContextScope(a + '\u0000' + c);
         setContext(r.data);
         setContextError('');
-        if (r.data.buyer.nickname) setConversations((old) => old.map((v) =>
-          v.cid === c ? { ...v, otherUserName: r.data.buyer.nickname } : v));
+        if (r.data.buyer.nickname || r.data.buyer.avatar_url) setConversations((old) => old.map((v) =>
+          v.cid === c ? { ...v, otherUserName: r.data.buyer.nickname || v.otherUserName, otherUserAvatar: r.data.buyer.avatar_url || v.otherUserAvatar } : v));
         setOutgoing((old) => mergeOutgoing(old, r.data.outgoing || [], a + '\u0000' + c, a));
       }
     } catch (e) {
