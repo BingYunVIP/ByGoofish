@@ -168,6 +168,8 @@ def parse_conversation(raw: Dict[str, Any], my_id: str) -> Optional[Dict[str, An
 
         first = _strip_domain(conversation.get("pairFirst"))
         second = _strip_domain(conversation.get("pairSecond"))
+        if not my_id or str(my_id) not in (first, second) or first == second:
+            return None
         other_id = second if first == str(my_id) else first
         if not other_id or other_id == "0":
             return None
@@ -195,7 +197,7 @@ def parse_conversation(raw: Dict[str, Any], my_id: str) -> Optional[Dict[str, An
             "otherUserAvatar": str(
                 extension.get("avatar")
                 or extension.get("avatarUrl")
-                or last_extension.get("senderAvatar")
+                or (last_extension.get("senderAvatar") if sender_id == other_id else "")
                 or ""
             ),
             "itemId": str(extension.get("itemId") or ""),

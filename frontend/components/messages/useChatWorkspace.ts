@@ -14,9 +14,9 @@ import type {
   OutgoingMessage,
   WorkspaceConversation,
 } from './workspaceTypes';
-import { dateRangeBounds, timestampInRange } from '../DateRangeFilter';
+import { dateRangeBounds } from '../DateRangeFilter';
 import { notify } from '../../services/feedback';
-import { draftKey, mergeMessages, mergeOutgoing, messageTimeline, unread } from '../../lib/chatWorkspace.mjs';
+import { draftKey, mergeMessages, mergeOutgoing, messageTimeline, unread, selectConversations } from '../../lib/chatWorkspace.mjs';
 export { draftKey, mergeMessages, unread };
 const readDraft = (key: string) => {
   try {
@@ -432,32 +432,9 @@ export default function useChatWorkspace(isActive: boolean) {
     setPane('chat');
   };
   const visibleConversations = useMemo(
-    () =>
-      (conversationAccount === accountId ? conversations : [])
-        .filter((v) =>
-          timestampInRange(v.lastMessageTime, dateRangeBounds({ preset: days, start: '', end: '' }))
-        )
-        .filter(
-          (v) =>
-            !query ||
-            [v.otherUserName, v.otherUserId, v.itemTitle, v.lastMessageSummary].some((x) =>
-              String(x || '')
-                .toLowerCase()
-                .includes(query.toLowerCase())
-            )
-        )
-        .filter((v) =>
-          filter === 'unread'
-            ? unread(v) > 0
-            : filter === 'pending'
-              ? v.workspace?.needs_reply
-              : true
-        )
-        .sort(
-          (a, b) =>
-            Number(Boolean(b.workspace?.pinned)) - Number(Boolean(a.workspace?.pinned)) ||
-            b.lastMessageTime - a.lastMessageTime
-        ),
+    () => selectConversations(conversationAccount === accountId ? conversations : [], {
+      bounds: dateRangeBounds({ preset: days, start: '', end: '' }), query, filter,
+    }) as WorkspaceConversation[],
     [conversations, days, query, filter, conversationAccount, accountId]
   );
   const send = async (file?: File) => {

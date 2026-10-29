@@ -128,6 +128,19 @@ async def send_reply(instance, cid, recipient, source, text=None, image=None, *,
     return response
 
 
+async def validate_forward_reference(instance, target_cid, recipient, source):
+    message, parsed = source
+    reference = parsed.get('reply')
+    source_cid = str(message.get('cid') or '').split('@')[0]
+    if reference and str(target_cid).split('@')[0] != source_cid:
+        # Native references are conversation-scoped; never emit a dangling pointer.
+        try:
+            await resolve_source(instance, target_cid, reference['messageId'], recipient, allow_quote=True)
+        except HTTPException as error:
+            raise HTTPException(409, '目标会话无法核实被引用的原消息，不能转发此引用消息',
+                                headers={'X-Chat-Send-Status': 'not_sent'}) from error
+
+
 async def forward(instance, target_cid, recipient, source, *, db=None, client_request_id=""):
     message, parsed = source
     request_id = generate_uuid()

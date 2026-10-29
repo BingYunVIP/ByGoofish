@@ -470,11 +470,12 @@ def create_chat_workspace_router(
         target_state=conversation(db,uid,cookie_id,body.target_cid)
         recipient=str(target_state['snapshot'].get('otherUserId') or '')
         if not recipient:raise HTTPException(400,'转发目标缺少参与者信息')
-        from app.services.message_actions import resolve_source, forward
+        from app.services.message_actions import resolve_source, forward, validate_forward_reference
         source=await run_account(cookie_id,lambda instance:resolve_source(instance,body.source_cid,body.message_id,str(source_state['snapshot'].get('otherUserId') or ''),allow_quote=True))
+        await run_account(cookie_id,lambda instance:validate_forward_reference(instance,body.target_cid,recipient,source))
         from app.services.native_capabilities import require
         require(db,uid,recipient,'forward_image' if source[1]['type']=='image' else 'forward_text')
-        result=await send_once(db,uid,cookie_id,body.target_cid,recipient,body.client_request_id,'text',
+        result=await send_once(db,uid,cookie_id,body.target_cid,recipient,body.client_request_id,source[1]['type'],
             json.dumps(['forward',body.source_cid,body.message_id,body.target_cid]).encode(),run_account,
             lambda instance:forward(instance,body.target_cid,recipient,source,db=db,client_request_id=body.client_request_id))
         if invalidate_account:invalidate_account(cookie_id)

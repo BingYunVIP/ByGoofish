@@ -64,3 +64,28 @@ export function shipOrderResult(response) {
     message: result?.message || '未取得本订单的成功结果，请核查发货记录后再操作',
   };
 }
+
+/** Both the sidebar and forwarding use exactly this filtered, stable ordering. */
+export function selectConversations(conversations, { bounds, query = '', filter = 'all' }) {
+  const needle = query.trim().toLocaleLowerCase();
+  const milliseconds = value => Number(value) < 1e12 ? Number(value) * 1000 : Number(value);
+  return conversations.filter(v => {
+    const time = milliseconds(v.lastMessageTime);
+    return Number.isFinite(time) && time > 0 && (!bounds ||
+      (time >= Date.parse(bounds.startTime) && time < Date.parse(bounds.endTime)));
+  }).filter(v => !needle || [v.otherUserName, v.otherUserId, v.itemTitle, v.lastMessageSummary]
+    .some(value => String(value || '').toLocaleLowerCase().includes(needle)))
+    .filter(v => filter === 'unread' ? unread(v) > 0 : filter === 'pending' ? v.workspace?.needs_reply : true)
+    .sort((a, b) => Number(Boolean(b.workspace?.pinned)) - Number(Boolean(a.workspace?.pinned)) ||
+      milliseconds(b.lastMessageTime) - milliseconds(a.lastMessageTime) || a.cid.localeCompare(b.cid));
+}
+
+/** Recipient picker data intentionally excludes notes, orders and message bodies. */
+export const forwardRecipients = conversations => conversations.map(v => ({
+  cid: v.cid, otherUserId: v.otherUserId, otherUserName: v.otherUserName,
+  itemTitle: v.itemTitle || '', lastMessageTime: v.lastMessageTime,
+}));
+
+/** A reconciled local echo is actionable only with its real platform record. */
+export const confirmedMessage = message => Boolean(message.messageId &&
+  message.messageId !== message.client_request_id && (!message.send_status || message.send_status === 'sent'));

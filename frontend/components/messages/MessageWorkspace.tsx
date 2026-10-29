@@ -1,3 +1,4 @@
+import { forwardRecipients } from '../../lib/chatWorkspace.mjs';
 import { createPortal } from 'react-dom';
 import { useModalFocus } from '../../lib/useModalFocus';
 import HandoverBanner from './HandoverBanner';
@@ -928,7 +929,11 @@ export default function MessageWorkspace({
           document.body
         )}
       {menu && <MessageMenu target={menu} capabilities={capabilities} close={closeMenu} quote={() => w.setReference(menu.message)} forward={() => setForwarding(menu.message)} />}
-      {forwarding && <ForwardDialog owner={w.owner} account={w.accountId} sourceCid={w.cid} message={forwarding} conversations={w.conversations} emojis={emojis}
+      {forwarding && <ForwardDialog owner={w.owner} account={w.accountId} sourceCid={w.cid} message={forwarding}
+        accountName={accountName} scopeKey={JSON.stringify([w.accountId,w.days,w.query,w.filter])}
+        scopeLabel={`${w.days === '30' ? '1个月内' : w.days+'天内'} · ${{all:'全部',unread:'未读',pending:'待回复'}[w.filter] || '全部'}${w.query ? ' · 搜索：'+w.query : ''}`}
+        recipients={forwardRecipients(w.visibleConversations)} hasMore={w.hasMore} loading={w.loading}
+        loadMore={() => void w.loadConversations(true)} emojis={emojis}
         close={() => setForwarding(undefined)} sent={target => { void w.loadConversations();if (target===w.cid) void w.loadMessages(); }} />}
     </div>
   );

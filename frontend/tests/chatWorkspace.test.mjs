@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { draftKey, mergeMessages, mergeOutgoing, messageTimeline, unread, shipOrderResult } from '../lib/chatWorkspace.mjs';
+import { draftKey, mergeMessages, mergeOutgoing, messageTimeline, unread, shipOrderResult, selectConversations, forwardRecipients, confirmedMessage } from '../lib/chatWorkspace.mjs';
 test('drafts are scoped to authenticated user, account and cid', () => {
   const keys = [
     draftKey(1, 'shop-a', 'chat'),
@@ -91,4 +91,35 @@ test('context refresh preserves local image and text, scopes records and cannot 
   assert.equal(result[0].send_status, 'sent');
   assert.equal(result[0].messageId, 'official');
   assert.equal(result[0].time, 10);
+});
+
+test('forward and sidebar share dates, search, unread, pending and pin ordering', () => {
+  const start = Date.parse('2026-10-23T00:00:00Z'), end = Date.parse('2026-10-30T00:00:00Z');
+  const bounds = { startTime: new Date(start).toISOString(), endTime: new Date(end).toISOString() };
+  const row = (cid, time, patch = {}) => ({ cid, lastMessageTime: time, otherUserName: 'Buyer',
+    otherUserId: cid, itemTitle: 'Product', lastMessageSummary: 'Hello', unreadCount: 1, ...patch });
+  const rows = [row('old',start-1),row('boundary',start/1000),row('new',end-1),row('future',end),
+    row('pin',start+1,{workspace:{pinned:true,needs_reply:true}}),row('invalid',0)];
+  const selected = selectConversations(rows,{bounds});
+  assert.deepEqual(selected.map(v=>v.cid),['pin','new','boundary']);
+  assert.deepEqual(selectConversations(rows,{bounds,query:'BUYER',filter:'pending'}).map(v=>v.cid),['pin']);
+  assert.equal(selectConversations(rows,{bounds,query:'missing'}).length,0);
+  const viewed = {...rows[2],workspace:{viewed_message_time:end,viewed_message_summary:'Hello',viewed_unread_count:1}};
+  assert.equal(selectConversations([viewed],{bounds,filter:'unread'}).length,0);
+  assert.equal(rows[0].cid,'old'); // never mutate the original page
+});
+test('forward recipients contain only minimum contact fields, not business context', () => {
+  const [recipient] = forwardRecipients([{cid:'c',otherUserId:'buyer',otherUserName:'Buyer',
+    lastMessageTime:1234,itemTitle:'Item',orders:[{address:'private'}],note:'private',lastMessageSummary:'private'}]);
+  assert.deepEqual(Object.keys(recipient).sort(),['cid','itemTitle','lastMessageTime','otherUserId','otherUserName'].sort());
+});
+
+test('only real confirmed platform messages permit forwarding after local echo reconciliation', () => {
+  const local={messageId:'request',client_request_id:'request',send_status:'sending'};
+  assert.equal(confirmedMessage(local),false);
+  assert.equal(confirmedMessage({...local,send_status:'sent'}),false);
+  assert.equal(confirmedMessage({...local,messageId:'platform',send_status:'unknown'}),false);
+  assert.equal(confirmedMessage({...local,messageId:'platform',send_status:'failed'}),false);
+  assert.equal(confirmedMessage({...local,messageId:'platform',send_status:'sent'}),true);
+  assert.equal(confirmedMessage({messageId:'platform'}),true);
 });

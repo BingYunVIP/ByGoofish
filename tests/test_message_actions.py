@@ -119,6 +119,37 @@ class NativeProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.live._send_im_request.side_effect=None;self.live._send_im_request.return_value={'code':200,'body':{'sendResults':{}}}
         with self.assertRaises(TimeoutError):await actions.forward(self.live,'target','target-buyer',source)
 
+    async def test_foreign_conversation_and_self_pair_are_not_parsed(self):
+        for first,second in [('stranger','buyer'),('seller','seller'),('','buyer')]:
+            self.assertIsNone(parse_conversation({'singleChatConversation':{'cid':'c','pairFirst':first,'pairSecond':second}},'seller'))
+
+    async def test_cross_conversation_quote_requires_original_in_target(self):
+        row=model('quoted','引用文本');row['message']['extension']['replyMessageId']='original'
+        source=(row['message'],parse_message(row,'seller'))
+        self.live.get_im_messages.return_value={'userMessageModels':[]}
+        with self.assertRaises(HTTPException) as error:
+            await actions.validate_forward_reference(self.live,'target','target-buyer',source)
+        self.assertEqual(error.exception.status_code,409)
+        self.live._send_im_request.assert_not_awaited()
+        self.live.get_im_messages.reset_mock()
+        await actions.validate_forward_reference(self.live,'source-chat','buyer',source)
+        self.live.get_im_messages.assert_not_awaited()
+
+    async def test_single_image_forward_preserves_url_and_dimensions(self):
+        row=model();row['message']['content']=actions.custom_content(image={'url':'https://img.alicdn.com/fixture.png','width':320,'height':180})
+        source=(row['message'],parse_message(row,'seller'))
+        async def frame(path,body):
+            entry=body[0]['forwardMessages'][0]
+            parsed=parse_message({'message':{'content':entry['content']}},'seller')
+            self.assertEqual(parsed['images'],['https://img.alicdn.com/fixture.png'])
+            decoded=json.loads(base64.b64decode(entry['content']['custom']['data']))
+            self.assertEqual(decoded['image']['pics'][0]['width'],320)
+            self.assertEqual(decoded['image']['pics'][0]['height'],180)
+            self.assertEqual(entry['extension'],{})
+            return {'code':200,'body':{'sendResults':{entry['uuid']:{'messageId':'image-result'}}}}
+        self.live._send_im_request.side_effect=frame
+        self.assertEqual((await actions.forward(self.live,'target','target-buyer',source))['body']['messageId'],'image-result')
+
 
 class MessageActionRouteTests(unittest.TestCase):
     def setUp(self):
@@ -156,6 +187,23 @@ class MessageActionRouteTests(unittest.TestCase):
         self.assertEqual(self.client.post('/chat/forward/foreign',json=self.payload).status_code,403)
         self.assertEqual(self.client.post('/chat/forward/seller',json={**self.payload,'target_cid':'not-loaded'}).status_code,404)
         self.assertEqual(self.sends,0)
+
+    def test_unresolvable_quote_is_rejected_before_claim_or_pause(self):
+        row=model();row['message']['extension']['replyMessageId']='missing-original'
+        self.live.get_im_messages.return_value={'userMessageModels':[row]}
+        response=self.client.post('/chat/forward/seller',json=self.payload)
+        self.assertEqual(response.status_code,409)
+        self.assertEqual(response.headers['X-Chat-Send-Status'],'not_sent')
+        self.assertEqual(self.sends,0)
+        self.assertEqual(self.db.conn.execute('SELECT count(*) FROM chat_send_attempts').fetchone()[0],0)
+
+    def test_image_forward_ledger_has_image_kind_and_no_image_body(self):
+        row=model();row['message']['content']=actions.custom_content(image={'url':'https://img.alicdn.com/fixture.png','width':20,'height':30})
+        self.live.get_im_messages.return_value={'userMessageModels':[row]}
+        response=self.client.post('/chat/forward/seller',json=self.payload)
+        self.assertEqual(response.json()['data']['status'],'sent')
+        self.assertEqual(self.db.conn.execute('SELECT kind FROM chat_send_attempts').fetchone()[0],'image')
+        self.assertNotIn('fixture.png',str(self.db.conn.execute('SELECT * FROM chat_send_attempts').fetchall()))
 
     def test_timeout_unknown_is_never_repeated(self):
         self.live._send_im_request.side_effect=TimeoutError()

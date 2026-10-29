@@ -301,3 +301,7 @@
 .message-action-row:focus-within .message-more { opacity: 1; }
 @media (hover: none) { .message-more { opacity: 1; } }
 .message-quote { display: block; width: 100%; margin-bottom: 8px; padding: 8px 10px; border-left: 3px solid var(--brand); border-radius: 4px; background: var(--surface-subtle); color: var(--text-muted); text-align: left; font-size: 12px; }
+
+.forward-dialog { max-width: 36rem; max-height: min(90dvh, 52rem); }
+.forward-dialog .modal-body { overscroll-behavior: contain; }
+.forward-dialog [role="option"]:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }

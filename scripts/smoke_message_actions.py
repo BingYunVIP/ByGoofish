@@ -36,11 +36,18 @@ def main():
     event=message('event','[我已付款，等待你发货]')
     histories={'source-chat':[original,image,event], 'target-chat':[message('target','目标会话内容','target-buyer','target-chat')]}
     def conv(cid,buyer,nick):
-        return {'singleChatUserConversation':{'modifyTime':now,'singleChatConversation':{'cid':cid+'@goofish','pairFirst':account,'pairSecond':buyer},'lastMessage':message('last',nick,buyer,cid)}}
+        row=message('last',nick,buyer,cid);row['message']['extension']['senderNick']=nick
+        return {'singleChatUserConversation':{'modifyTime':now,'singleChatConversation':{'cid':cid+'@goofish','pairFirst':account,'pairSecond':buyer},'lastMessage':row}}
     live=SimpleNamespace(cookie_id=account,myid=account,cookies_str='unb=fixture',connection_state=ConnectionState.CONNECTED,ws=SimpleNamespace(closed=False))
     async def history(cid,*a,**k):return {'userMessageModels':list(reversed(histories[cid])),'hasMore':False}
     live.get_im_messages=history
-    live.get_im_conversations=AsyncMock(return_value={'userConvs':[conv('source-chat','buyer','测试买家'),conv('target-chat','target-buyer','目标买家')],'hasMore':False})
+    old=conv('old-chat','old-buyer','旧会话');old['singleChatUserConversation']['modifyTime']=now-9*86400000
+    foreign=conv('foreign-chat','foreign-buyer','跨账号会话');foreign['singleChatUserConversation']['singleChatConversation']['pairFirst']='other-fixture'
+    older=conv('older-page-chat','old-buyer','更早会话');older['singleChatUserConversation']['modifyTime']=now-12*86400000
+    async def conversations(cursor=None,limit=30):
+        if cursor is not None:return {'userConvs':[older],'hasMore':False}
+        return {'userConvs':[conv('source-chat','buyer','测试买家'),conv('target-chat','target-buyer','目标买家'),old,foreign],'hasMore':True,'nextCursor':now-9*86400000}
+    live.get_im_conversations=AsyncMock(side_effect=conversations)
     frames=[]
     async def wire(lwp,body):
         frames.append({'lwp':lwp,'body':body})
@@ -70,6 +77,8 @@ def main():
                 elif '/static/fixture-' in route.request.url:route.fulfill(status=200,content_type='image/png',body=__import__('base64').b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aPZsAAAAASUVORK5CYII='))
                 else:route.continue_()
             context.route('**/*',restrict)
+            requests=[]
+            context.on('request',lambda req:requests.append(urlsplit(req.url).path))
             page=context.new_page();page.on('pageerror',lambda e:errors.append(str(e)));base=f'http://127.0.0.1:{sock.getsockname()[1]}'
             page.goto(base,wait_until='networkidle');page.get_by_placeholder('请输入账号').fill('admin');page.get_by_placeholder('请输入密码').fill('admin123');page.get_by_role('button',name='登录',exact=True).click()
             page.get_by_role('button',name='消息中心',exact=True).click()
@@ -90,12 +99,64 @@ def main():
             assert frames[0]['body'][0]['content']['contentType']==101
             assert frames[0]['body'][0]['extension']['replyMessageId']=='source'
             expect(page.locator('[data-message-id="reply-result"]').get_by_role('button',name='定位引用原消息')).to_be_visible()
-            checks.append('native quote request and receipt/history merge with quote display')
+            page.locator('[data-message-id="reply-result"]').click(button='right')
+            expect(menu.get_by_role('menuitem',name='转发',exact=True)).to_be_enabled();page.keyboard.press('Escape')
+            checks.append('native quote request and receipt/history merge with quote display; reconciled echo can forward')
             original_node.click(button='right');menu.get_by_role('menuitem',name='转发',exact=True).click()
             dialog=page.get_by_role('dialog',name='转发消息');expect(dialog).to_be_visible()
-            before=len(frames);dialog.get_by_role('option',name='目标买家',exact=False).click();assert len(frames)==before
+            expect(dialog.get_by_role('option')).to_have_count(2)
+            initial_calls=live.get_im_conversations.await_count
+            page.wait_for_timeout(200);assert live.get_im_conversations.await_count==initial_calls
+            dialog.get_by_role('button',name='加载更多会话（仍应用当前筛选）',exact=True).click()
+            expect(dialog.get_by_role('button',name='加载更多会话（仍应用当前筛选）',exact=True)).to_have_count(0)
+            assert live.get_im_conversations.await_count==initial_calls+1
+            expect(dialog.get_by_role('option')).to_have_count(2)
+            expect(dialog.get_by_role('option',name='旧会话',exact=False)).to_have_count(0)
+            expect(dialog.get_by_role('option',name='跨账号会话',exact=False)).to_have_count(0)
+            expect(dialog.get_by_label('转发筛选范围')).to_contain_text('7天内')
+            before=len(frames);before_requests=len(requests)
+            dialog.get_by_label('搜索转发会话').fill('目标');expect(dialog.get_by_role('option')).to_have_count(1)
+            dialog.get_by_role('option',name='目标买家',exact=False).click();assert len(frames)==before
+            assert not any('/chat/context/' in x or '/chat/messages/' in x for x in requests[before_requests:])
+            expect(dialog.get_by_label('转发接收方')).to_contain_text('目标买家')
             dialog.get_by_role('button',name='确认转发',exact=True).click();expect(dialog).to_be_hidden();assert len(frames)==before+1
             checks.append('one-account target selection and explicit confirmation before native forwarding')
+            # Sidebar search must also narrow forwarding; popup search cannot expand it.
+            sidebar_search=page.get_by_placeholder('搜索已加载会话')
+            sidebar_search.click();sidebar_search.fill('测试买家')
+            original_node.click(button='right');menu.get_by_role('menuitem',name='转发',exact=True).click()
+            expect(dialog.get_by_role('option')).to_have_count(1)
+            expect(dialog.get_by_label('转发筛选范围')).to_contain_text('搜索：测试买家')
+            dialog.get_by_label('搜索转发会话').fill('目标');expect(dialog.get_by_role('option')).to_have_count(0)
+            expect(dialog.get_by_role('button',name='确认转发',exact=True)).to_be_disabled()
+            dialog.get_by_role('button',name='取消',exact=True).click();sidebar_search.click();sidebar_search.fill('')
+            for theme in ('light','dark'):
+                page.evaluate("t=>{document.documentElement.classList.toggle('dark',t==='dark');document.documentElement.dataset.theme=t}",theme)
+                for width in (375,768,1280,1440):
+                    page.set_viewport_size({'width':width,'height':740})
+                    original_node.click(button='right');menu.get_by_role('menuitem',name='转发',exact=True).click()
+                    expect(dialog.get_by_role('option')).to_have_count(2)
+                    dialog.get_by_role('option',name='目标买家',exact=False).click()
+                    button=dialog.get_by_role('button',name='确认转发',exact=True);expect(button).to_be_in_viewport();expect(button).to_be_enabled()
+                    box=dialog.bounding_box();assert box and box['x']>=0 and box['x']+box['width']<=width+1
+                    page.screenshot(path=str(args.output/f'forward-{theme}-{width}.png'))
+                    dialog.get_by_role('button',name='取消',exact=True).click()
+            page.set_viewport_size({'width':1280,'height':900})
+            checks.append('forward follows sidebar date/search; no target context/history fetch; responsive preview and cancel zero sends')
+            image_node=page.locator('[data-message-id="image"]');image_node.click(button='right')
+            menu.get_by_role('menuitem',name='转发',exact=True).click()
+            expect(dialog.get_by_alt_text('转发图片预览')).to_be_visible()
+            dialog.get_by_role('option',name='目标买家',exact=False).click()
+            before=len(frames);dialog.get_by_role('button',name='取消',exact=True).click();assert len(frames)==before
+            sidebar_group=page.get_by_role('group',name='会话筛选')
+            sidebar_group.get_by_role('button',name='未读',exact=True).click()
+            original_node.click(button='right');menu.get_by_role('menuitem',name='转发',exact=True).click()
+            expect(dialog.get_by_label('转发筛选范围')).to_contain_text('未读')
+            expect(dialog.get_by_role('option')).to_have_count(0)
+            expect(dialog.get_by_role('button',name='确认转发',exact=True)).to_be_disabled()
+            dialog.get_by_role('button',name='取消',exact=True).click()
+            sidebar_group.get_by_role('button',name='全部',exact=True).click()
+            checks.append('manual-only history pagination retains dates; image preview cancel; sidebar unread scope')
             # The source needs a scoped draft after reference selection, including refresh.
             original_node.click(button='right');menu.get_by_role('menuitem',name='引用回复',exact=True).click()
             composer.fill('保留引用草稿');page.reload(wait_until='domcontentloaded');page.get_by_role('button',name='消息中心',exact=True).click();page.get_by_role('button',name='测试买家',exact=False).first.click()
