@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
+import AutoReplyActivity from './AutoReplyActivity';
 import {AccountDetail, ShippingRule, DefaultReply} from '../types';
 import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords } from '../services/api';
 import { Plus, Trash2, MessageSquare, X, Save, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot } from 'lucide-react';
@@ -78,6 +79,8 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
   });
 
   const [loading, setLoading] = useState(false);
+  const [savingDefault, setSavingDefault] = useState(false);
+  const [activityVersion, setActivityVersion] = useState(0);
 
   useEffect(() => {
     if (mode === 'delivery') {
@@ -308,24 +311,25 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
   };
 
   const handleSaveDefault = async () => {
-    if (!defaultForm.cookie_id) {
-      notify('请先选择账号');
-      return;
-    }
-
+    if (savingDefault) return;
+    if (!defaultForm.cookie_id) { notify('请先选择账号'); return; }
+    const snapshot = { ...defaultForm };
+    setSavingDefault(true);
     try {
-      await updateDefaultReply(defaultForm.cookie_id, {
-        enabled: defaultForm.enabled,
-        reply_content: defaultForm.reply_content,
-        reply_once: defaultForm.reply_once,
-        reply_image_url: defaultForm.reply_image_url
-      });
+      const result = await updateDefaultReply(snapshot.cookie_id, snapshot);
+      if (result.success !== true) throw new Error('服务端未确认保存成功');
+      const saved = await getDefaultReply(snapshot.cookie_id);
+      if (saved.enabled !== snapshot.enabled || saved.reply_content !== snapshot.reply_content ||
+          saved.reply_once !== snapshot.reply_once || (saved.reply_image_url || '') !== snapshot.reply_image_url) {
+        throw new Error('读取到的配置与本次提交不一致，请重新检查');
+      }
+      setDefaultReplies(current => ({ ...current, [snapshot.cookie_id]: saved }));
+      setActivityVersion(current => current + 1);
       setShowDefaultModal(false);
-      loadDefaultReplies();
-      notify('保存成功！');
+      notify('配置已保存，对新来信生效');
     } catch (e) {
-      notify('保存失败：' + (e as Error).message);
-    }
+      notify('保存结果未确认：' + (e as Error).message);
+    } finally { setSavingDefault(false); }
   };
 
   const handleDeleteDefault = async (cookieId: string) => {
@@ -630,6 +634,8 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
         </section>
       )}
 
+      {mode === 'reply' && selectedAccount && <AutoReplyActivity account={selectedAccount} version={activityVersion} />}
+
       {mode === 'reply' && showReplyModal && createPortal(
         <div className="modal-overlay">
           <div className="modal-container">
@@ -766,11 +772,11 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
                 <h3 className="text-lg font-bold text-gray-900">账号默认回复</h3>
                 <p className="mt-1 text-sm text-gray-500">关键词规则未命中时使用此内容。</p>
               </div>
-              <button type="button" onClick={() => setShowDefaultModal(false)} className="rounded-md p-2 hover:bg-gray-100" aria-label="关闭">
+              <button type="button" disabled={savingDefault} onClick={() => setShowDefaultModal(false)} className="rounded-md p-2 hover:bg-gray-100" aria-label="关闭">
                 <X className="h-5 w-5" />
               </button>
             </div>
-            <div className="modal-body space-y-4">
+            <fieldset disabled={savingDefault} className="modal-body min-w-0 space-y-4">
               <label className="block">
                 <span className="field-label">应用账号</span>
                 <select
@@ -830,12 +836,12 @@ const Keywords: React.FC<KeywordsProps> = ({ mode }) => {
                   />
                 </div>
               </label>
-            </div>
+            </fieldset>
             <div className="modal-footer flex justify-end gap-2">
-              <button type="button" onClick={() => setShowDefaultModal(false)} className="ios-btn-secondary rounded-md px-4 py-2.5">取消</button>
-              <button type="button" onClick={() => void handleSaveDefault()} className="ios-btn-primary flex items-center gap-2 rounded-md px-4 py-2.5">
+              <button type="button" disabled={savingDefault} onClick={() => setShowDefaultModal(false)} className="ios-btn-secondary rounded-md px-4 py-2.5">取消</button>
+              <button type="button" disabled={savingDefault} aria-busy={savingDefault} onClick={() => void handleSaveDefault()} className="ios-btn-primary flex items-center gap-2 rounded-md px-4 py-2.5">
                 <Save className="h-4 w-4" />
-                保存
+                {savingDefault ? '保存中…' : '保存'}
               </button>
             </div>
           </div>

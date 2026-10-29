@@ -482,6 +482,11 @@ export interface AutoReplyLog {
   reply_text?: string;
   error_message?: string;
   send_status: 'success' | 'failed' | 'unknown' | string;
+  message_source?: 'push' | 'history';
+  config_updated_at?: string;
+  text_send_status?: string;
+  image_send_status?: string;
+  remaining_pause_seconds?: number;
   created_at?: string;
   updated_at?: string;
 }
@@ -648,6 +653,8 @@ export interface DefaultReply {
   reply_content: string;
   reply_once: boolean;
   reply_image_url?: string;
+  updated_at?: string;
+  runtime?: { connected: boolean; paused_conversations: number; remaining_pause_seconds: number };
 }
 
 export interface AccountRecoveryStatus {

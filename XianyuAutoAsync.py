@@ -66,7 +66,7 @@ class AutoReplyPauseManager:
     def _key(cookie_id: str, chat_id: str):
         return (str(cookie_id), str(chat_id))
 
-    def pause_chat(self, chat_id: str, cookie_id: str):
+    def pause_chat(self, chat_id: str, cookie_id: str, message_time=None):
         """暂停指定账号下该 chat_id 的自动回复，使用账号特定的暂停时间"""
         # 获取账号特定的暂停时间
         try:
@@ -82,7 +82,13 @@ class AutoReplyPauseManager:
             return
 
         pause_duration_seconds = pause_minutes * 60
-        pause_until = time.time() + pause_duration_seconds
+        now = time.time()
+        from app.services.auto_reply import stamp_ms
+        event_time = stamp_ms(message_time)/1000 if message_time is not None else now
+        pause_until = min(now, event_time) + pause_duration_seconds
+        if pause_until <= now:
+            return
+        pause_until = max(pause_until, self._pause_until(chat_id, cookie_id))
         self.paused_chats[self._key(cookie_id, chat_id)] = pause_until
         from app.services.chat_workspace import set_handover
         set_handover(db_manager,cookie_id,chat_id,pause_until)
@@ -862,15 +868,9 @@ class XianyuLive:
 
         # 消息防抖管理器：用于处理用户连续发送消息的情况
         # {chat_id: {'task': asyncio.Task, 'last_message': dict, 'timer': float}}
-        self.message_debounce_tasks = {}  # 存储每个chat_id的防抖任务
         self.message_debounce_delay = 1  # 防抖延迟时间（秒）：用户停止发送消息1秒后才回复
-        self.message_debounce_lock = asyncio.Lock()  # 防抖任务管理的锁
-        
-        # 消息去重机制：防止同一条消息被处理多次
-        self.processed_message_ids = {}  # 存储已处理的消息ID和时间戳 {message_id: timestamp}
-        self.processed_message_ids_lock = asyncio.Lock()  # 消息ID去重的锁
-        self.processed_message_ids_max_size = 10000  # 最大保存10000个消息ID，防止内存泄漏
-        self.message_expire_time = 3600  # 消息过期时间（秒），默认1小时后可以重复回复
+        self._auto_reply_pending = {}
+        self._auto_reply_locks = {}
 
         # 初始化订单状态处理器
         self._init_order_status_handler()
@@ -3981,17 +3981,12 @@ class XianyuLive:
 
             # 进行变量替换
             try:
-                # 获取当前商品是否有设置自动回复
-                item_replay = db_manager.get_item_replay(item_id)
-
                 formatted_reply = reply_content.format(
                     send_user_name=send_user_name,
                     send_user_id=send_user_id,
-                    send_message=send_message
+                    send_message=send_message,
+                    item_id=item_id or ''
                 ) if reply_content else ''
-
-                if item_replay:
-                    formatted_reply = item_replay.get('reply_content', '')
 
                 logger.info(f"【{self.cookie_id}】使用默认回复: 文字={formatted_reply}, 图片={reply_image_url}")
                 return {'text': formatted_reply, 'image_url': reply_image_url if reply_image_url and reply_image_url.strip() else None}
@@ -8204,27 +8199,6 @@ class XianyuLive:
         
         return None
 
-    def _add_reply_decision_log(self, message_data: dict, **fields):
-        try:
-            from app.db_manager import db_manager
-            return db_manager.add_auto_reply_log(
-                cookie_id=self.cookie_id,
-                source_message_id=self._extract_message_id(message_data),
-                **fields,
-            )
-        except Exception as error:
-            logger.error(f"【{self.cookie_id}】记录自动回复决策失败: {self._safe_str(error)}")
-            return None
-
-    def _update_reply_decision_log(self, log_id, **fields):
-        if not log_id:
-            return
-        try:
-            from app.db_manager import db_manager
-            db_manager.update_auto_reply_log(log_id, **fields)
-        except Exception as error:
-            logger.error(f"【{self.cookie_id}】更新自动回复决策失败: {self._safe_str(error)}")
-
     def _find_reply_keyword(self, message: str, item_id: str = None):
         try:
             from app.db_manager import db_manager
@@ -8244,502 +8218,18 @@ class XianyuLive:
             logger.debug(f"【{self.cookie_id}】读取命中关键词失败: {self._safe_str(error)}")
         return None
 
-    async def _schedule_debounced_reply(self, chat_id: str, message_data: dict, websocket, 
-                                       send_user_name: str, send_user_id: str, send_message: str,
-                                       item_id: str, msg_time: str):
-        """
-        调度防抖回复：如果用户连续发送消息，等待用户停止发送后再回复最后一条消息
-        
-        Args:
-            chat_id: 聊天ID
-            message_data: 原始消息数据
-            websocket: WebSocket连接
-            send_user_name: 发送者用户名
-            send_user_id: 发送者用户ID
-            send_message: 消息内容
-            item_id: 商品ID
-            msg_time: 消息时间
-        """
-        # 提取消息ID并检查是否已处理
-        message_id = self._extract_message_id(message_data)
-        # 如果没有 messageId，使用备用标识（chat_id + send_message + 时间戳）
-        if not message_id:
-            try:
-                # 尝试从消息数据中提取时间戳
-                create_time = 0
-                if isinstance(message_data, dict) and "1" in message_data:
-                    message_1 = message_data.get("1")
-                    if isinstance(message_1, dict):
-                        create_time = message_1.get("5", 0)
-                # 使用组合键作为备用标识
-                message_id = f"{chat_id}_{send_message}_{create_time}"
-            except Exception:
-                # 如果提取失败，使用当前时间戳
-                message_id = f"{chat_id}_{send_message}_{int(time.time() * 1000)}"
-        
-        async with self.processed_message_ids_lock:
-            current_time = time.time()
-            
-            # 检查消息是否已处理且未过期
-            if message_id in self.processed_message_ids:
-                last_process_time = self.processed_message_ids[message_id]
-                time_elapsed = current_time - last_process_time
-                
-                # 如果消息处理时间未超过1小时，跳过
-                if time_elapsed < self.message_expire_time:
-                    remaining_time = int(self.message_expire_time - time_elapsed)
-                    logger.warning(f"【{self.cookie_id}】消息ID {message_id[:50]}... 已处理过，距离可重复回复还需 {remaining_time} 秒")
-                    return
-                else:
-                    # 超过1小时，可以重新处理
-                    logger.info(f"【{self.cookie_id}】消息ID {message_id[:50]}... 已超过 {int(time_elapsed/60)} 分钟，允许重新回复")
-            
-            # 标记消息ID为已处理（更新或添加时间戳）
-            self.processed_message_ids[message_id] = current_time
-            
-            # 定期清理过期的消息ID
-            if len(self.processed_message_ids) > self.processed_message_ids_max_size:
-                # 清理超过1小时的旧记录
-                expired_ids = [
-                    msg_id for msg_id, timestamp in self.processed_message_ids.items()
-                    if current_time - timestamp > self.message_expire_time
-                ]
-                
-                for msg_id in expired_ids:
-                    del self.processed_message_ids[msg_id]
-                
-                logger.info(f"【{self.cookie_id}】已清理 {len(expired_ids)} 个过期消息ID")
-                
-                # 如果清理后仍然过大，删除最旧的一半
-                if len(self.processed_message_ids) > self.processed_message_ids_max_size:
-                    sorted_ids = sorted(self.processed_message_ids.items(), key=lambda x: x[1])
-                    remove_count = len(sorted_ids) // 2
-                    for msg_id, _ in sorted_ids[:remove_count]:
-                        del self.processed_message_ids[msg_id]
-                    logger.info(f"【{self.cookie_id}】消息ID去重字典过大，已清理 {remove_count} 个最旧记录")
-        
-        async with self.message_debounce_lock:
-            # 如果该chat_id已有防抖任务，取消它
-            if chat_id in self.message_debounce_tasks:
-                old_task = self.message_debounce_tasks[chat_id].get('task')
-                if old_task and not old_task.done():
-                    old_task.cancel()
-                    logger.warning(f"【{self.cookie_id}】取消chat_id {chat_id} 的旧防抖任务")
-            
-            # 更新最后一条消息信息
-            current_timer = time.time()
-            self.message_debounce_tasks[chat_id] = {
-                'last_message': {
-                    'message_data': message_data,
-                    'websocket': websocket,
-                    'send_user_name': send_user_name,
-                    'send_user_id': send_user_id,
-                    'send_message': send_message,
-                    'item_id': item_id,
-                    'msg_time': msg_time
-                },
-                'timer': current_timer
-            }
-            
-            # 创建新的防抖任务
-            async def debounce_task():
-                saved_timer = current_timer  # 保存创建任务时的时间戳
-                try:
-                    # 等待防抖延迟时间
-                    await asyncio.sleep(self.message_debounce_delay)
-                    
-                    # 检查是否仍然是最新的消息（防止在等待期间有新消息）
-                    async with self.message_debounce_lock:
-                        if chat_id not in self.message_debounce_tasks:
-                            return
-                        
-                        debounce_info = self.message_debounce_tasks[chat_id]
-                        # 检查时间戳是否匹配（确保这是最新的消息）
-                        if saved_timer != debounce_info['timer']:
-                            logger.warning(f"【{self.cookie_id}】chat_id {chat_id} 在防抖期间有新消息，跳过旧消息处理")
-                            return
-                        
-                        # 获取最后一条消息
-                        last_msg = debounce_info['last_message']
-                        
-                        # 从防抖任务中移除
-                        del self.message_debounce_tasks[chat_id]
-                    
-                    # 处理最后一条消息
-                    logger.info(f"【{self.cookie_id}】防抖延迟结束，开始处理chat_id {chat_id} 的最后一条消息: {last_msg['send_message'][:30]}...")
-                    await self._process_chat_message_reply(
-                        last_msg['message_data'],
-                        last_msg['websocket'],
-                        last_msg['send_user_name'],
-                        last_msg['send_user_id'],
-                        last_msg['send_message'],
-                        last_msg['item_id'],
-                        chat_id,
-                        last_msg['msg_time']
-                    )
-                    
-                except asyncio.CancelledError:
-                    logger.warning(f"【{self.cookie_id}】chat_id {chat_id} 的防抖任务被取消")
-                except Exception as e:
-                    logger.error(f"【{self.cookie_id}】处理防抖回复时发生错误: {self._safe_str(e)}")
-                    # 确保从防抖任务中移除
-                    async with self.message_debounce_lock:
-                        if chat_id in self.message_debounce_tasks:
-                            del self.message_debounce_tasks[chat_id]
-            
-            task = self._create_tracked_task(debounce_task())
-            self.message_debounce_tasks[chat_id]['task'] = task
-            logger.warning(f"【{self.cookie_id}】为chat_id {chat_id} 创建防抖任务，延迟 {self.message_debounce_delay} 秒")
-
-    async def _process_chat_message_reply(self, message_data: dict, websocket, send_user_name: str,
-                                         send_user_id: str, send_message: str, item_id: str,
-                                         chat_id: str, msg_time: str):
-        """
-        处理聊天消息的回复逻辑（从handle_message中提取出来的核心回复逻辑）
-        
-        Args:
-            message_data: 原始消息数据
-            websocket: WebSocket连接
-            send_user_name: 发送者用户名
-            send_user_id: 发送者用户ID
-            send_message: 消息内容
-            item_id: 商品ID
-            chat_id: 聊天ID
-            msg_time: 消息时间
-        """
-        log_id = None
-        reply_send_failed = False
-        log_context = {
-            "chat_id": chat_id,
-            "item_id": item_id,
-            "sender_user_id": send_user_id,
-            "sender_user_name": send_user_name,
-            "source_message": send_message,
-        }
-        try:
-
-            from app.db_manager import db_manager
-            matched_filter = db_manager.matches_message_filter(
-                self.cookie_id, send_message, "skip_reply"
-            )
-            if matched_filter:
-                self._add_reply_decision_log(
-                    message_data,
-                    **log_context,
-                    process_status="skipped",
-                    decision_reason="skip_reply_filter",
-                    reply_strategy="none",
-                    matched_keyword=matched_filter,
-                    send_status="unknown",
-                )
-                logger.info(
-                    f"[{msg_time}] 【{self.cookie_id}】消息命中过滤规则“{matched_filter}”，跳过自动回复"
-                )
-                return
-
-            # 自动回复消息
-            if not AUTO_REPLY.get('enabled', True):
-                self._add_reply_decision_log(
-                    message_data,
-                    **log_context,
-                    process_status="skipped",
-                    decision_reason="auto_reply_disabled",
-                    reply_strategy="none",
-                    send_status="unknown",
-                )
-                logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】自动回复已禁用")
-                return
-
-            # 检查该chat_id是否处于暂停状态
-            if pause_manager.is_chat_paused(chat_id, self.cookie_id):
-                remaining_time = pause_manager.get_remaining_pause_time(chat_id, self.cookie_id)
-                remaining_minutes = remaining_time // 60
-                remaining_seconds = remaining_time % 60
-                self._add_reply_decision_log(
-                    message_data,
-                    **log_context,
-                    process_status="skipped",
-                    decision_reason="chat_paused",
-                    reply_strategy="none",
-                    send_status="unknown",
-                )
-                logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】chat_id {chat_id} 自动回复已暂停，剩余时间: {remaining_minutes}分{remaining_seconds}秒")
-                return
-
-            # 构造用户URL
-            user_url = f'https://www.goofish.com/personal?userId={send_user_id}'
-
-            reply = None
-            reply_strategy = "none"
-            matched_keyword = None
-            # 判断是否启用API回复
-            if AUTO_REPLY.get('api', {}).get('enabled', False):
-                reply = await self.get_api_reply(
-                    msg_time, user_url, send_user_id, send_user_name,
-                    item_id, send_message, chat_id
-                )
-                if reply:
-                    reply_strategy = "api"
-                if not reply:
-                    logger.error(f"[{msg_time}] 【API调用失败】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
-
-            # 记录回复来源
-            reply_source = 'API'  # 默认假设是API回复
-
-            # 如果API回复失败或未启用API，按新的优先级顺序处理
-            if not reply:
-                # 1. 首先尝试关键词匹配（传入商品ID）
-                reply = await self.get_keyword_reply(send_user_name, send_user_id, send_message, item_id)
-                if reply == "EMPTY_REPLY":
-                    # 匹配到关键词但回复内容为空，不进行任何回复
-                    matched_keyword = self._find_reply_keyword(send_message, item_id)
-                    self._add_reply_decision_log(
-                        message_data,
-                        **log_context,
-                        process_status="skipped",
-                        decision_reason="empty_reply",
-                        reply_strategy="keyword",
-                        matched_keyword=matched_keyword,
-                        send_status="unknown",
-                    )
-                    logger.info(f"[{msg_time}] 【{self.cookie_id}】匹配到空回复关键词，跳过自动回复")
-                    return
-                elif reply:
-                    reply_source = '关键词'  # 标记为关键词回复
-                    reply_strategy = "keyword"
-                    matched_keyword = self._find_reply_keyword(send_message, item_id)
-                else:
-                    # 2. 关键词匹配失败，如果AI开关打开，尝试AI回复
-                    reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id)
-                    if reply:
-                        reply_source = 'AI'  # 标记为AI回复
-                        reply_strategy = "ai"
-                    else:
-                        # 3. 最后使用默认回复
-                        default_reply_result = await self.get_default_reply(send_user_name, send_user_id, send_message, chat_id, item_id)
-                        if default_reply_result == "EMPTY_REPLY":
-                            # 默认回复内容为空，不进行任何回复
-                            self._add_reply_decision_log(
-                                message_data,
-                                **log_context,
-                                process_status="skipped",
-                                decision_reason="empty_reply",
-                                reply_strategy="default",
-                                send_status="unknown",
-                            )
-                            logger.info(f"[{msg_time}] 【{self.cookie_id}】默认回复内容为空，跳过自动回复")
-                            return
-                        
-                        # 处理默认回复（可能包含图片和文字）
-                        if default_reply_result and isinstance(default_reply_result, dict):
-                            reply_source = '默认'  # 标记为默认回复
-                            reply_strategy = "default"
-                            default_image_url = default_reply_result.get('image_url')
-                            default_text = default_reply_result.get('text')
-                            
-                            # 如果存在图片，先发送图片
-                            if default_image_url:
-                                try:
-                                    # 处理图片URL（上传到CDN如果需要）
-                                    final_image_url = default_image_url
-                                    image_width, image_height = 800, 600  # 默认尺寸
-                                    
-                                    if self._is_cdn_url(default_image_url):
-                                        # 已经是CDN链接，获取真实尺寸
-                                        logger.info(f"【{self.cookie_id}】默认回复使用CDN图片: {default_image_url}")
-                                        width, height = await self._get_image_size_from_url(default_image_url)
-                                        if width and height:
-                                            image_width, image_height = width, height
-                                    elif default_image_url.startswith('/static/uploads/') or default_image_url.startswith('static/uploads/'):
-                                        # 本地图片，需要上传到闲鱼CDN
-                                        local_image_path = default_image_url.replace('/static/uploads/', 'static/uploads/')
-                                        if os.path.exists(local_image_path):
-                                            logger.info(f"【{self.cookie_id}】准备上传默认回复本地图片到闲鱼CDN: {local_image_path}")
-                                            
-                                            from utils.image_uploader import ImageUploader
-                                            uploader = ImageUploader(self.cookies_str)
-                                            
-                                            async with uploader:
-                                                cdn_url = await uploader.upload_image(local_image_path)
-                                                if cdn_url:
-                                                    logger.info(f"【{self.cookie_id}】默认回复图片上传成功，CDN URL: {cdn_url}")
-                                                    final_image_url = cdn_url
-                                                    
-                                                    # 更新数据库中的图片URL为CDN URL
-                                                    await self._update_default_reply_image_url(cdn_url)
-                                                    
-                                                    # 获取实际图片尺寸
-                                                    from utils.image_utils import image_manager
-                                                    try:
-                                                        actual_width, actual_height = image_manager.get_image_size(local_image_path)
-                                                        if actual_width and actual_height:
-                                                            image_width, image_height = actual_width, actual_height
-                                                    except Exception as e:
-                                                        logger.warning(f"【{self.cookie_id}】获取图片尺寸失败，使用默认尺寸: {e}")
-                                                else:
-                                                    logger.error(f"【{self.cookie_id}】默认回复图片上传失败: {local_image_path}")
-                                                    final_image_url = None
-                                        else:
-                                            logger.error(f"【{self.cookie_id}】默认回复本地图片文件不存在: {local_image_path}")
-                                            final_image_url = None
-                                    else:
-                                        # 其他类型的URL，获取真实尺寸
-                                        width, height = await self._get_image_size_from_url(default_image_url)
-                                        if width and height:
-                                            image_width, image_height = width, height
-                                    
-                                    # 发送图片
-                                    if final_image_url:
-                                        log_id = self._add_reply_decision_log(
-                                            message_data,
-                                            **log_context,
-                                            process_status="success",
-                                            decision_reason="reply_selected",
-                                            reply_strategy=reply_strategy,
-                                            reply_text=default_text or final_image_url,
-                                            send_status="unknown",
-                                        )
-                                        if pause_manager.is_chat_paused(chat_id,self.cookie_id):
-                                            self._update_reply_decision_log(log_id,process_status='skipped',decision_reason='chat_paused_before_send',send_status='unknown')
-                                            return
-                                        await self.send_image_msg(websocket, chat_id, send_user_id, final_image_url, image_width, image_height)
-                                        self._update_reply_decision_log(
-                                            log_id,
-                                            decision_reason="reply_sent",
-                                            send_status="success",
-                                        )
-                                        msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                                        logger.info(f"[{msg_time}] 【{reply_source}图片发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): 图片 {final_image_url}")
-                                    else:
-                                        reply_send_failed = True
-                                        log_id = self._add_reply_decision_log(
-                                            message_data,
-                                            **log_context,
-                                            process_status="failed",
-                                            decision_reason="send_failed",
-                                            reply_strategy=reply_strategy,
-                                            reply_text=default_text or default_image_url,
-                                            error_message="默认回复图片不可用或上传失败",
-                                            send_status="failed",
-                                        )
-                                except Exception as e:
-                                    reply_send_failed = True
-                                    self._update_reply_decision_log(
-                                        log_id,
-                                        process_status="failed",
-                                        decision_reason="send_failed",
-                                        error_message=self._safe_str(e),
-                                        send_status="failed",
-                                    )
-                                    logger.error(f"【{self.cookie_id}】默认回复图片发送失败: {self._safe_str(e)}")
-                            
-                            # 然后发送文字（如果有）
-                            if default_text and default_text.strip():
-                                reply = default_text
-                            else:
-                                # 只有图片没有文字，已经发送完毕
-                                if default_image_url:
-                                    if not reply_send_failed:
-                                        self._record_default_reply_sent(chat_id)
-                                    return
-                                reply = None
-                        else:
-                            reply = None
-
-            # 注意：这里只有商品ID，没有标题和详情，根据新的规则不保存到数据库
-            # 商品信息会在其他有完整信息的地方保存（如发货规则匹配时）
-            # 消息通知已在收到消息时立即发送，此处不再重复发送
-
-            # 如果有回复内容，发送消息
-            if reply:
-                if not log_id:
-                    log_id = self._add_reply_decision_log(
-                        message_data,
-                        **log_context,
-                        process_status="success",
-                        decision_reason="reply_selected",
-                        reply_strategy=reply_strategy,
-                        matched_keyword=matched_keyword,
-                        reply_text=reply,
-                        send_status="unknown",
-                    )
-                if pause_manager.is_chat_paused(chat_id,self.cookie_id):
-                    self._update_reply_decision_log(log_id,process_status='skipped',decision_reason='chat_paused_before_send',send_status='unknown')
-                    return
-                # 检查是否是图片发送标记
-                if reply.startswith("__IMAGE_SEND__"):
-                    # 提取图片URL（关键词回复不包含卡券ID）
-                    image_url = reply.replace("__IMAGE_SEND__", "")
-                    # 发送图片消息
-                    try:
-                        await self.send_image_msg(websocket, chat_id, send_user_id, image_url)
-                        self._update_reply_decision_log(
-                            log_id,
-                            decision_reason="reply_sent",
-                            send_status="success",
-                        )
-                        # 记录发出的图片消息
-                        msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                        logger.info(f"[{msg_time}] 【{reply_source}图片发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): 图片 {image_url}")
-                    except Exception as e:
-                        # 图片发送失败，发送错误提示
-                        self._update_reply_decision_log(
-                            log_id,
-                            process_status="failed",
-                            decision_reason="send_failed",
-                            error_message=self._safe_str(e),
-                            send_status="failed",
-                        )
-                        logger.error(f"图片发送失败: {self._safe_str(e)}")
-                        await self.send_msg(websocket, chat_id, send_user_id, "抱歉，图片发送失败，请稍后重试。")
-                        msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                        logger.error(f"[{msg_time}] 【{reply_source}图片发送失败】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id})")
-                else:
-                    # 普通文本消息
-                    await self.send_msg(websocket, chat_id, send_user_id, reply)
-                    if not reply_send_failed:
-                        if reply_strategy == 'default':
-                            self._record_default_reply_sent(chat_id)
-                        self._update_reply_decision_log(
-                            log_id,
-                            decision_reason="reply_sent",
-                            send_status="success",
-                        )
-                    # 记录发出的消息
-                    msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                    logger.info(f"[{msg_time}] 【{reply_source}发出】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {reply}")
-            else:
-                self._add_reply_decision_log(
-                    message_data,
-                    **log_context,
-                    process_status="skipped",
-                    decision_reason="no_rule_matched",
-                    reply_strategy="none",
-                    send_status="unknown",
-                )
-                msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】未找到匹配的回复规则，不回复")
-        except Exception as e:
-            error_message = self._safe_str(e)
-            if log_id:
-                self._update_reply_decision_log(
-                    log_id,
-                    process_status="failed",
-                    decision_reason="failed",
-                    error_message=error_message,
-                    send_status="failed",
-                )
-            else:
-                self._add_reply_decision_log(
-                    message_data,
-                    **log_context,
-                    process_status="failed",
-                    decision_reason="failed",
-                    reply_strategy="none",
-                    error_message=error_message,
-                    send_status="failed",
-                )
-            logger.error(f"处理聊天消息回复时发生错误: {self._safe_str(e)}")
+    async def _schedule_debounced_reply(self, chat_id, message_data, websocket,
+                                       send_user_name, send_user_id, send_message, item_id, msg_time):
+        from app.services.auto_reply import accept
+        record = message_data.get('1') or {}
+        details = record.get('10') or {}
+        if str(details.get('sessionType', '1')) == '30':
+            return
+        return await accept(self, db_manager, {
+            'cid': chat_id, 'senderId': str(send_user_id), 'senderName': send_user_name,
+            'text': send_message, 'itemId': item_id, 'time': record.get('5'),
+            'messageId': self._extract_message_id(message_data), 'type': 'text',
+        })
 
     async def handle_message(self, message_data, websocket):
         """Process every record in a sync packet, acknowledging the packet once."""
@@ -9062,14 +8552,17 @@ class XianyuLive:
 
 
             # 判断消息方向
-            if send_user_id == self.myid:
-                logger.info(f"[{msg_time}] 【手动发出】 商品({item_id}): {send_message}")
+            if str(send_user_id).split('@')[0] == str(self.myid).split('@')[0]:
 
                 # 暂停该chat_id的自动回复10分钟
-                if self._consume_programmatic_echo(chat_id,send_message):
+                from app.services.auto_reply import own_automation_echo
+                if self._consume_programmatic_echo(chat_id,send_message) or own_automation_echo(
+                        db_manager,self.cookie_id,chat_id,send_message,create_time,self._extract_message_id(message)):
                     logger.debug('程序消息回显，不延长人工接管')
                     return
-                pause_manager.pause_chat(chat_id, self.cookie_id)
+                logger.info(f"[{msg_time}] 【手动发出】 商品({item_id}): {send_message}")
+
+                pause_manager.pause_chat(chat_id, self.cookie_id, message_time=create_time)
 
                 return
             else:
@@ -9290,7 +8783,7 @@ class XianyuLive:
             # 如果用户连续发送消息，等待用户停止发送后再回复最后一条消息
             await self._schedule_debounced_reply(
                 chat_id=chat_id,
-                message_data=message_data,
+                message_data=message,
                 websocket=websocket,
                 send_user_name=send_user_name,
                 send_user_id=send_user_id,

@@ -10,6 +10,7 @@ SCOPES = {
     'logistics_quote_routes':'user_id', 'product_filter_rules':'user_id',
     'product_delete_rules':'user_id', 'product_materials':'user_id',
     'cookie_status':'cookie_id', 'keywords':'cookie_id', 'default_replies':'cookie_id',
+    'auto_reply_activation':'cookie_id', 'auto_reply_receipts':'cookie_id', 'auto_reply_outbound':'cookie_id',
     'default_reply_records':'cookie_id', 'message_notifications':'cookie_id',
     'item_info':'cookie_id', 'item_replay':'cookie_id', 'ai_reply_settings':'cookie_id',
     'ai_conversations':'cookie_id', 'orders':'cookie_id', 'risk_control_logs':'cookie_id',

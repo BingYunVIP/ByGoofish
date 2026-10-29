@@ -1,6 +1,6 @@
 """Bounded recovery of recent incoming messages when a full IM push is missing.
 
-Only notifications are recovered here. Never replay chat replies or transactions.
+Notifications and automatic replies share bounded reads; transactions are never replayed.
 """
 import asyncio
 import hashlib
@@ -70,20 +70,27 @@ async def reconcile_once(instance, db, now=None):
     if (not db.get_cookie_status(account) or auth_paused(account)
             or registry.get(account).is_blocked or connection != 'connected'):
         return 0
-    if not any(r.get('enabled', True) for r in db.get_account_notifications(account, event_type='buyer_message')):
-        # Enabling a subscription later must not send messages received while disabled.
-        with db.lock:
-            db.conn.execute('DELETE FROM buyer_notification_activation WHERE cookie_id=?', (account,))
-            db.conn.commit()
-        return 0
+    from app.services.auto_reply import activation, accept
+    from app.config import AUTO_REPLY
     now = time.time() if now is None else now
+    replies_since = activation(db, account, now) if AUTO_REPLY.get('enabled', True) else None
+    notify_enabled = any(r.get('enabled', True) for r in db.get_account_notifications(account, event_type='buyer_message'))
+    notify_since = None
     with db.lock:
-        row = db.conn.execute('SELECT activated_at FROM buyer_notification_activation WHERE cookie_id=?', (account,)).fetchone()
-        if not row:
-            db.conn.execute('INSERT INTO buyer_notification_activation VALUES(?,?)', (account, now))
-            db.conn.commit()
-            return 0
-    cutoff = max(row[0], now - LOOKBACK)
+        if not notify_enabled:
+            db.conn.execute('DELETE FROM buyer_notification_activation WHERE cookie_id=?', (account,))
+        else:
+            row = db.conn.execute('SELECT activated_at FROM buyer_notification_activation WHERE cookie_id=?', (account,)).fetchone()
+            if not row:
+                db.conn.execute('INSERT INTO buyer_notification_activation VALUES(?,?)', (account, now))
+                notify_since = now
+            else:
+                notify_since = row[0]
+        db.conn.commit()
+    cutoffs = [stamp for stamp in (notify_since, replies_since) if stamp is not None]
+    if not cutoffs or min(cutoffs) >= now:
+        return 0
+    cutoff = max(min(cutoffs), now - LOOKBACK)
     conversations = payload(await instance.get_im_conversations(limit=30))
     scans = {cid: stamp for cid, stamp in getattr(instance, '_notification_history_scans', {}).items() if stamp >= now - 3600}
     instance._notification_history_scans = scans
@@ -109,8 +116,12 @@ async def reconcile_once(instance, db, now=None):
             text = msg['text'] or ('[图片]' if msg['type'] == 'image' else '')
             if not text or AIReplyEngine.is_system_or_order_event(text):
                 continue
-            sent += await instance.send_notification(msg.get('senderName') or conv['otherUserId'], msg['senderId'],
-                         text, conv['itemId'], conv['cid'], message_time=msg['time']) or 0
+            if replies_since is not None and msg['time'] / 1000 >= replies_since:
+                await accept(instance, db, {**msg, 'cid': conv['cid'], 'itemId': conv['itemId'], 'text': text}, 'history')
+            if notify_since is not None and msg['time'] / 1000 >= notify_since:
+                sent += await instance.send_notification(msg.get('senderName') or conv['otherUserId'], msg['senderId'],
+                             text, conv['itemId'], conv['cid'], message_time=msg['time']) or 0
+
     return sent
 
 

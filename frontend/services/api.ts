@@ -1348,7 +1348,9 @@ export const getDefaultReply = async (cookieId: string): Promise<DefaultReply> =
     enabled: result.enabled || false,
     reply_content: result.reply_content || '',
     reply_once: result.reply_once || false,
-    reply_image_url: result.reply_image_url || ''
+    reply_image_url: result.reply_image_url || '',
+    updated_at: result.updated_at,
+    runtime: result.runtime,
   };
 };
 

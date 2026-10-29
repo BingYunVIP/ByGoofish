@@ -621,6 +621,14 @@ class EntryPointTests(Fixture, IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.close_db()
 
+    async def invoke_reply(self, live):
+        from app.services.auto_reply import process, claim
+        from XianyuAutoAsync import ConnectionState
+        self.db.save_default_reply("fixture-shop", True, "示例回复", False, "")
+        live.connection_state = ConnectionState.CONNECTED
+        msg = {"cid":"fixture-chat", "senderId":"fixture-buyer", "senderName":"示例买家", "text":"询问规格", "itemId":"fixture-item", "time":int(time.time()*1000), "messageId":"fixture-reply"}
+        await process(live,self.db,msg,"push",claim(self.db,"fixture-shop",msg))
+
     async def test_pause_during_keyword_generation_blocks_actual_send(self):
         live = XianyuLive.__new__(XianyuLive)
         live.cookie_id = "fixture-shop"
@@ -633,25 +641,14 @@ class EntryPointTests(Fixture, IsolatedAsyncioTestCase):
 
         live.get_keyword_reply = AsyncMock(side_effect=keyword)
         live._find_reply_keyword = Mock(return_value="fixture")
-        live._add_reply_decision_log = Mock(return_value=1)
-        live._update_reply_decision_log = Mock()
-        live.send_msg = AsyncMock()
-        live.send_image_msg = AsyncMock()
+        live.send_im_text = AsyncMock()
+        live.send_im_image = AsyncMock()
         with patch("XianyuAutoAsync.AUTO_REPLY", {"api": {"enabled": False}}):
-            await live._process_chat_message_reply(
-                {},
-                None,
-                "示例买家",
-                "fixture-buyer",
-                "询问规格",
-                "fixture-item",
-                "fixture-chat",
-                "fixture-time",
-            )
-        live.send_msg.assert_not_awaited()
-        live.send_image_msg.assert_not_awaited()
+            await self.invoke_reply(live)
+        live.send_im_text.assert_not_awaited()
+        live.send_im_image.assert_not_awaited()
         self.assertEqual(
-            live._update_reply_decision_log.call_args.kwargs["decision_reason"],
+            self.db.get_auto_reply_logs(self.uid)[0]["decision_reason"],
             "chat_paused_before_send",
         )
 
@@ -675,25 +672,14 @@ class EntryPointTests(Fixture, IsolatedAsyncioTestCase):
             return 20, 10
 
         live._get_image_size_from_url = AsyncMock(side_effect=image_size)
-        live._add_reply_decision_log = Mock(return_value=1)
-        live._update_reply_decision_log = Mock()
-        live.send_msg = AsyncMock()
-        live.send_image_msg = AsyncMock()
+        live.send_im_text = AsyncMock()
+        live.send_im_image = AsyncMock()
         with patch("XianyuAutoAsync.AUTO_REPLY", {"api": {"enabled": False}}):
-            await live._process_chat_message_reply(
-                {},
-                None,
-                "示例买家",
-                "fixture-buyer",
-                "询问规格",
-                "fixture-item",
-                "fixture-chat",
-                "fixture-time",
-            )
-        live.send_msg.assert_not_awaited()
-        live.send_image_msg.assert_not_awaited()
+            await self.invoke_reply(live)
+        live.send_im_text.assert_not_awaited()
+        live.send_im_image.assert_not_awaited()
         self.assertEqual(
-            live._update_reply_decision_log.call_args.kwargs["decision_reason"],
+            self.db.get_auto_reply_logs(self.uid)[0]["decision_reason"],
             "chat_paused_before_send",
         )
 

@@ -3426,10 +3426,11 @@ def get_default_reply(cid: str, current_user: Dict[str, Any] = Depends(get_curre
             raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
         result = db_manager.get_default_reply(cid)
+        from app.services.auto_reply import runtime_status
         if result is None:
             # 如果没有设置，返回默认值
-            return {'enabled': False, 'reply_content': '', 'reply_once': False}
-        return result
+            return {'enabled': False, 'reply_content': '', 'reply_once': False, 'runtime': runtime_status(db_manager, cid)}
+        return {**result, 'runtime': runtime_status(db_manager, cid)}
     except HTTPException:
         raise
     except Exception as e:
@@ -3449,7 +3450,7 @@ def update_default_reply(cid: str, reply_data: DefaultReplyIn, current_user: Dic
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
         db_manager.save_default_reply(cid, reply_data.enabled, reply_data.reply_content, reply_data.reply_once, reply_data.reply_image_url)
-        return {'msg': 'default reply updated', 'enabled': reply_data.enabled, 'reply_once': reply_data.reply_once, 'reply_image_url': reply_data.reply_image_url}
+        return {'success': True, 'data': db_manager.get_default_reply(cid)}
     except HTTPException:
         raise
     except Exception as e:
@@ -4047,7 +4048,7 @@ def list_auto_reply_logs(
     process_status = (process_status or "").strip() or None
     reply_strategy = (reply_strategy or "").strip() or None
     send_status = (send_status or "").strip() or None
-    if process_status not in (None, "success", "skipped", "failed"):
+    if process_status not in (None, "success", "skipped", "failed", "pending", "unknown"):
         raise HTTPException(status_code=400, detail="无效的处理状态")
     if reply_strategy not in (None, "keyword", "ai", "default", "api", "none"):
         raise HTTPException(status_code=400, detail="无效的回复策略")

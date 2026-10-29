@@ -89,6 +89,8 @@ class DBManager:
         initialize_event_journal(self)
         from app.services.item_details import initialize as initialize_item_details
         initialize_item_details(self)
+        from app.services.auto_reply import initialize as initialize_auto_reply
+        initialize_auto_reply(self)
     
     def init_db(self):
         """初始化数据库表结构"""
@@ -2706,6 +2708,8 @@ class DBManager:
                         raise ie
 
                 self.conn.commit()
+                from app.services.auto_reply import activation
+                activation(self, cookie_id)
                 logger.info(f"关键字保存成功: {cookie_id}, {len(keywords)}条")
                 return True
             except Exception as e:
@@ -2757,6 +2761,8 @@ class DBManager:
                         (cookie_id, keyword, reply, normalized_item_id))
 
                 self.conn.commit()
+                from app.services.auto_reply import activation
+                activation(self, cookie_id)
                 logger.info(f"文本关键字保存成功: {cookie_id}, {len(keywords)}条，图片关键词已保留")
                 return True
             except ValueError:
@@ -2826,6 +2832,8 @@ class DBManager:
                     (cookie_id, keyword, '', normalized_item_id, 'image', image_url))
 
                 self.conn.commit()
+                from app.services.auto_reply import activation
+                activation(self, cookie_id)
                 logger.info(f"图片关键词保存成功: {cookie_id}, 关键词: {keyword}, 图片: {image_url}")
                 return True
             except Exception as e:
@@ -3012,6 +3020,8 @@ class DBManager:
                     settings.get('custom_prompts', '')
                 ))
                 self.conn.commit()
+                from app.services.auto_reply import activation
+                activation(self, cookie_id)
                 logger.debug(f"AI回复设置保存成功: {cookie_id}")
                 return True
             except Exception as e:
@@ -3177,6 +3187,8 @@ class DBManager:
                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (cookie_id, enabled, reply_content, reply_image_url, reply_once))
                 self.conn.commit()
+                from app.services.auto_reply import activation
+                activation(self, cookie_id)
                 logger.debug(f"保存默认回复设置: {cookie_id} -> {'启用' if enabled else '禁用'}, 只回复一次: {'是' if reply_once else '否'}, 图片: {reply_image_url}")
             except Exception as e:
                 logger.error(f"保存默认回复设置失败: {e}")
@@ -3188,16 +3200,17 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT enabled, reply_content, reply_once, reply_image_url FROM default_replies WHERE cookie_id = ?
+                SELECT enabled, reply_content, reply_once, reply_image_url, updated_at FROM default_replies WHERE cookie_id = ?
                 ''', (cookie_id,))
                 result = cursor.fetchone()
                 if result:
-                    enabled, reply_content, reply_once, reply_image_url = result
+                    enabled, reply_content, reply_once, reply_image_url, updated_at = result
                     return {
                         'enabled': bool(enabled),
                         'reply_content': reply_content or '',
                         'reply_once': bool(reply_once) if reply_once is not None else False,
-                        'reply_image_url': reply_image_url or ''
+                        'reply_image_url': reply_image_url or '',
+                        'updated_at': updated_at
                     }
                 return None
             except Exception as e:
@@ -3291,6 +3304,8 @@ class DBManager:
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, "DELETE FROM default_replies WHERE cookie_id = ?", (cookie_id,))
                 self.conn.commit()
+                from app.services.auto_reply import activation
+                activation(self, cookie_id)
                 logger.debug(f"删除默认回复设置: {cookie_id}")
                 return True
             except Exception as e:
@@ -3927,11 +3942,14 @@ class DBManager:
             "sender_user_id", "sender_user_name", "source_message",
             "process_status", "decision_reason", "reply_strategy",
             "matched_keyword", "reply_text", "error_message", "send_status",
+            "message_source", "config_updated_at", "text_send_status", "image_send_status", "remaining_pause_seconds",
         )
         values = {key: fields.get(key) for key in allowed_fields}
         values["process_status"] = values["process_status"] or "success"
         values["reply_strategy"] = values["reply_strategy"] or "none"
         values["send_status"] = values["send_status"] or "unknown"
+        for name, default in {"message_source":"push", "config_updated_at":"", "text_send_status":"not_requested", "image_send_status":"not_requested", "remaining_pause_seconds":0}.items():
+            values[name] = values[name] if values[name] is not None else default
         columns = ", ".join(values.keys())
         placeholders = ", ".join("?" for _ in values)
         with self.lock:
@@ -3947,6 +3965,7 @@ class DBManager:
         allowed_fields = {
             "process_status", "decision_reason", "reply_strategy",
             "matched_keyword", "reply_text", "error_message", "send_status",
+            "message_source", "config_updated_at", "text_send_status", "image_send_status", "remaining_pause_seconds",
         }
         updates = [(key, value) for key, value in fields.items() if key in allowed_fields]
         if not updates:
@@ -7700,6 +7719,8 @@ class DBManager:
                     ''', (item_id, cookie_id, reply_content))
 
                 self.conn.commit()
+                from app.services.auto_reply import activation
+                activation(self, cookie_id)
             return True
         except Exception as e:
             logger.error(f"更新商品回复失败: {e}")
@@ -7758,6 +7779,8 @@ class DBManager:
                     WHERE cookie_id = ? AND item_id = ?
                 ''', (cookie_id, item_id))
                 self.conn.commit()
+                from app.services.auto_reply import activation
+                activation(self, cookie_id)
                 # 判断是否有删除行
                 return cursor.rowcount > 0
         except Exception as e:
