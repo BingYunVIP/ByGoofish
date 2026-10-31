@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from app.services.outbound_security import PublicResolver, validate_external_url
 
 import aiohttp
 from .smtp_delivery import send_message as send_smtp_message, DeliveryUncertain, TLSVerificationFailed, format_sender
@@ -147,6 +148,9 @@ class NotificationSender:
         self.timeout_seconds = min(max(float(timeout_seconds), 1.0), _MAX_TIMEOUT_SECONDS)
         self.session_factory = session_factory or aiohttp.ClientSession
         self.email_sender = email_sender
+        # Injectable sessions are used by isolated tests; production sessions always
+        # enforce DNS/IP and HTTPS policy before opening a socket.
+        self.enforce_network_policy = session_factory is None
 
     async def send(
         self,
@@ -195,9 +199,11 @@ class NotificationSender:
         # factory injectable makes all provider branches straightforward to
         # mock without opening a socket in tests.
         try:
-            session = self.session_factory(
-                timeout=aiohttp.ClientTimeout(total=self.timeout_seconds)
-            )
+            options = {'timeout': aiohttp.ClientTimeout(total=self.timeout_seconds)}
+            if self.enforce_network_policy:
+                options.update(connector=aiohttp.TCPConnector(resolver=PublicResolver(), limit=4),
+                               trust_env=False)
+            session = self.session_factory(**options)
         except TypeError:
             session = self.session_factory()
         if inspect.isawaitable(session):
@@ -213,30 +219,55 @@ class NotificationSender:
         headers: Mapping[str, str] | None = None,
     ) -> tuple[int, Any]:
         safe_url = _safe_url(url)
+        if self.enforce_network_policy:
+            safe_url = validate_external_url(safe_url)
         session_context = await self._open_session()
         try:
             async with session_context as session:
                 request_method = getattr(session, method.lower())
                 kwargs: dict[str, Any] = {"json": dict(payload)}
                 if headers:
-                    kwargs["headers"] = dict(headers)
+                    blocked = {'cookie', 'host', 'content-length', 'connection', 'origin'}
+                    kwargs["headers"] = {str(k): str(v) for k, v in headers.items()
+                                          if str(k).lower() not in blocked}
+                kwargs['allow_redirects'] = False
                 try:
-                    response_context = request_method(safe_url, **kwargs)
-                    if inspect.isawaitable(response_context):
-                        response_context = await response_context
-                    async with response_context as response:
+                    current_url = safe_url
+                    for _ in range(4):
+                        response_context = request_method(current_url, **kwargs)
+                        if inspect.isawaitable(response_context):
+                            response_context = await response_context
+                        response = await response_context.__aenter__()
+                        if response.status in {301, 302, 303, 307, 308}:
+                            location = response.headers.get('Location')
+                            await response_context.__aexit__(None, None, None)
+                            if not location:
+                                raise NotificationProviderRejected(int(response.status))
+                            current_url = validate_external_url(
+                                __import__('urllib.parse', fromlist=['urljoin']).urljoin(current_url, location)
+                            )
+                            continue
                         status = int(getattr(response, "status", 0) or 0)
-                        text_reader = getattr(response, "text", "")
-                        raw_text = text_reader() if callable(text_reader) else text_reader
+                        content = getattr(response, 'content', None)
+                        if content is not None and hasattr(content, 'read'):
+                            raw_bytes = await content.read(2 * 1024 * 1024 + 1)
+                            if len(raw_bytes) > 2 * 1024 * 1024:
+                                raise NotificationProviderRejected(status)
+                            raw_text = raw_bytes.decode('utf-8', errors='replace')
+                        else:
+                            text_reader = getattr(response, "text", "")
+                            raw_text = text_reader() if callable(text_reader) else text_reader
                         if inspect.isawaitable(raw_text):
                             raw_text = await raw_text
                         try:
                             body = json.loads(raw_text) if raw_text else None
                         except (TypeError, json.JSONDecodeError):
                             body = None
+                        await response_context.__aexit__(None, None, None)
                         if not 200 <= status < 300:
                             raise NotificationProviderRejected(status)
                         return status, body
+                    raise NotificationProviderRejected(310)
                 except (asyncio.TimeoutError, TimeoutError) as exc:
                     raise NotificationSendTimeout() from exc
                 except NotificationSendError:

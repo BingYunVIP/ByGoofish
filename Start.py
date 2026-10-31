@@ -212,7 +212,7 @@ def _start_api_server():
     api_conf = AUTO_REPLY.get('api', {})
 
     # 优先使用环境变量配置
-    host = os.getenv('API_HOST', '0.0.0.0')  # 默认绑定所有接口
+    host = os.getenv('API_HOST', '127.0.0.1')  # 默认仅本机访问，由HTTPS反代对外提供服务
     port = int(os.getenv('API_PORT', '8080'))  # 默认端口8080
 
     # 如果配置文件中有特定配置，则使用配置文件

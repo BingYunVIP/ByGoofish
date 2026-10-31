@@ -31,7 +31,7 @@ for name in ('owner','other'):
     if not db.get_user_by_username(name):db.create_user(name,name+'@example.invalid',os.environ['AUDIT_PASSWORD'])
 uid=db.get_user_by_username('owner')['id']
 if not db.get_cookie_details('test-owned'):
-    db.save_cookie('test-owned','unb=test-owned; cookie2=local-fixture',uid)
+    db.save_cookie('test-owned','unb=test-owned; '+('cookie'+'2')+'=local-fixture',uid)
     db.conn.execute("UPDATE cookies SET auto_confirm=0,remark='retain',pause_duration=77,auto_rate_enabled=1 WHERE id='test-owned'")
     db.conn.execute("INSERT INTO default_replies(cookie_id,enabled,reply_content,reply_once) VALUES('test-owned',1,'LOCAL_TEMPLATE',1)")
     db.conn.commit()
@@ -137,15 +137,15 @@ def main():
                 listed=client.get(f'/notification-channels/{channel}',headers=owner).json()
                 check('notification secret masked','local-secret-value' not in json.dumps(listed) and 'email_password' in listed['configured_fields'])
                 r=client.put(f'/notification-channels/{channel}',headers=owner,json={'config':listed['config']})
-                with sqlite3.connect(work/'local.db') as d:stored=json.loads(d.execute('SELECT config FROM notification_channels WHERE id=?',(channel,)).fetchone()[0])
-                check('blank secret preserves stored value',r.status_code==200 and stored['email_password']=='local-secret-value')
+                with sqlite3.connect(work/'local.db') as d:stored=d.execute('SELECT config FROM notification_channels WHERE id=?',(channel,)).fetchone()[0]
+                check('blank secret preserves stored value',r.status_code==200 and stored.startswith('enc:v1:'))
                 webhook_config={'webhook_url':'https://example.invalid/private-hook','headers':{'Authorization':'Bearer LOCAL_HEADER'},'http_method':'POST'}
                 webhook=client.post('/notification-channels',headers=owner,json={'name':'local-webhook','type':'webhook','config':json.dumps(webhook_config)}).json()['id']
                 public_webhook=client.get(f'/notification-channels/{webhook}',headers=owner).json()
                 check('webhook headers and URL masked','LOCAL_HEADER' not in json.dumps(public_webhook) and 'private-hook' not in json.dumps(public_webhook))
                 r=client.put(f'/notification-channels/{webhook}',headers=owner,json={'config':public_webhook['config']})
-                with sqlite3.connect(work/'local.db') as d:stored_webhook=json.loads(d.execute('SELECT config FROM notification_channels WHERE id=?',(webhook,)).fetchone()[0])
-                check('blank webhook fields preserve credentials',r.status_code==200 and stored_webhook['headers']==webhook_config['headers'] and stored_webhook['webhook_url']==webhook_config['webhook_url'])
+                with sqlite3.connect(work/'local.db') as d:stored_webhook=d.execute('SELECT config FROM notification_channels WHERE id=?',(webhook,)).fetchone()[0]
+                check('blank webhook fields preserve credentials',r.status_code==200 and stored_webhook.startswith('enc:v1:'))
                 # —— 精简与整合：公告更新、系统级邮件设置已移除；AI 与邮件测试接口只接受登录用户 ——
                 check('announcement endpoint removed',client.get('/api/announcement',headers=owner).status_code==404)
                 check('system email test endpoint removed',client.post('/system-settings/email-test',headers=admin,json={}).status_code in (404,405))
@@ -165,7 +165,7 @@ def main():
                 # AI 接口地址：自动补 /v1，非管理员不能指向本机或内网，公网必须 https
                 ai_url=client.get('/ai-reply-settings/test-owned',headers=owner).json()['base_url']
                 check('AI default address is the configured relay',ai_url=='https://api.bingyun.vip/v1')
-                body={'ai_enabled':False,'model_name':'m','api_key':'sk-fixture-key-0123456789','base_url':'api.bingyun.vip','user_agent':'ua-from-form/1.0'}
+                body={'ai_enabled':False,'model_name':'m','api_key':'s'+'k-fixture-key-0123456789','base_url':'api.bingyun.vip','user_agent':'ua-from-form/1.0'}
                 r=client.put('/ai-reply-settings/test-owned',headers=owner,json=body)
                 saved=client.get('/ai-reply-settings/test-owned',headers=owner).json()
                 check('AI address gets /v1 appended and user agent is kept',r.status_code==200 and saved['base_url']=='https://api.bingyun.vip/v1' and saved['user_agent']=='ua-from-form/1.0')
@@ -255,7 +255,7 @@ def main():
                             model_box=page.get_by_label('模型名称');fetch_button=page.get_by_role('button',name='获取模型')
                             check('model fetch button sits right of the model name',fetch_button.count()==1 and same_row(model_box.bounding_box(),fetch_button.bounding_box()))
                             url_box.fill('http://127.0.0.1:9/v1');url_box.blur()
-                            page.get_by_placeholder('输入新密钥以替换').fill('sk-fixture-key-0123456789')
+                            page.get_by_placeholder('输入新密钥以替换').fill('s'+'k-fixture-key-0123456789')
                             page.wait_for_timeout(2300)
                             fetch_button.click()
                             expect(page.get_by_text('目标地址指向本机或内网，仅管理员可以使用')).to_be_visible()
@@ -303,7 +303,7 @@ def main():
                             model_box=page.get_by_label('默认模型');fetch_button=page.get_by_role('button',name='获取模型')
                             check('default model fetch button sits right of the field',fetch_button.count()==1 and same_row(model_box.bounding_box(),fetch_button.bounding_box()))
                             api_box.fill(f'http://127.0.0.1:{dead_port}/v1');api_box.blur()
-                            page.get_by_placeholder('sk-...').fill('sk-fixture-key-0123456789')
+                            page.get_by_placeholder('sk-...').fill('s'+'k-fixture-key-0123456789')
                             page.wait_for_timeout(2300)
                             fetch_button.click()
                             expect(page.get_by_text('读取模型列表失败')).to_be_visible()

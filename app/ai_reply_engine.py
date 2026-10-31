@@ -78,6 +78,7 @@ class AIReplyEngine:
                 settings['base_url'],
                 settings['api_key'],
                 user_agent=settings.get('user_agent') or DEFAULT_USER_AGENT,
+                allow_private=False,
             )
         except AIConfigError as e:
             logger.error(f"创建AI客户端失败 {cookie_id}: {e}")

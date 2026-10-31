@@ -32,6 +32,7 @@ SCOPES = {
     'buyer_notification_activation':'cookie_id', 'buyer_notification_receipts':'cookie_id',
     'account_offline_incidents':'cookie_id', 'account_offline_notices':'cookie_id',
     'delivery_reconciliation_activation':'cookie_id','delivery_reconciliation_runs':'cookie_id',
+    'operational_incidents':'cookie_id','operational_notices':'incident_id','operational_notice_attempts':'incident_id',
 }
 RELATIONS = {'card_id':'cards', 'auto_card_id':'cards', 'channel_id':'notification_channels',
              'variant_id':'product_variants', 'import_id':'logistics_quote_route_imports'}
@@ -50,6 +51,8 @@ def schema(conn, table):
 def condition(column):
     if column in ('cookie_id','account_id'):
         return f'{ident(column)} IN (SELECT id FROM cookies WHERE user_id=?)'
+    if column == 'incident_id':
+        return f'{ident(column)} IN (SELECT id FROM operational_incidents WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id=?))'
     return f'{ident(column)}=?'
 
 
@@ -85,6 +88,18 @@ def import_user(conn, payload, user_id):
             if scope not in item:raise ValueError('备份缺少所有权字段')
             if scope in ('user_id','owner_id'):item[scope]=user_id
             if table in ('chat_workspace_state','chat_customer_notes','chat_send_attempts'):item['user_id']=user_id
+            if table == 'keywords' and item.get('image_url'):
+                from utils.path_security import safe_upload_path
+                try:
+                    safe_upload_path(str(item['image_url']))
+                except ValueError:
+                    raise ValueError('备份中的图片附件路径无效') from None
+            if table == 'ai_reply_settings' and item.get('base_url'):
+                from app.services.ai_client import validate_outbound_url
+                try:
+                    validate_outbound_url(str(item['base_url']), allow_private=False, require_resolution=False)
+                except Exception:
+                    raise ValueError('备份中的 AI 地址不允许访问本机或内网') from None
             parsed.append(item)
         tables[table]=(info,columns,parsed)
 
@@ -97,6 +112,8 @@ def import_user(conn, payload, user_id):
 
     def owned_row(table,row):
         scope=SCOPES[table]
+        if scope == 'incident_id':
+            return row.get(scope) in ids.get('operational_incidents', set())
         return row.get(scope) in owned_cookies if scope in ('cookie_id','account_id') else row.get(scope)==user_id
 
     ids={}

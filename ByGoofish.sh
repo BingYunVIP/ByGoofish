@@ -101,6 +101,12 @@ check_system() {
         die "项目文件不完整；请把脚本放在完整项目根目录。"
     [[ $ROOT != *$'\n'* && $ROOT != *$'\r'* ]] || die "目录名称包含不支持的控制字符。"
 }
+ensure_runtime_user() {
+    if ! id bygoofish >/dev/null 2>&1; then
+        useradd --system --home-dir /var/lib/bygoofish --create-home --shell /usr/sbin/nologin bygoofish
+    fi
+    install -d -m 750 -o bygoofish -g bygoofish /var/lib/bygoofish
+}
 prepare_state() {
     if [[ ! -d $ROOT/.local ]]; then
         install -d -m 700 -o "$RUN_USER" "$ROOT/.local"
@@ -310,7 +316,7 @@ configure_access() {
         if [[ ! $PORT =~ ^[0-9]{1,5}$ ]]; then die "端口必须在1–65535之间。"; fi
         if (( 10#$PORT < 1 || 10#$PORT > 65535 )); then die "端口必须在1–65535之间。"; fi
         PORT=$((10#$PORT))
-        HOST=0.0.0.0
+        HOST=127.0.0.1
     fi
     if [[ $EXISTS == no ]] || ! service_active; then
         check_port
@@ -492,6 +498,18 @@ begin_deployment() {
         env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y python3
     }
     load_settings
+    ensure_runtime_user
+    if [[ $RUN_USER == root && $ROOT != "$HOME"/* ]]; then
+        RUN_USER=bygoofish
+        RUN_HOME=/var/lib/bygoofish
+    fi
+    if [[ $RUN_USER == root && $ROOT == "$HOME"/* ]]; then
+        RUN_USER=bygoofish
+        RUN_HOME=/var/lib/bygoofish
+        chmod 711 "$HOME"
+    fi
+    install -d -m 700 -o "$RUN_USER" -g "$RUN_USER" "$ROOT/.local" "$ROOT/data" "$ROOT/logs" "$ROOT/browser_data" "$ROOT/static/uploads"
+    chown -R "$RUN_USER:$RUN_USER" "$ROOT/.local" "$ROOT/data" "$ROOT/logs" "$ROOT/browser_data" "$ROOT/static/uploads"
     prepare_state
     WORK=$(mktemp -d "$STATE/staging-XXXXXX")
     chown "$RUN_USER:" "$WORK"

@@ -187,6 +187,7 @@ class LoginResponse(BaseModel):
     is_admin: Optional[bool] = None
     # True 表示下一次登录必须携带图形验证码
     captcha_required: Optional[bool] = False
+    must_change_password: Optional[bool] = False
 
 
 class ChangePasswordRequest(BaseModel):
@@ -395,7 +396,32 @@ async def log_requests(request, call_next):
     process_time = time.time() - start_time
     logger.info(f"✅ API响应: {request.method} {request.url.path} - {response.status_code} ({process_time:.3f}s)")
 
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Content-Security-Policy',
+        "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+        "img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; connect-src 'self' https: wss:; font-src 'self' data:;")
     return response
+
+
+@app.middleware("http")
+async def enforce_password_initialization(request, call_next):
+    """Known bootstrap passwords may only reach the password-change flow."""
+    allowed = {'/login', '/verify', '/logout', '/change-password', '/change-admin-password',
+               '/account/profile', '/change-email/send-code', '/change-email',
+               '/health', '/health/ready', '/system-settings/public', '/registration-status',
+               '/login-info-status'}
+    header = request.headers.get('authorization', '')
+    token = header[7:].strip() if header.lower().startswith('bearer ') else ''
+    user = SESSION_TOKENS.get(token) if token else None
+    if user and user.get('must_change_password') and request.url.path not in allowed:
+        return JSONResponse(status_code=403, content={
+            'detail': '首次使用或已知初始密码，请先修改登录密码',
+            'code': 'password_change_required',
+        })
+    return await call_next(request)
 
 # 提供前端静态文件
 import os
@@ -627,7 +653,8 @@ async def login(request: LoginRequest):
                     message="登录成功",
                     user_id=user['id'],
                     username=user['username'],
-                    is_admin=(user['username'] == ADMIN_USERNAME)
+                    is_admin=(user['username'] == ADMIN_USERNAME),
+                    must_change_password=bool(user.get('must_change_password'))
                 )
 
         login_failure_tracker.record_failure(fail_key)
@@ -672,7 +699,8 @@ async def login(request: LoginRequest):
                 message="登录成功",
                 user_id=user['id'],
                 username=user['username'],
-                is_admin=(user['username'] == ADMIN_USERNAME)
+                is_admin=(user['username'] == ADMIN_USERNAME),
+                must_change_password=bool(user.get('must_change_password'))
             )
 
         login_failure_tracker.record_failure(fail_key)
@@ -721,7 +749,8 @@ async def login(request: LoginRequest):
             message="登录成功",
             user_id=user['id'],
             username=user['username'],
-            is_admin=(user['username'] == ADMIN_USERNAME)
+            is_admin=(user['username'] == ADMIN_USERNAME),
+            must_change_password=bool(user.get('must_change_password'))
         )
 
     else:
@@ -739,7 +768,8 @@ async def verify(user_info: Optional[Dict[str, Any]] = Depends(verify_token)):
             "authenticated": True,
             "user_id": user_info['user_id'],
             "username": user_info['username'],
-            "is_admin": user_info['username'] == ADMIN_USERNAME
+            "is_admin": user_info['username'] == ADMIN_USERNAME,
+            "must_change_password": bool(user_info.get('must_change_password'))
         }
     return {"authenticated": False}
 
@@ -1135,6 +1165,12 @@ async def send_verification_code(request: SendCodeRequest):
                 message="图形验证码错误或已过期"
             )
 
+        purpose = str(request.type or '').strip().lower()
+        if purpose not in {'register', 'login'}:
+            return SendCodeResponse(success=False, message='验证码用途无效')
+        if purpose == 'register' and db_manager.get_system_setting('registration_enabled') != 'true':
+            return SendCodeResponse(success=False, message='注册功能已关闭')
+
         # 3. 发送频率限制：同邮箱 60s 冷却 + 每日上限
         wait_seconds = email_code_send_limiter.acquire(request.email)
         if wait_seconds is not None:
@@ -1146,7 +1182,7 @@ async def send_verification_code(request: SendCodeRequest):
             )
 
         # 4. 根据验证码类型进行不同的检查
-        if request.type == 'register':
+        if purpose == 'register':
             # 注册验证码：检查邮箱是否已注册
             existing_user = db_manager.get_user_by_email(request.email)
             if existing_user:
@@ -1154,7 +1190,7 @@ async def send_verification_code(request: SendCodeRequest):
                     success=False,
                     message="该邮箱已被注册"
                 )
-        elif request.type == 'login':
+        elif purpose == 'login':
             # 登录验证码：检查邮箱是否存在
             existing_user = db_manager.get_user_by_email(request.email)
             if not existing_user:
@@ -1167,7 +1203,7 @@ async def send_verification_code(request: SendCodeRequest):
         code = db_manager.generate_verification_code()
 
         # 6. 保存验证码到数据库（重发时自动作废旧活码）
-        if not db_manager.save_verification_code(request.email, code, request.type):
+        if not db_manager.save_verification_code(request.email, code, purpose):
             return SendCodeResponse(
                 success=False,
                 message="验证码保存失败，请稍后重试"
@@ -1718,7 +1754,7 @@ async def send_message_api(request: SendMessageRequest):
             cleaned_message
         )
 
-        logger.info(f"API成功发送消息: {cleaned_cookie_id} -> {cleaned_to_user_id}, 内容: {cleaned_message[:50]}{'...' if len(cleaned_message) > 50 else ''}")
+        logger.info(f"API成功发送消息: {cleaned_cookie_id} -> {cleaned_to_user_id}, 字符数: {len(cleaned_message)}")
 
         return SendMessageResponse(
             success=True,
@@ -9589,8 +9625,13 @@ async def import_verified_web_session(cookie_id: str, request_text: str = Form(.
         previous.manual_captcha_in_progress = True
     def writer():
         try:
+            from app.services.secret_storage import seal
+            stored_original = db.conn.execute('SELECT value FROM cookies WHERE id=? AND user_id=?',
+                                              (cookie_id, current_user['user_id'])).fetchone()
+            if not stored_original:
+                return False
             changed = db.conn.execute('UPDATE cookies SET value=? WHERE id=? AND user_id=? AND value=?',
-                       (new_cookie,cookie_id,current_user['user_id'],original)).rowcount
+                       (seal(new_cookie, f'cookie:{cookie_id}'), cookie_id, current_user['user_id'], stored_original[0])).rowcount
             if changed != 1:
                 db.conn.rollback()
                 return False

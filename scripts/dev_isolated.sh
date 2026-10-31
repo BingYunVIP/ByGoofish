@@ -10,5 +10,5 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/bygoofish-isolated-XXXXXX")"
 chmod 700 "$TMP"
 trap 'rm -rf "$TMP"' EXIT
 cd "$ROOT" || exit 1
-DB_PATH="$TMP/isolated.db" APP_LOG_PATH="$TMP/app.log" SQL_LOG_ENABLED=false ACCOUNT_OFFLINE_MONITOR_ENABLED=false \
+DB_PATH="$TMP/isolated.db" BYGOOFISH_MASTER_KEY_FILE="$TMP/master.key" APP_LOG_PATH="$TMP/app.log" SQL_LOG_ENABLED=false SQLITE_FOREIGN_KEYS=false ACCOUNT_OFFLINE_MONITOR_ENABLED=false \
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ROOT" "${PYTHON:-$ROOT/.venv/bin/python}" -B "$@"

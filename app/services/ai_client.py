@@ -634,7 +634,8 @@ class AIClient:
 
     def __init__(self, base_url: Optional[str], api_key: Optional[str], *, user_agent: str = '',
                  timeout: float = REQUEST_TIMEOUT, total_timeout: float = TOTAL_TIMEOUT,
-                 min_fallback: float = MIN_FALLBACK_SECONDS) -> None:
+                 min_fallback: float = MIN_FALLBACK_SECONDS,
+                 allow_private: bool = True) -> None:
         self.base_url = resolve_base_url(base_url)
         self.api_key = _clean_api_key(api_key)
         agent = (user_agent or '').encode('ascii', 'ignore').decode().strip()
@@ -642,6 +643,7 @@ class AIClient:
         self.timeout = float(timeout)
         self.total_timeout = float(total_timeout)
         self.min_fallback = float(min_fallback)
+        self.allow_private = bool(allow_private)
 
     # -- 内部 ------------------------------------------------------------
 
@@ -752,7 +754,7 @@ class AIClient:
         model = (model or '').strip()
         if not model:
             raise AIConfigError('模型名称不能为空')
-        validate_outbound_url(self.base_url, allow_private=True)
+        validate_outbound_url(self.base_url, allow_private=self.allow_private)
         order = plan_protocols(self.base_url, model)
         deadline = time.monotonic() + self.total_timeout
         failures: List[Tuple[str, Exception]] = []

@@ -184,14 +184,10 @@ class ImageManager:
             删除成功返回True，失败返回False
         """
         try:
-            # 构建完整路径
-            if not image_path.startswith(self.upload_dir):
-                full_path = os.path.join(os.getcwd(), image_path)
-            else:
-                full_path = image_path
-            
-            if os.path.exists(full_path):
-                os.remove(full_path)
+            from utils.path_security import safe_upload_path
+            full_path = safe_upload_path(image_path)
+            if full_path.exists() and full_path.is_file() and not full_path.is_symlink():
+                full_path.unlink()
                 logger.info(f"图片删除成功: {image_path}")
                 return True
             else:

@@ -58,12 +58,14 @@ class SessionStore:
         with db_manager.lock:
             row = db_manager.conn.execute('''
                 SELECT s.user_id,u.username,u.password_hash,u.is_active,
+                       COALESCE(u.must_change_password,0),
                        s.password_fingerprint,s.created_at,s.expires_at
                 FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?
             ''', (digest(token),)).fetchone()
-            if not row or not row[3] or row[6] <= time.time() or not secrets.compare_digest(digest(row[2]), row[4]):
+            if not row or not row[3] or row[7] <= time.time() or not secrets.compare_digest(digest(row[2]), row[5]):
                 return default
-            return {'user_id':row[0], 'username':row[1], 'is_admin':row[1]=='admin', 'timestamp':row[5]}
+            return {'user_id':row[0], 'username':row[1], 'is_admin':row[1]=='admin',
+                    'must_change_password': bool(row[4]), 'timestamp':row[6]}
 
     def __getitem__(self, token):
         value = self.get(token)

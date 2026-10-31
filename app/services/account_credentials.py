@@ -72,12 +72,12 @@ def change(db, user_id, current_password, *, new_password=None, new_email=None, 
                                    (attempts, attempts >= 5, code_id))
                     db.conn.commit()
                     return result_error('code_attempts_exceeded' if attempts >= 5 else 'code_wrong', request_id=request_id)
-                cursor.execute('UPDATE users SET email=?,updated_at=CURRENT_TIMESTAMP WHERE id=?', (new_email,user_id))
+                cursor.execute('UPDATE users SET email=?,must_change_password=0,updated_at=CURRENT_TIMESTAMP WHERE id=?', (new_email,user_id))
                 cursor.execute('UPDATE email_verifications SET used=1 WHERE id=?', (code_id,))
             else:
                 if new_password == current_password:
                     return reject('password_unchanged')
-                cursor.execute('UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',
+                cursor.execute('UPDATE users SET password_hash=?,must_change_password=0,updated_at=CURRENT_TIMESTAMP WHERE id=?',
                                (hash_password(new_password),user_id))
             # The credential mutation and revocation succeed or roll back together.
             cursor.execute('DELETE FROM auth_sessions WHERE user_id=?', (user_id,))

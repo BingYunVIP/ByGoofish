@@ -100,6 +100,8 @@ class DBManager:
         """初始化数据库表结构"""
         try:
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            if os.getenv('SQLITE_FOREIGN_KEYS', 'true').strip().lower() not in ('0', 'false', 'no'):
+                self.conn.execute('PRAGMA foreign_keys=ON')
             cursor = self.conn.cursor()
             
             # 创建用户表
@@ -114,6 +116,9 @@ class DBManager:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             ''')
+            user_columns = {row[1] for row in cursor.execute('PRAGMA table_info(users)').fetchall()}
+            if 'must_change_password' not in user_columns:
+                cursor.execute('ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0')
 
             # 创建邮箱验证码表
             cursor.execute('''
@@ -1390,6 +1395,12 @@ class DBManager:
                 else:
                     logger.info("创建 admin 用户，密码取自 ADMIN_PASSWORD 环境变量")
 
+            admin_columns = {row[1] for row in cursor.execute('PRAGMA table_info(users)').fetchall()}
+            if 'must_change_password' in admin_columns:
+                row = cursor.execute("SELECT password_hash FROM users WHERE username='admin'").fetchone()
+                if row and verify_password('admin123', row[0]):
+                    cursor.execute("UPDATE users SET must_change_password=1 WHERE username='admin'")
+
             # 获取admin用户ID，用于历史数据绑定
             self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
             admin_user = cursor.fetchone()
@@ -2300,13 +2311,14 @@ class DBManager:
 
                 if not cursor.execute('SELECT 1 FROM users WHERE id=?', (user_id,)).fetchone():
                     return False
+                from app.services.secret_storage import seal
                 is_new = not cursor.execute('SELECT 1 FROM cookies WHERE id=?', (cookie_id,)).fetchone()
                 self._execute_sql(cursor,
                     "INSERT INTO cookies (id, value, user_id, auto_rate_enabled, auto_flower_enabled, auto_thanks_enabled) "
                     "VALUES (?, ?, ?, 1, 1, 1) "
                     "ON CONFLICT(id) DO UPDATE SET value=excluded.value "
                     "WHERE cookies.user_id=excluded.user_id",
-                    (cookie_id, cookie_value, user_id)
+                    (cookie_id, seal(cookie_value, f'cookie:{cookie_id}'), user_id)
                 )
 
                 if cursor.rowcount == 0:
@@ -2366,7 +2378,8 @@ class DBManager:
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, "SELECT value FROM cookies WHERE id = ?", (cookie_id,))
                 result = cursor.fetchone()
-                return result[0] if result else None
+                from app.services.secret_storage import open_secret
+                return open_secret(result[0], f'cookie:{cookie_id}') if result else None
             except Exception as e:
                 logger.error(f"获取Cookie失败: {e}")
                 return None
@@ -2380,7 +2393,8 @@ class DBManager:
                     self._execute_sql(cursor, "SELECT id, value FROM cookies WHERE user_id = ?", (user_id,))
                 else:
                     self._execute_sql(cursor, "SELECT id, value FROM cookies")
-                return {row[0]: row[1] for row in cursor.fetchall()}
+                from app.services.secret_storage import open_secret
+                return {row[0]: open_secret(row[1], f'cookie:{row[0]}') for row in cursor.fetchall()}
             except Exception as e:
                 logger.error(f"获取所有Cookie失败: {e}")
                 return {}
@@ -2416,8 +2430,8 @@ class DBManager:
                 if result:
                     return {
                         'id': result[0],
-                        'cookies_str': result[1],  # 使用cookies_str字段名以匹配调用方期望
-                        'value': result[1],        # 保持向后兼容
+                        'cookies_str': __import__('app.services.secret_storage', fromlist=['open_secret']).open_secret(result[1], f'cookie:{cookie_id}'),
+                        'value': __import__('app.services.secret_storage', fromlist=['open_secret']).open_secret(result[1], f'cookie:{cookie_id}'),
                         'created_at': result[2]
                     }
                 return None
@@ -2444,15 +2458,16 @@ class DBManager:
                 )
                 result = cursor.fetchone()
                 if result:
+                    from app.services.secret_storage import open_secret
                     return {
                         'id': result[0],
-                        'value': result[1],
+                        'value': open_secret(result[1], f'cookie:{cookie_id}'),
                         'user_id': result[2],
                         'auto_confirm': bool(result[3]),
                         'remark': result[4] or '',
                         'pause_duration': result[5] if result[5] is not None else 10,  # 0是有效值，表示不暂停
                         'username': result[6] or '',
-                        'password': result[7] or '',
+                        'password': open_secret(result[7], f'account-password:{cookie_id}') if result[7] else '',
                         'show_browser': bool(result[8]) if result[8] is not None else False,
                         'nickname': result[9] or '',
                         'avatar_url': result[10] or '',
@@ -2603,7 +2618,8 @@ class DBManager:
                     
                     # 构建插入语句
                     insert_fields = ['id', 'value', 'user_id']
-                    insert_values = [cookie_id, cookie_value, user_id]
+                    from app.services.secret_storage import seal
+                    insert_values = [cookie_id, seal(cookie_value, f'cookie:{cookie_id}'), user_id]
                     insert_placeholders = ['?', '?', '?']
                     
                     if username is not None:
@@ -2613,7 +2629,7 @@ class DBManager:
                     
                     if password is not None:
                         insert_fields.append('password')
-                        insert_values.append(password)
+                        insert_values.append(seal(password, f'account-password:{cookie_id}'))
                         insert_placeholders.append('?')
                     
                     if show_browser is not None:
@@ -2634,7 +2650,8 @@ class DBManager:
                     
                     if cookie_value is not None:
                         update_fields.append("value = ?")
-                        params.append(cookie_value)
+                        from app.services.secret_storage import seal
+                        params.append(seal(cookie_value, f'cookie:{cookie_id}'))
                     
                     if username is not None:
                         update_fields.append("username = ?")
@@ -2642,7 +2659,8 @@ class DBManager:
                     
                     if password is not None:
                         update_fields.append("password = ?")
-                        params.append(password)
+                        from app.services.secret_storage import seal
+                        params.append(seal(password, f'account-password:{cookie_id}'))
                     
                     if show_browser is not None:
                         update_fields.append("show_browser = ?")
@@ -3001,6 +3019,8 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                from app.services.secret_storage import seal
+                stored_key = seal(settings.get('api_key', ''), f'ai-key:{cookie_id}')
                 cursor.execute('''
                 INSERT OR REPLACE INTO ai_reply_settings
                 (cookie_id, ai_enabled, model_name, api_key, base_url, user_agent,
@@ -3012,7 +3032,7 @@ class DBManager:
                     cookie_id,
                     settings.get('ai_enabled', False),
                     settings.get('model_name', 'qwen-plus'),
-                    settings.get('api_key', ''),
+                    stored_key,
                     resolve_base_url(settings.get('base_url')),
                     settings.get('user_agent', ''),
                     settings.get('max_discount_percent', 10),
@@ -3071,7 +3091,8 @@ class DBManager:
                 if result:
                     # 账号有设置，但如果api_key/base_url/model_name为空或等于默认值，使用系统设置
                     account_model = result[1]
-                    account_api_key = result[2]
+                    from app.services.secret_storage import open_secret
+                    account_api_key = open_secret(result[2], f'ai-key:{cookie_id}') if result[2] else ''
                     account_base_url = result[3]
                     
                     # 如果账号值为空或等于硬编码默认值，则使用系统设置
@@ -3139,7 +3160,8 @@ class DBManager:
                     (cookie_id,),
                 )
                 row = cursor.fetchone()
-                return (row[0] or '') if row else ''
+                from app.services.secret_storage import open_secret
+                return open_secret(row[0], f'ai-key:{cookie_id}') if row and row[0] else ''
             except Exception as e:
                 logger.error(f"获取账号AI API Key失败: {e}")
                 return ''
@@ -3160,10 +3182,11 @@ class DBManager:
                 result = {}
                 for row in cursor.fetchall():
                     cookie_id = row[0]
+                    from app.services.secret_storage import open_secret
                     result[cookie_id] = {
                         'ai_enabled': bool(row[1]),
                         'model_name': row[2],
-                        'api_key': row[3],
+                        'api_key': open_secret(row[3], f'ai-key:{cookie_id}') if row[3] else '',
                         'base_url': row[4],
                         'user_agent': row[5] or '',
                         'max_discount_percent': row[6],
@@ -3341,7 +3364,9 @@ class DBManager:
         """创建通知渠道"""
         with self.lock:
             try:
+                from app.services.secret_storage import seal
                 cursor = self.conn.cursor()
+                config = seal(config, f'notification-channel:{user_id}')
                 cursor.execute('''
                 INSERT INTO notification_channels (name, type, config, user_id)
                 VALUES (?, ?, ?, ?)
@@ -3362,25 +3387,26 @@ class DBManager:
                 cursor = self.conn.cursor()
                 if user_id is not None:
                     cursor.execute('''
-                    SELECT id, name, type, config, enabled, created_at, updated_at
+                    SELECT id, name, type, config, enabled, created_at, updated_at, user_id
                     FROM notification_channels
                     WHERE user_id = ?
                     ORDER BY created_at DESC
                     ''', (user_id,))
                 else:
                     cursor.execute('''
-                    SELECT id, name, type, config, enabled, created_at, updated_at
+                    SELECT id, name, type, config, enabled, created_at, updated_at, user_id
                     FROM notification_channels
                     ORDER BY created_at DESC
                     ''')
 
+                from app.services.secret_storage import open_secret
                 channels = []
                 for row in cursor.fetchall():
                     channels.append({
                         'id': row[0],
                         'name': row[1],
                         'type': row[2],
-                        'config': row[3],
+                        'config': open_secret(row[3], f'notification-channel:{row[7]}') if row[3] else '{}',
                         'enabled': bool(row[4]),
                         'created_at': row[5],
                         'updated_at': row[6]
@@ -3398,12 +3424,12 @@ class DBManager:
                 cursor = self.conn.cursor()
                 if user_id is not None:
                     cursor.execute('''
-                    SELECT id, name, type, config, enabled, created_at, updated_at
+                    SELECT id, name, type, config, enabled, created_at, updated_at, user_id
                     FROM notification_channels WHERE id = ? AND user_id = ?
                     ''', (channel_id, user_id))
                 else:
                     cursor.execute('''
-                    SELECT id, name, type, config, enabled, created_at, updated_at
+                    SELECT id, name, type, config, enabled, created_at, updated_at, user_id
                     FROM notification_channels WHERE id = ?
                     ''', (channel_id,))
 
@@ -3413,7 +3439,7 @@ class DBManager:
                         'id': row[0],
                         'name': row[1],
                         'type': row[2],
-                        'config': row[3],
+                        'config': __import__('app.services.secret_storage', fromlist=['open_secret']).open_secret(row[3], f'notification-channel:{row[7]}') if row[3] else '{}',
                         'enabled': bool(row[4]),
                         'created_at': row[5],
                         'updated_at': row[6]
@@ -3428,7 +3454,13 @@ class DBManager:
         """更新通知渠道"""
         with self.lock:
             try:
+                from app.services.secret_storage import seal
                 cursor = self.conn.cursor()
+                owner = user_id
+                if owner is None:
+                    row = cursor.execute('SELECT user_id FROM notification_channels WHERE id=?', (channel_id,)).fetchone()
+                    owner = row[0] if row else None
+                config = seal(config, f'notification-channel:{owner}')
                 if user_id is not None:
                     cursor.execute('''
                     UPDATE notification_channels
@@ -3694,6 +3726,8 @@ class DBManager:
                 '''
                 cursor.execute(sql, params)
 
+                from app.services.secret_storage import open_secret
+                owner = user_id if user_id is not None else self.get_cookie_owner_user(cookie_id)
                 notifications = []
                 for row in cursor.fetchall():
                     rule_event_types = parse_event_types(row[7])
@@ -3705,7 +3739,7 @@ class DBManager:
                         'enabled': bool(row[2]),
                         'channel_name': row[3],
                         'channel_type': row[4],
-                        'channel_config': row[5],
+                        'channel_config': open_secret(row[5], f'notification-channel:{owner}') if row[5] else '{}',
                         'name': row[6],
                         'event_types': rule_event_types,
                         'reminder_limit': row[8],
@@ -3726,7 +3760,7 @@ class DBManager:
                 cursor = self.conn.cursor()
                 sql = '''
                 SELECT mn.cookie_id, mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config,
-                       mn.name, mn.event_types, nc.enabled, mn.reminder_limit, mn.reminder_interval_minutes
+                       mn.name, mn.event_types, nc.enabled, mn.reminder_limit, mn.reminder_interval_minutes, c.user_id
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
                 JOIN cookies c ON mn.cookie_id = c.id
@@ -3740,6 +3774,7 @@ class DBManager:
                 '''
                 cursor.execute(sql, params)
 
+                from app.services.secret_storage import open_secret
                 result = {}
                 for row in cursor.fetchall():
                     cookie_id = row[0]
@@ -3752,7 +3787,7 @@ class DBManager:
                         'enabled': bool(row[3]),
                         'channel_name': row[4],
                         'channel_type': row[5],
-                        'channel_config': row[6],
+                        'channel_config': open_secret(row[6], f'notification-channel:{row[12]}') if row[6] else '{}',
                         'name': row[7],
                         'event_types': parse_event_types(row[8]),
                         'channel_enabled': bool(row[9]),
@@ -4083,7 +4118,10 @@ class DBManager:
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, "SELECT value FROM system_settings WHERE key = ?", (key,))
                 result = cursor.fetchone()
-                return result[0] if result else None
+                if not result:
+                    return None
+                from app.services.secret_storage import is_secret_setting, open_secret
+                return open_secret(result[0], f'system-setting:{key}') if is_secret_setting(key) else result[0]
             except Exception as e:
                 logger.error(f"获取系统设置失败: {e}")
                 return None
@@ -4092,7 +4130,10 @@ class DBManager:
         """设置系统设置"""
         with self.lock:
             try:
+                from app.services.secret_storage import is_secret_setting, seal
                 cursor = self.conn.cursor()
+                if is_secret_setting(key):
+                    value = seal(value, f'system-setting:{key}')
                 cursor.execute('''
                 INSERT OR REPLACE INTO system_settings (key, value, description, updated_at)
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
@@ -4113,8 +4154,9 @@ class DBManager:
                 self._execute_sql(cursor, "SELECT key, value FROM system_settings")
 
                 settings = {}
+                from app.services.secret_storage import is_secret_setting, open_secret
                 for row in cursor.fetchall():
-                    settings[row[0]] = row[1]
+                    settings[row[0]] = open_secret(row[1], f'system-setting:{row[0]}') if is_secret_setting(row[0]) else row[1]
 
                 return settings
             except Exception as e:
@@ -4155,7 +4197,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, password_hash, is_active, created_at, updated_at, COALESCE(must_change_password,0)
                 FROM users WHERE username = ?
                 ''', (username,))
 
@@ -4169,6 +4211,7 @@ class DBManager:
                         'is_active': row[4],
                         'created_at': row[5],
                         'updated_at': row[6]
+                        ,'must_change_password': bool(row[7])
                     }
                 return None
             except Exception as e:
@@ -4181,7 +4224,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, password_hash, is_active, created_at, updated_at, COALESCE(must_change_password,0)
                 FROM users WHERE email = ?
                 ''', (email,))
 
@@ -4195,6 +4238,7 @@ class DBManager:
                         'is_active': row[4],
                         'created_at': row[5],
                         'updated_at': row[6]
+                        ,'must_change_password': bool(row[7])
                     }
                 return None
             except Exception as e:
@@ -4549,7 +4593,7 @@ class DBManager:
             cursor = self.conn.cursor()
             cursor.execute(
                 """
-                SELECT c.config FROM notification_channels c
+                SELECT c.config, c.user_id FROM notification_channels c
                 JOIN users u ON u.id = c.user_id
                 WHERE c.type = 'email' AND c.enabled = 1 AND u.username = 'admin'
                 ORDER BY c.id LIMIT 1
@@ -4559,7 +4603,8 @@ class DBManager:
         if not row:
             return None
         try:
-            config = json.loads(row[0])
+            from app.services.secret_storage import open_secret
+            config = json.loads(open_secret(row[0], f'notification-channel:{row[1]}'))
             port = int(config.get('smtp_port') or 0)
         except (TypeError, ValueError):
             return None

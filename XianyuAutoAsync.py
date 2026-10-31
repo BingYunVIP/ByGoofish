@@ -4606,21 +4606,16 @@ class XianyuLive:
                 'source': 'xianyu-auto-reply'
             }
 
-            async with aiohttp.ClientSession(trust_env=False) as session:
-                if http_method == 'POST':
-                    async with session.post(webhook_url, json=data, headers=headers, timeout=10) as response:
-                        if response.status == 200:
-                            logger.info(f"Webhook通知发送成功")
-                        else:
-                            logger.warning(f"Webhook通知发送失败: {response.status}")
-                elif http_method == 'PUT':
-                    async with session.put(webhook_url, json=data, headers=headers, timeout=10) as response:
-                        if response.status == 200:
-                            logger.info(f"Webhook通知发送成功")
-                        else:
-                            logger.warning(f"Webhook通知发送失败: {response.status}")
-                else:
-                    logger.warning(f"不支持的HTTP方法: {http_method}")
+            if http_method not in {'POST', 'PUT'}:
+                logger.warning(f"不支持的HTTP方法: {http_method}")
+                return
+            from app.services.outbound_security import request_json_public
+            status, _ = await request_json_public(http_method, webhook_url,
+                                                  payload=data, headers=headers, timeout=10)
+            if 200 <= status < 300:
+                logger.info("Webhook通知发送成功")
+            else:
+                logger.warning(f"Webhook通知发送失败: {status}")
 
         except Exception as e:
             logger.error(f"发送Webhook通知异常: {self._safe_str(e)}")
@@ -5484,28 +5479,47 @@ class XianyuLive:
                 params = await self._replace_api_dynamic_params(params, order_id, item_id, buyer_id, spec_name, spec_value)
 
             retry_info = f" (重试 {retry_count + 1}/{max_retries})" if retry_count > 0 else ""
-            logger.info(f"调用API获取卡券: {method} {url}{retry_info}")
+            from urllib.parse import urlsplit
+            safe_target = urlsplit(str(url))._replace(query='', fragment='').geturl()
+            logger.info(f"调用API获取卡券: {method} {safe_target[:200]}{retry_info}")
             if method == 'POST' and params:
-                logger.warning(f"POST请求参数: {json.dumps(params, ensure_ascii=False)}")
+                logger.debug("卡券 API POST 参数已省略（仅记录字段数量） fields=%d", len(params) if isinstance(params, dict) else 0)
 
-            # 确保session存在
-            if not self.session:
-                await self.create_session()
-
-            # 发起HTTP请求
+            # 第三方卡券接口必须使用独立、无 Cookie 的公网客户端。
+            # self.session 带有闲鱼 Cookie，不能复用于外部配置地址。
+            from app.services.outbound_security import validate_external_url, validate_redirect
+            current_url = validate_external_url(url)
             timeout_obj = aiohttp.ClientTimeout(total=timeout)
-
-            if method == 'GET':
-                async with self.session.get(url, headers=headers, params=params, timeout=timeout_obj) as response:
-                    status_code = response.status
-                    response_text = await response.text()
-            elif method == 'POST':
-                async with self.session.post(url, headers=headers, json=params, timeout=timeout_obj) as response:
-                    status_code = response.status
-                    response_text = await response.text()
-            else:
+            if method not in {'GET', 'POST'}:
                 logger.error(f"不支持的HTTP方法: {method}")
                 return None
+            safe_headers = {str(k): str(v) for k, v in (headers or {}).items()
+                            if str(k).lower() not in {'cookie', 'referer', 'origin', 'host', 'user-agent'}}
+            resolver = aiohttp.ThreadedResolver()
+            connector = aiohttp.TCPConnector(resolver=resolver, limit=2)
+            try:
+                async with aiohttp.ClientSession(
+                    trust_env=False, connector=connector,
+                    cookie_jar=aiohttp.DummyCookieJar(), timeout=timeout_obj,
+                ) as external:
+                    for _ in range(4):
+                        async with external.request(method, current_url, headers=safe_headers,
+                                                    params=params if method == 'GET' else None,
+                                                    json=params if method == 'POST' else None,
+                                                    allow_redirects=False) as response:
+                            if response.status in {301, 302, 303, 307, 308}:
+                                location = response.headers.get('Location')
+                                if not location:
+                                    return None
+                                current_url = validate_redirect(current_url, location)
+                                continue
+                            status_code = response.status
+                            response_text = await response.text()
+                            break
+                    else:
+                        return None
+            finally:
+                await resolver.close()
 
             if status_code == 200:
                 # 尝试解析JSON响应，如果失败则使用原始文本
@@ -5831,8 +5845,12 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
-        self._remember_programmatic_echo(cid,text["text"]["text"])
+        # Delivery must wait for the platform response keyed by mid. A successful
+        # WebSocket write alone is only an outbound attempt and cannot consume stock.
+        if ws is getattr(self, 'ws', None) and not getattr(ws, 'closed', False):
+            await self._send_im_request(msg['lwp'], msg['body'], timeout=20)
+        else:
+            raise ConnectionError('闲鱼消息连接不可用，发送结果未知')
 
     def _resolve_im_response(self, message_data):
         """Resolve a pending IM request when the server echoes its mid."""
@@ -9846,8 +9864,9 @@ class XianyuLive:
                 ]
             }
 
-            await ws.send(json.dumps(msg))
-            self._remember_programmatic_echo(cid,['[图片]','[图片消息]'])
+            if ws is not getattr(self, 'ws', None) or getattr(ws, 'closed', False):
+                raise ConnectionError('闲鱼消息连接不可用，图片发送结果未知')
+            await self._send_im_request(msg['lwp'], msg['body'], timeout=20)
             logger.info(f"【{self.cookie_id}】图片消息发送成功: {image_url}")
 
         except Exception as e:
