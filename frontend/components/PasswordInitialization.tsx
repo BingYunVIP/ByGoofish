@@ -9,7 +9,7 @@ import ThemeToggle from './ThemeToggle';
 /** Mounted instead of the workbench, so bootstrap sessions make no business requests. */
 const PasswordInitialization: React.FC = () => {
   const [form, setForm] = useState({ current: '', next: '', confirm: '' });
-  const [visible, setVisible] = useState(false);
+  const [visible, setVisible] = useState({ current: false, next: false, confirm: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const locked = useRef(false);
@@ -88,21 +88,27 @@ const PasswordInitialization: React.FC = () => {
             ['next', '新密码', 'new-password'],
             ['confirm', '确认新密码', 'new-password'],
           ] as const).map(([key, label, autocomplete]) => (
-            <label key={key} className="block">
-              <span className="mb-1.5 block text-sm font-semibold">{label}</span>
-              <input required type={visible ? 'text' : 'password'} autoComplete={autocomplete}
-                value={form[key]} disabled={busy}
-                onChange={event => setForm(previous => ({ ...previous, [key]: event.target.value }))}
-                aria-describedby={key === 'next' ? 'password-rules' : undefined}
-                className="ios-input min-h-11 w-full rounded-md px-3 py-2.5 text-sm disabled:opacity-60" />
-            </label>
+            <div key={key}>
+              <label htmlFor={`initial-password-${key}`} className="mb-1.5 block text-sm font-semibold">{label}</label>
+              <div className="relative">
+                <input id={`initial-password-${key}`} required type={visible[key] ? 'text' : 'password'} autoComplete={autocomplete}
+                  value={form[key]} disabled={busy}
+                  placeholder={key === 'next' ? '8–64位，字母+数字，≤72字节' : `请输入${label}`}
+                  title={key === 'next' ? '新密码需8–64位，同时包含字母和数字，且不超过72字节。' : undefined}
+                  onChange={event => setForm(previous => ({ ...previous, [key]: event.target.value }))}
+                  aria-describedby={key === 'next' ? 'password-rules' : undefined}
+                  className="ios-input h-11 w-full rounded-md py-2.5 pl-3 pr-12 text-sm placeholder:text-xs disabled:opacity-60" />
+                <button type="button" disabled={busy} aria-controls={`initial-password-${key}`}
+                  onClick={() => setVisible(previous => ({ ...previous, [key]: !previous[key] }))}
+                  aria-pressed={visible[key]} aria-label={`${visible[key] ? '隐藏' : '显示'}${label}`}
+                  title={`${visible[key] ? '隐藏' : '显示'}${label}`}
+                  className="absolute inset-y-0 right-0 flex w-11 items-center justify-center rounded-md text-[var(--text-muted)] hover:text-[var(--text)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--brand)] disabled:opacity-60">
+                  {visible[key] ? <EyeOff aria-hidden="true" className="h-4 w-4" /> : <Eye aria-hidden="true" className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
           ))}
-          <p id="password-rules" className="text-xs leading-5 text-[var(--text-soft)]">新密码需8–64位，同时包含字母和数字，且不超过72字节。</p>
-          <button type="button" onClick={() => setVisible(value => !value)} aria-pressed={visible}
-            className="ios-btn-secondary inline-flex min-h-11 items-center gap-2 rounded-md px-3 py-2 text-sm">
-            {visible ? <EyeOff aria-hidden="true" className="h-4 w-4" /> : <Eye aria-hidden="true" className="h-4 w-4" />}
-            {visible ? '隐藏密码' : '显示密码'}
-          </button>
+          <p id="password-rules" className="sr-only">新密码需8–64位，同时包含字母和数字，且不超过72字节。</p>
           <div ref={errorBox} role={error ? 'alert' : undefined} tabIndex={-1} className={error ? 'rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm leading-6 text-red-800' : 'hidden'}>{error}</div>
           <button type="submit" disabled={busy} className="ios-btn-primary flex min-h-11 w-full items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm disabled:opacity-60">
             {busy ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" /> : <KeyRound aria-hidden="true" className="h-4 w-4" />}修改密码并重新登录
