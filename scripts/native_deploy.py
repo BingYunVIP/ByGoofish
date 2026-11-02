@@ -308,6 +308,8 @@ def write_service(root, directory, host, port, db, user, home, browsers, browser
     for path in (private / "settings.json", private / "service.env", master):
         path.chmod(0o600)
     directory.mkdir(parents=True, exist_ok=True)
+    writable_paths = " ".join(quote_unit(root / relative) for relative in
+                              ("data", "logs", "browser_data", "static/uploads", ".local"))
     text = ("[Unit]\nStartLimitIntervalSec=300\nStartLimitBurst=3\n\n[Service]\n"
             f"WorkingDirectory={str(root).replace('%', '%%')}\nExecStart=\n"
             f"ExecStart=/usr/bin/xvfb-run -a -s \"-screen 0 1920x1080x24\" {quote_unit(root / '.venv/bin/python')} -u {quote_unit(root / 'Start.py')}\n"
@@ -317,11 +319,7 @@ def write_service(root, directory, host, port, db, user, home, browsers, browser
             "PrivateTmp=true\nProtectSystem=strict\nProtectHome=read-only\n"
             "ProtectKernelTunables=true\nProtectKernelModules=true\nProtectControlGroups=true\n"
             "RestrictSUIDSGID=true\nLockPersonality=true\nRestrictRealtime=true\n"
-            f"ReadWritePaths={str(root).replace('%','%%').replace(' ','\\x20')}/data "
-            f"{str(root).replace('%','%%').replace(' ','\\x20')}/logs "
-            f"{str(root).replace('%','%%').replace(' ','\\x20')}/browser_data "
-            f"{str(root).replace('%','%%').replace(' ','\\x20')}/static/uploads "
-            f"{str(root).replace('%','%%').replace(' ','\\x20')}/.local\n")
+            f"ReadWritePaths={writable_paths}\n")
     (directory / "90-bygoofish-native.conf").write_text(text)
 
 

@@ -28,6 +28,23 @@ def git(root, *args):
 
 
 class NativeHelpers(unittest.TestCase):
+    def test_frontend_publication_is_readable_with_private_build_permissions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, live = root / 'stage', root / 'live'
+            for directory in (stage, live):
+                (directory / 'assets').mkdir(parents=True)
+            (stage / 'index.html').write_text('<script src="/assets/new.js"></script>')
+            (stage / 'assets/new.js').write_text('new')
+            (live / 'index.html').write_text('<script src="/assets/old.js"></script>')
+            (live / 'assets/old.js').write_text('old')
+            for path in (stage / 'index.html', stage / 'assets/new.js', live / 'assets/old.js'):
+                path.chmod(0o600)
+            subprocess.run([sys.executable, str(ROOT / 'scripts/publish_frontend.py'), str(stage),
+                            '--static-dir', str(live)], check=True, capture_output=True)
+            for path in (live / 'index.html', live / 'assets/new.js', live / 'assets/old.js'):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+
     def test_resource_profiles(self):
         self.assertEqual([native.profile(cpu, ram) for cpu, ram in
                           [(1, 16000), (8, 1024), (4, 8000), (12, 8192), (12, 16384)]], [1, 1, 2, 2, 3])
@@ -106,6 +123,9 @@ class NativeHelpers(unittest.TestCase):
             self.assertIn('ExecStart=\nExecStart=', unit)
             self.assertIn('WorkingDirectory=' + str(root), unit)
             self.assertIn('EnvironmentFile=' + str(root / '.local/bygoofish/service.env'), unit)
+            writable_paths = ' '.join(native.quote_unit(root / relative) for relative in
+                                      ('data', 'logs', 'browser_data', 'static/uploads', '.local'))
+            self.assertIn('ReadWritePaths=' + writable_paths + '\n', unit)
             self.assertIn('WEB_CONCURRENCY="1"', env)
             self.assertTrue(native.systemd_values(env)['PATH'].startswith(str(root / 'tools/node/bin') + ':'))
             self.assertNotIn('admin123', env + unit)
@@ -126,7 +146,7 @@ class NativeHelpers(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('systemd-analyze'), 'systemd-analyze is unavailable')
     def test_generated_service_passes_real_systemd_parser_including_space_paths(self):
-        with tempfile.TemporaryDirectory(prefix='bygoofish unit ') as temporary:
+        with tempfile.TemporaryDirectory(prefix='bygoofish unit % ') as temporary:
             root = Path(temporary)
             native.write_service(root, root / 'dropin', '0.0.0.0', '8080', root / 'data/live.db', 'root', '/root', 1)
             unit = root / 'bygoofish-fixture.service'

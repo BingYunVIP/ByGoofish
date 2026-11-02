@@ -64,11 +64,15 @@ def main():
 
     for name in to_copy:
         shutil.copy2(stage_assets / name, live_assets / name)
+    for name in keep:
+        (live_assets / name).chmod(0o644)
     for name in ('favicon.svg',):
         if (stage / name).is_file():
             shutil.copy2(stage / name, static / name)
+            (static / name).chmod(0o644)
     temporary = static / 'index.html.new'
     shutil.copy2(stage / 'index.html', temporary)
+    temporary.chmod(0o644)
     os.replace(temporary, old_entry)  # 原子切换入口
     for name in stale:
         (live_assets / name).unlink()
