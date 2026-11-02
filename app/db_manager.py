@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
 from app.password_hasher import hash_password, is_bcrypt_hash, verify_password
+from utils.product_images import normalize_image_url
 from app.services.ai_client import DEFAULT_AI_BASE_URL, AIConfigError, is_default_base_url, resolve_base_url
 from app.specification import (
     DEFAULT_SPEC_KEY,
@@ -89,6 +90,8 @@ class DBManager:
         initialize_event_journal(self)
         from app.services.item_details import initialize as initialize_item_details
         initialize_item_details(self)
+        from utils.product_images import initialize as initialize_product_images
+        initialize_product_images(self)
         from app.services.auto_reply import initialize as initialize_auto_reply
         initialize_auto_reply(self)
         from app.services.chat_emojis import initialize as initialize_emojis
@@ -5754,6 +5757,7 @@ class DBManager:
         Returns:
             bool: 操作是否成功
         """
+        item_image = normalize_image_url(item_image)
         try:
             with self.lock:
                 cursor = self.conn.cursor()
@@ -5864,6 +5868,8 @@ class DBManager:
                     for column, key in [('item_title','title'),('item_description','description'),
                                         ('item_category','category'),('item_price','price'),('item_image','item_image')]:
                         value = item_data.get(key)
+                        if column == 'item_image':
+                            value = normalize_image_url(value)
                         if value:
                             c.execute(f"UPDATE item_info SET {column}=? WHERE cookie_id=? AND item_id=?", (value,cookie_id,item_id))
                     manual = (item_data.get('detail_source') == 'manual' if 'detail_source' in item_data else
@@ -5907,6 +5913,7 @@ class DBManager:
                     item_info = dict(zip(columns, row))
 
                     item_info.pop('platform_metadata', None)
+                    item_info['item_image'] = normalize_image_url(item_info.get('item_image'))
 
                     return item_info
                 return None
@@ -6607,6 +6614,7 @@ class DBManager:
                     item_info = dict(zip(columns, row))
 
                     item_info.pop('platform_metadata', None)
+                    item_info['item_image'] = normalize_image_url(item_info.get('item_image'))
 
                     items.append(item_info)
 
@@ -6637,6 +6645,7 @@ class DBManager:
                     item_info = dict(zip(columns, row))
 
                     item_info.pop('platform_metadata', None)
+                    item_info['item_image'] = normalize_image_url(item_info.get('item_image'))
 
                     items.append(item_info)
 
@@ -6732,7 +6741,7 @@ class DBManager:
                         item_description = item_data.get('item_description', '')
                         item_category = item_data.get('item_category', '')
                         item_price = item_data.get('item_price', '')
-                        item_image = item_data.get('item_image', '')
+                        item_image = normalize_image_url(item_data.get('item_image', ''))
                         item_detail = item_data.get('item_detail', '')
 
                         if not cookie_id or not item_id:

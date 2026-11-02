@@ -1,3 +1,4 @@
+import type { NativeCapability } from '../../types';
 import { forwardRecipients } from '../../lib/chatWorkspace.mjs';
 import { createPortal } from 'react-dom';
 import { useModalFocus } from '../../lib/useModalFocus';
@@ -94,7 +95,7 @@ export default function MessageWorkspace({
   const [areaMenu,setAreaMenu] = useState<AreaMenuTarget | null>(null);
   const closeAreaMenu=useCallback(()=>setAreaMenu(null),[]);
   const [forwarding,setForwarding] = useState<ChatMessage>();
-  const [capabilities,setCapabilities] = useState<Record<string,{supported:boolean;reason:string}>>({});
+  const [capabilities,setCapabilities] = useState<Record<string,NativeCapability>>({});
   const [emojiState,setEmojiState] = useState<{ account: string; items: OfficialEmoji[] }>({account:'',items:[]});
   const emojis = emojiState.account === w.accountId ? emojiState.items : [];
   const closeMenu = useCallback(() => setMenu(null), []);
@@ -103,7 +104,7 @@ export default function MessageWorkspace({
     if (!isActive || !w.accountId) return;
     let active = true;
     setCapabilities({});
-    get<Record<string,{supported:boolean;reason:string}>>(`/chat/capabilities/${encodeURIComponent(w.accountId)}`).then(result => { if (active) setCapabilities(result); }).catch(() => {});
+    get<Record<string,NativeCapability>>(`/chat/capabilities/${encodeURIComponent(w.accountId)}`).then(result => { if (active) setCapabilities(result); }).catch(() => {});
     get<{items: OfficialEmoji[]}>(`/chat/emojis/${encodeURIComponent(w.accountId)}`,undefined,{timeout:60000})
       .then(result => { if (active) setEmojiState({ account:w.accountId,items:result.items || [] }); }).catch(() => {});
     return () => { active = false; };

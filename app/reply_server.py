@@ -5964,6 +5964,9 @@ def create_manual_item(
             raise HTTPException(status_code=400, detail="请填写商品 ID")
         if not title:
             raise HTTPException(status_code=400, detail="请填写商品标题")
+        from utils.product_images import normalize_image_url
+        if item.image_url.strip() and not normalize_image_url(item.image_url):
+            raise HTTPException(400,'图片地址不可用，请使用HTTPS图片或站内图片地址')
 
         user_cookies = db_manager.get_all_cookies(current_user["user_id"])
         if cookie_id not in user_cookies:
@@ -6459,6 +6462,32 @@ def get_item_detail(cookie_id: str, item_id: str, current_user: Dict[str, Any] =
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取商品详情失败: {str(e)}")
+
+
+@app.post('/items/{cookie_id}/{item_id}/refresh-image')
+async def refresh_product_image(cookie_id: str, item_id: str,
+                                current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Explicit one-item repair; list/detail reads never trigger platform requests."""
+    if cookie_id not in db_manager.get_all_cookies(current_user['user_id']):
+        raise HTTPException(403, '无权访问该闲鱼账号')
+    item = db_manager.get_item_info(cookie_id, item_id)
+    if not item:
+        raise HTTPException(404, '商品不存在')
+    if item.get('item_image'):
+        return {'success':True,'item_image':item['item_image'],'requested':False}
+    from app.services.auth_recovery import auth_paused
+    from utils import risk_control
+    if auth_paused(cookie_id) or risk_control.registry.get(cookie_id).is_blocked:
+        return {'success':False,'failure_category':'authentication_required','requested':False}
+    from utils.product_images import fill_missing
+    async def operation(instance):
+        result = await instance.get_item_info(item_id)
+        if result.get('error_code'):
+            return {'success':False,'failure_category':result['error_code'],'requested':True}
+        image = fill_missing(db_manager,cookie_id,item_id,result)
+        return {'success':bool(image),'item_image':image,'requested':True,
+                'failure_category':'' if image else 'image_unavailable'}
+    return await _run_on_account_loop(cookie_id, operation)
 
 
 class ItemDetailUpdate(BaseModel):
@@ -8087,7 +8116,9 @@ def get_user_orders(
         user_cookies = db_manager.get_all_cookies(user_id)
 
         # 如果指定了cookie_id筛选
-        if cookie_id and cookie_id in user_cookies:
+        if cookie_id:
+            if cookie_id not in user_cookies:
+                raise HTTPException(403, '无权访问该闲鱼账号')
             user_cookies = {cookie_id: user_cookies[cookie_id]}
 
         # 获取所有订单数据
@@ -8099,12 +8130,13 @@ def get_user_orders(
         item_images = {}
         with db_manager.lock:
             cursor = db_manager.conn.cursor()
-            cursor.execute('SELECT item_id, item_title, item_image FROM item_info')
+            cursor.execute('SELECT i.cookie_id,i.item_id,i.item_title,i.item_image FROM item_info i JOIN cookies c ON c.id=i.cookie_id WHERE c.user_id=?',(user_id,))
             for row in cursor.fetchall():
-                if row[1]:
-                    item_titles[row[0]] = row[1]
                 if row[2]:
-                    item_images.setdefault(row[0], row[2])
+                    item_titles[(row[0],row[1])] = row[2]
+                if row[3]:
+                    from utils.product_images import normalize_image_url
+                    item_images[(row[0],row[1])] = normalize_image_url(row[3])
 
         for cid in user_cookies.keys():
             orders = db_manager.get_orders_by_cookie(
@@ -8115,9 +8147,9 @@ def get_user_orders(
             for order in orders:
                 order['cookie_id'] = cid
                 # 添加 item_title 字段
-                order['item_title'] = item_titles.get(order.get('item_id'), '')
+                order['item_title'] = item_titles.get((cid,order.get('item_id')), '')
                 # 添加 item_image 字段（订单表不存图片，从商品信息带出）
-                order['item_image'] = item_images.get(order.get('item_id'), '')
+                order['item_image'] = item_images.get((cid,order.get('item_id')), '')
                 # 状态计数在筛选之前统计，保证各标签数字始终是全量口径
                 order_state = get_order_status(order)
                 status_counts[order_state] = status_counts.get(order_state, 0) + 1
@@ -8149,6 +8181,8 @@ def get_user_orders(
             "status_counts": status_counts
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         log_with_user('error', f"查询用户订单失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=f"查询订单失败: {str(e)}")
@@ -8233,6 +8267,8 @@ def get_order_detail(order_id: str, current_user: Dict[str, Any] = Depends(get_c
         for cookie_id in user_cookies.keys():
             order = db_manager.get_order_by_id(order_id)
             if order and order.get('cookie_id') == cookie_id:
+                item = db_manager.get_item_info(cookie_id,order.get('item_id')) or {}
+                order.update(item_title=item.get('item_title',''),item_image=item.get('item_image',''),item_price=item.get('item_price',''))
                 log_with_user('info', f"订单详情查询成功: {order_id}", current_user)
                 return {"success": True, "data": order}
 

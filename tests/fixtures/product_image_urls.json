@@ -1,0 +1,14 @@
+[
+  ["http://img.alicdn.com/a.jpg?token=fixture%2Fvalue#preview", "https://img.alicdn.com/a.jpg?token=fixture%2Fvalue#preview"],
+  ["https://img.alicdn.com/a.jpg?x=1", "https://img.alicdn.com/a.jpg?x=1"],
+  ["//gw.alicdn.com/a.webp", "https://gw.alicdn.com/a.webp"],
+  ["  ", ""],
+  ["http://example.invalid/image.png", ""],
+  ["http://img.alicdn.com.example.invalid/a.png", ""],
+  ["javascript:alert(1)", ""],
+  ["https://user:pass@example.invalid/a.png", ""],
+  ["/static/uploads/images/local.png", "/static/uploads/images/local.png"],
+  ["http://img.alicdn.com:80/a.png", ""],
+  ["https://img.alicdn.com/a\nb.png", ""],
+  ["https://img.alicdn.com\\@example.invalid/a.png", ""]
+]

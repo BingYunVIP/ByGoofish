@@ -1,6 +1,7 @@
 import { describeApiError } from '../lib/errorMessage';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import AutoResizeTextarea from './AutoResizeTextarea';
+import ProductImage from './ProductImage';
 import { createPortal } from 'react-dom';
 import {
   Box,
@@ -106,12 +107,6 @@ const formatPrice = (price?: string) => {
   return value ? `¥${value}` : '价格未知';
 };
 
-const normalizeImageUrl = (url?: string) => {
-  const value = url?.trim();
-  if (!value) return '';
-  return value.startsWith('//') ? `https:${value}` : value;
-};
-
 const cardTypeLabels: Record<Card['type'], string> = {
   api: 'API 动态内容',
   text: '固定文本',
@@ -127,32 +122,6 @@ const getCardStockLabel = (card?: Card) => {
     return `当前可用 ${count} 条`;
   }
   return cardTypeLabels[card.type];
-};
-
-const ItemImage: React.FC<{ item: Item }> = ({ item }) => {
-  const src = normalizeImageUrl(item.item_image);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => setFailed(false), [src]);
-
-  if (!src || failed) {
-    return (
-      <div className="flex h-full w-full items-center justify-center text-gray-400">
-        <Box className="h-8 w-8" />
-      </div>
-    );
-  }
-
-  return (
-    <img
-      src={src}
-      alt={item.item_title || '商品图片'}
-      className="h-full w-full object-cover"
-      loading="lazy"
-      referrerPolicy="no-referrer"
-      onError={() => setFailed(true)}
-    />
-  );
 };
 
 const Toggle: React.FC<{
@@ -831,7 +800,7 @@ const ItemList: React.FC = () => {
                     >
                       <div className="flex min-w-0 gap-3">
                         <div className="h-20 w-20 flex-none overflow-hidden rounded-md border border-gray-200 bg-gray-100">
-                          <ItemImage item={item} />
+                          <ProductImage src={item.item_image} title={item.item_title || '商品图片'} />
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="flex min-w-0 flex-wrap items-start gap-2">

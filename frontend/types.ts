@@ -1,5 +1,12 @@
 
 // API Response Bases
+export interface NativeCapability {
+  supported: boolean;
+  reason: string;
+  protocol_revision: string;
+  source: 'release' | 'override';
+}
+
 export interface ApiResponse {
   success?: boolean;
   message?: string;

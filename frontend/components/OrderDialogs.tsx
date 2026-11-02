@@ -1,3 +1,4 @@
+import ProductImage from './ProductImage';
 import React, { useRef } from 'react';
 import { useModalFocus } from '../lib/useModalFocus';
 import { createPortal } from 'react-dom';
@@ -107,13 +108,9 @@ export function OrderDetailsDialog({
           <div className="space-y-4">
             <h4 className="text-lg font-bold text-gray-800">商品信息</h4>
             <div className="flex items-center gap-4 rounded-md border border-gray-200 bg-gray-50 p-4">
-              {selectedOrder.item_image && (
-                <img
-                  src={selectedOrder.item_image}
-                  alt=""
-                  className="h-20 w-20 rounded-md border border-gray-200 object-cover"
-                />
-              )}
+              <div className="h-20 w-20 shrink-0 overflow-hidden rounded-md border border-gray-200">
+                <ProductImage src={selectedOrder.item_image} title={itemTitle || selectedOrder.item_title || '商品图片'} />
+              </div>
               <div className="flex-1">
                 <div className="font-bold text-gray-900 mb-1">
                   {itemTitle || selectedOrder.item_title || selectedOrder.item_id}
