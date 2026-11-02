@@ -410,7 +410,7 @@ async def log_requests(request, call_next):
 async def enforce_password_initialization(request, call_next):
     """Known bootstrap passwords may only reach the password-change flow."""
     allowed = {'/login', '/verify', '/logout', '/change-password', '/change-admin-password',
-               '/account/profile', '/change-email/send-code', '/change-email',
+               '/account/profile',
                '/health', '/health/ready', '/system-settings/public', '/registration-status',
                '/login-info-status'}
     header = request.headers.get('authorization', '')

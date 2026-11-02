@@ -66,7 +66,7 @@ export const generateCaptcha = async (sessionId: string): Promise<{
   return post('/generate-captcha', { session_id: sessionId });
 };
 
-export const verifyToken = async (): Promise<{ authenticated: boolean; user_id?: number; username?: string; is_admin?: boolean }> => {
+export const verifyToken = async (): Promise<{ authenticated: boolean; user_id?: number; username?: string; is_admin?: boolean; must_change_password?: boolean }> => {
   return get('/verify');
 };
 

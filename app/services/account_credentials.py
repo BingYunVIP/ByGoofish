@@ -17,6 +17,7 @@ MESSAGES = {
     'code_wrong': '邮箱验证码错误，请检查后重试',
     'code_attempts_exceeded': '验证码错误次数已达上限，请重新发送',
     'write_failed': '修改未完成，原登录信息保持有效，请稍后重试',
+    'password_change_required': '请先修改初始登录密码，再修改登录邮箱',
 }
 
 
@@ -37,7 +38,7 @@ def change(db, user_id, current_password, *, new_password=None, new_email=None, 
         try:
             db.conn.execute('BEGIN IMMEDIATE')
             cursor = db.conn.cursor()
-            user = cursor.execute('SELECT id,username,email,password_hash,is_active FROM users WHERE id=?',
+            user = cursor.execute('SELECT id,username,email,password_hash,is_active,must_change_password FROM users WHERE id=?',
                                   (user_id,)).fetchone()
 
             def reject(category, message=None):
@@ -46,6 +47,8 @@ def change(db, user_id, current_password, *, new_password=None, new_email=None, 
 
             if not user or not user[4]:
                 return reject('user_unavailable')
+            if is_email and user[5]:
+                return reject('password_change_required')
             if not verify_password(current_password, user[3]):
                 return reject('current_password_wrong')
             if is_email:
@@ -72,7 +75,7 @@ def change(db, user_id, current_password, *, new_password=None, new_email=None, 
                                    (attempts, attempts >= 5, code_id))
                     db.conn.commit()
                     return result_error('code_attempts_exceeded' if attempts >= 5 else 'code_wrong', request_id=request_id)
-                cursor.execute('UPDATE users SET email=?,must_change_password=0,updated_at=CURRENT_TIMESTAMP WHERE id=?', (new_email,user_id))
+                cursor.execute('UPDATE users SET email=?,updated_at=CURRENT_TIMESTAMP WHERE id=?', (new_email,user_id))
                 cursor.execute('UPDATE email_verifications SET used=1 WHERE id=?', (code_id,))
             else:
                 if new_password == current_password:

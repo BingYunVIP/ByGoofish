@@ -1,6 +1,13 @@
 /** Keep credential-change logout and late network responses scoped to their session. */
 export interface LogoutNotice { message?: string; identifier?: string; credentialsChanged?: boolean }
 
+/** A delayed response from an older session must never gate a newer login. */
+export function requirePasswordChange(expectedToken: string | null): boolean {
+  if (!expectedToken || localStorage.getItem('auth_token') !== expectedToken) return false;
+  window.dispatchEvent(new CustomEvent('auth:password-change-required', { detail: { token: expectedToken } }));
+  return true;
+}
+
 export function clearAuthSession(expectedToken?: string | null, notice: LogoutNotice = {}): boolean {
   const current = localStorage.getItem('auth_token');
   if (expectedToken !== undefined && current !== expectedToken && !(current === null && notice.credentialsChanged)) return false;

@@ -14,6 +14,7 @@ from unittest import mock
 from app import reply_server
 from app.auth import SessionStore
 from app.db_manager import DBManager
+from app.password_hasher import hash_password
 from app.reply_server import (
     ChangeEmailRequest,
     EmailChangeCodeRequest,
@@ -32,6 +33,8 @@ class AuthEndpointFlowTests(unittest.TestCase):
     def setUp(self):
         self._temp = tempfile.TemporaryDirectory()
         self.db = DBManager(os.path.join(self._temp.name, "flow_test.db"))
+        self.db.conn.execute("UPDATE users SET password_hash=?,must_change_password=0 WHERE username='admin'", (hash_password("FixtureAdmin88"),))
+        self.db.conn.commit()
         # 注册默认关闭；认证流程用例显式打开，避免把测试前置条件误当成产品默认值。
         self.db.set_system_setting('registration_enabled', 'true')
         # 每个用例独立的限流器，避免模块级单例状态串扰
@@ -127,7 +130,7 @@ class AuthEndpointFlowTests(unittest.TestCase):
         self.db.send_verification_email.assert_not_awaited()
 
         sent = asyncio.run(send_change_email_code(
-            EmailChangeCodeRequest(email='new-owner@example.com', current_password='admin123'),
+            EmailChangeCodeRequest(email='new-owner@example.com', current_password='FixtureAdmin88'),
             current_user,
         ))
         self.assertTrue(sent['success'], sent)
@@ -138,7 +141,7 @@ class AuthEndpointFlowTests(unittest.TestCase):
         ).fetchone()[0]
         changed = asyncio.run(change_user_email(
             ChangeEmailRequest(
-                current_password='admin123',
+                current_password='FixtureAdmin88',
                 new_email='new-owner@example.com',
                 verification_code=code,
             ),
@@ -151,7 +154,7 @@ class AuthEndpointFlowTests(unittest.TestCase):
         self.db.create_user('other', 'other-owner@example.com', 'other1234')
         current_user = {'user_id': 1, 'username': 'admin'}
         result = asyncio.run(send_change_email_code(
-            EmailChangeCodeRequest(email='other-owner@example.com', current_password='admin123'),
+            EmailChangeCodeRequest(email='other-owner@example.com', current_password='FixtureAdmin88'),
             current_user,
         ))
         self.assertFalse(result['success'])
@@ -161,7 +164,7 @@ class AuthEndpointFlowTests(unittest.TestCase):
         self.db.create_user('other-owner', 'other-owner@example.com', 'other1234')
         current_user = {'user_id': 1, 'username': 'admin'}
         sent = asyncio.run(send_change_email_code(
-            EmailChangeCodeRequest(email='new-owner@example.com', current_password='admin123'),
+            EmailChangeCodeRequest(email='new-owner@example.com', current_password='FixtureAdmin88'),
             current_user,
         ))
         self.assertTrue(sent['success'])

@@ -34,6 +34,7 @@ export interface LoginResponse {
   user_id?: number;
   username?: string;
   is_admin?: boolean;
+  must_change_password?: boolean;
   /** true 表示连续登录失败已达阈值，下一次登录必须携带图形验证码 */
   captcha_required?: boolean;
 }

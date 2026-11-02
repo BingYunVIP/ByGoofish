@@ -12,6 +12,7 @@ from app import auth,reply_server
 from app.db_manager import DBManager
 from app.services import account_credentials
 from app.services.smtp_delivery import DeliveryUncertain,MailNotConfigured
+from app.password_hasher import hash_password
 
 
 class CredentialTests(unittest.IsolatedAsyncioTestCase):
@@ -19,6 +20,9 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
         self.temp=tempfile.TemporaryDirectory()
         self.db=DBManager(str(Path(self.temp.name)/'auth.db'))
         self.owner=self.db.get_user_by_username('admin')['id']
+        self.db.conn.execute('UPDATE users SET password_hash=?,must_change_password=0 WHERE id=?',
+                             (hash_password('FixtureAdmin88'),self.owner))
+        self.db.conn.commit()
         self.db.create_user('other','other@example.invalid','OtherPass88')
         self.patches=[patch('app.db_manager.db_manager',self.db),patch('app.auth.db_manager',self.db),
                       patch.object(reply_server,'db_manager',self.db),
@@ -44,16 +48,16 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
 
     async def email_change(self,email='next@example.invalid',code='123456'):
         return await self.client.post('/change-email',headers=self.headers,json={
-            'current_password':'admin123','new_email':email,'verification_code':code})
+            'current_password':'FixtureAdmin88','new_email':email,'verification_code':code})
 
     async def test_password_change_http_reauth_and_other_user_isolation(self):
-        response=await self.client.post('/change-password',headers=self.headers,json={'current_password':'admin123','new_password':'ChangedPass88'})
+        response=await self.client.post('/change-password',headers=self.headers,json={'current_password':'FixtureAdmin88','new_password':'ChangedPass88'})
         result=response.json();self.assertTrue(result['success']);self.assertTrue(result['reauth_required'])
         self.assertEqual(result['profile']['username'],'admin')
         self.assertNotIn('password',json.dumps(result))
         self.assertEqual((await self.client.get('/account/profile',headers=self.headers)).status_code,401)
         self.assertIsNotNone(auth.SESSION_TOKENS.get(self.other_token))
-        old=await self.client.post('/login',json={'username':'admin','password':'admin123'})
+        old=await self.client.post('/login',json={'username':'admin','password':'FixtureAdmin88'})
         new=await self.client.post('/login',json={'username':'admin','password':'ChangedPass88'})
         self.assertFalse(old.json()['success']);self.assertTrue(new.json()['success'])
 
@@ -62,7 +66,7 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
         result=response.json();self.assertTrue(result['success'])
         self.assertEqual(result['profile']['email'],'next@example.invalid')
         self.assertIsNone(auth.SESSION_TOKENS.get(self.token))
-        logged=await self.client.post('/login',json={'email':'next@example.invalid','password':'admin123'})
+        logged=await self.client.post('/login',json={'email':'next@example.invalid','password':'FixtureAdmin88'})
         self.assertTrue(logged.json()['success'])
         profile=await self.client.get('/account/profile',headers={'Authorization':'Bearer '+logged.json()['token']})
         self.assertEqual(profile.json()['email'],'next@example.invalid')
@@ -83,9 +87,9 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
         self.code()
         self.db.conn.execute("CREATE TRIGGER fail_revoke BEFORE DELETE ON auth_sessions BEGIN SELECT RAISE(ABORT,'fixture revoke failure'); END")
         self.db.conn.commit()
-        changed=await self.client.post('/change-password',headers=self.headers,json={'current_password':'admin123','new_password':'ChangedPass88'})
+        changed=await self.client.post('/change-password',headers=self.headers,json={'current_password':'FixtureAdmin88','new_password':'ChangedPass88'})
         self.assertEqual(changed.json()['error_code'],'write_failed')
-        self.assertTrue(self.db.verify_user_password('admin','admin123'))
+        self.assertTrue(self.db.verify_user_password('admin','FixtureAdmin88'))
         failed=await self.email_change();self.assertEqual(failed.json()['error_code'],'write_failed')
         self.assertEqual(self.db.conn.execute("SELECT used FROM email_verifications WHERE email='next@example.invalid'").fetchone()[0],0)
         self.assertIsNotNone(auth.SESSION_TOKENS.get(self.token))
@@ -106,13 +110,13 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_current_password_duplicate_same_email_and_password_rules(self):
         for payload,error in [({'current_password':'wrong','new_password':'ChangedPass88'},'current_password_wrong'),
-                              ({'current_password':'admin123','new_password':'abc123'},'password_invalid')]:
+                              ({'current_password':'FixtureAdmin88','new_password':'abc123'},'password_invalid')]:
             r=await self.client.post('/change-password',headers=self.headers,json=payload)
             self.assertEqual(r.json()['error_code'],error)
         self.code('other@example.invalid');self.assertEqual((await self.email_change('OTHER@example.invalid')).json()['error_code'],'email_in_use')
         self.code();self.assertTrue((await self.email_change()).json()['success'])
         # Direct invocation with a stale identity still uses the current database user.
-        result=account_credentials.change(self.db,self.owner,'admin123',new_email='next@example.invalid',code='123456')
+        result=account_credentials.change(self.db,self.owner,'FixtureAdmin88',new_email='next@example.invalid',code='123456')
         self.assertEqual(result['error_code'],'email_unchanged')
 
     async def test_repeated_submission_cannot_consume_or_change_twice(self):
@@ -126,7 +130,7 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
         other=DBManager(self.db.db_path)
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                futures=[pool.submit(account_credentials.change,manager,self.owner,'admin123',new_password=password)
+                futures=[pool.submit(account_credentials.change,manager,self.owner,'FixtureAdmin88',new_password=password)
                          for manager,password in [(self.db,'ParallelPass88'),(other,'DifferentPass88')]]
                 results=[f.result() for f in futures]
             self.assertEqual(sum(r['success'] for r in results),1)
@@ -135,14 +139,14 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_send_definite_failure_invalidates_only_its_code(self):
         self.db.send_verification_email.side_effect=OSError('fixture SMTP unavailable')
-        result=await self.client.post('/change-email/send-code',headers=self.headers,json={'email':'next@example.invalid','current_password':'admin123'})
+        result=await self.client.post('/change-email/send-code',headers=self.headers,json={'email':'next@example.invalid','current_password':'FixtureAdmin88'})
         self.assertEqual(result.json()['error_code'],'mail_send_failed')
         self.assertEqual(self.db.conn.execute("SELECT used FROM email_verifications WHERE email='next@example.invalid'").fetchone()[0],1)
         self.assertIsNotNone(auth.SESSION_TOKENS.get(self.token))
 
     async def test_send_uncertain_remains_usable_and_no_automatic_resend(self):
         self.db.send_verification_email.side_effect=DeliveryUncertain()
-        result=await self.client.post('/change-email/send-code',headers=self.headers,json={'email':'next@example.invalid','current_password':'admin123'})
+        result=await self.client.post('/change-email/send-code',headers=self.headers,json={'email':'next@example.invalid','current_password':'FixtureAdmin88'})
         self.assertEqual(result.json()['error_code'],'delivery_uncertain')
         code,used=self.db.conn.execute("SELECT code,used FROM email_verifications WHERE email='next@example.invalid'").fetchone()
         self.assertEqual(used,0)
@@ -151,7 +155,7 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_send_cooldown_and_configuration_failure(self):
         self.db.send_verification_email.side_effect=MailNotConfigured()
-        payload={'email':'next@example.invalid','current_password':'admin123'}
+        payload={'email':'next@example.invalid','current_password':'FixtureAdmin88'}
         first=(await self.client.post('/change-email/send-code',headers=self.headers,json=payload)).json()
         self.assertEqual(first['error_code'],'mail_not_configured')
         second=(await self.client.post('/change-email/send-code',headers=self.headers,json=payload)).json()
@@ -162,6 +166,59 @@ class CredentialTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.05)
             return True
         self.db.send_verification_email.side_effect=slow
-        sent=(await self.client.post('/change-email/send-code',headers=self.headers,json={'email':'next@example.invalid','current_password':'admin123'})).json()
+        sent=(await self.client.post('/change-email/send-code',headers=self.headers,json={'email':'next@example.invalid','current_password':'FixtureAdmin88'})).json()
         self.assertTrue(sent['success']);self.assertEqual(sent['retry_after_seconds'],60)
         self.assertIn('request_id',sent)
+
+    def require_password_change(self):
+        self.db.conn.execute('UPDATE users SET must_change_password=1 WHERE id=?', (self.owner,))
+        self.db.conn.commit()
+
+    async def test_initialization_login_verify_change_and_business_access(self):
+        self.require_password_change()
+        login=(await self.client.post('/login',json={'username':'admin','password':'FixtureAdmin88'})).json()
+        self.assertTrue(login['must_change_password'])
+        headers={'Authorization':'Bearer '+login['token']}
+        verified=(await self.client.get('/verify',headers=headers)).json()
+        self.assertTrue(verified['must_change_password'])
+        self.assertEqual((await self.client.get('/account/profile',headers=headers)).status_code,200)
+        blocked=await self.client.get('/cookies/details',headers=headers)
+        self.assertEqual(blocked.status_code,403)
+        self.assertEqual(blocked.json()['code'],'password_change_required')
+        changed=(await self.client.post('/change-password',headers=headers,json={
+            'current_password':'FixtureAdmin88','new_password':'InitializedPass88'})).json()
+        self.assertTrue(changed['success'])
+        self.assertIsNone(auth.SESSION_TOKENS.get(self.token))
+        self.assertEqual((await self.client.get('/account/profile',headers=headers)).status_code,401)
+        login=(await self.client.post('/login',json={'username':'admin','password':'InitializedPass88'})).json()
+        self.assertTrue(login['success']);self.assertFalse(login['must_change_password'])
+        headers={'Authorization':'Bearer '+login['token']}
+        self.assertFalse((await self.client.get('/verify',headers=headers)).json()['must_change_password'])
+        self.assertEqual((await self.client.get('/cookies/details',headers=headers)).status_code,200)
+
+    async def test_initialization_email_cannot_bypass_gate_or_consume_code(self):
+        self.require_password_change();self.code()
+        for endpoint,payload in [('/change-email/send-code',{'email':'next@example.invalid','current_password':'FixtureAdmin88'}),
+                                 ('/change-email',{'new_email':'next@example.invalid','current_password':'FixtureAdmin88','verification_code':'123456'})]:
+            response=await self.client.post(endpoint,headers=self.headers,json=payload)
+            self.assertEqual(response.status_code,403)
+            self.assertEqual(response.json()['code'],'password_change_required')
+        self.db.send_verification_email.assert_not_awaited()
+        direct=account_credentials.change(self.db,self.owner,'FixtureAdmin88',new_email='next@example.invalid',code='123456')
+        self.assertEqual(direct['error_code'],'password_change_required')
+        self.assertEqual(self.db.conn.execute('SELECT must_change_password FROM users WHERE id=?',(self.owner,)).fetchone()[0],1)
+        self.assertEqual(self.db.conn.execute("SELECT used FROM email_verifications WHERE email='next@example.invalid'").fetchone()[0],0)
+        self.assertIsNotNone(auth.SESSION_TOKENS.get(self.token))
+
+    async def test_initialization_wrong_password_and_write_failure_preserve_gate(self):
+        self.require_password_change()
+        wrong=await self.client.post('/change-password',headers=self.headers,json={
+            'current_password':'wrong','new_password':'InitializedPass88'})
+        self.assertEqual(wrong.json()['error_code'],'current_password_wrong')
+        self.db.conn.execute("CREATE TRIGGER fail_password BEFORE UPDATE OF password_hash ON users BEGIN SELECT RAISE(ABORT,'fixture write failure'); END")
+        self.db.conn.commit()
+        failed=await self.client.post('/change-password',headers=self.headers,json={
+            'current_password':'FixtureAdmin88','new_password':'InitializedPass88'})
+        self.assertEqual(failed.json()['error_code'],'write_failed')
+        self.assertEqual(self.db.conn.execute('SELECT must_change_password FROM users WHERE id=?',(self.owner,)).fetchone()[0],1)
+        self.assertIsNotNone(auth.SESSION_TOKENS.get(self.token))

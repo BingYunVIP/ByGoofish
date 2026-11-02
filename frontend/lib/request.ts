@@ -1,4 +1,4 @@
-import { clearAuthSession } from './authSession';
+import { clearAuthSession, requirePasswordChange } from './authSession';
 import axios, { AxiosError, AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
 
 const request: AxiosInstance = axios.create({
@@ -29,9 +29,16 @@ request.interceptors.request.use(
 request.interceptors.response.use(
   (response: AxiosResponse) => response,
   (error: AxiosError) => {
+    const sent = error.config?.headers?.Authorization;
+    const current = localStorage.getItem('auth_token');
+    const data = error.response?.data as { code?: string; detail?: unknown } | undefined;
+    if (error.response?.status === 403 && data?.code === 'password_change_required' && sent === `Bearer ${current}`) {
+      requirePasswordChange(current);
+    }
+    if (error.response?.status === 403 && typeof data?.detail === 'string') {
+      error.message = data.detail;
+    }
     if (error.response?.status === 401) {
-      const sent = error.config?.headers?.Authorization;
-      const current = localStorage.getItem('auth_token');
       if (current && sent === `Bearer ${current}`) {
         clearAuthSession(current, { message: '登录状态已失效，请重新登录' });
       }

@@ -3,6 +3,7 @@ import React, { Suspense, lazy, useState, useEffect } from 'react';
 import Sidebar from './components/Sidebar';
 import GlobalFeedback from './components/GlobalFeedback';
 import ThemeToggle from './components/ThemeToggle';
+import PasswordInitialization from './components/PasswordInitialization';
 import CaptchaInput from './components/CaptchaInput';
 import { useCaptcha } from './lib/useCaptcha';
 import { validateEmail, validatePassword, validateUsername } from './lib/authValidation';
@@ -66,6 +67,7 @@ const App: React.FC = () => {
   const [loginNotice, setLoginNotice] = useState('');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [mustChangePassword, setMustChangePassword] = useState(false);
 
   // 注册相关。是否显示入口由后台「允许用户注册」控制，
   // 是否需要填验证码由后台「注册邮箱验证」控制（没配 SMTP 时可以关掉）。
@@ -196,6 +198,8 @@ const App: React.FC = () => {
       sequence += 1;
       setIsLoggedIn(false);
       setIsAdmin(false);
+      setMustChangePassword(false);
+      setMobileMenuOpen(false);
       setPassword('');
       setRegForm({ username: '', email: '', password: '', code: '' });
       loginCaptcha.setCode('');
@@ -215,6 +219,7 @@ const App: React.FC = () => {
         } else {
           setPassword('');
           setIsAdmin(Boolean(result.is_admin));
+          setMustChangePassword(Boolean(result.must_change_password));
           setIsLoggedIn(true);
         }
       }).catch(() => {
@@ -222,6 +227,16 @@ const App: React.FC = () => {
       }).finally(() => { if (!disposed) setCheckingAuth(false); });
     };
     const handleLogout = (event: Event) => resetLogin((event as CustomEvent<LogoutNotice>).detail);
+    const handlePasswordRequired = (event: Event) => {
+      const token = (event as CustomEvent<{ token: string }>).detail?.token;
+      if (token && localStorage.getItem('auth_token') === token) {
+        // Invalidate an older verify response that could otherwise undo this gate.
+        sequence += 1;
+        setMustChangePassword(true);
+        setMobileMenuOpen(false);
+        setCheckingAuth(false);
+      }
+    };
     const handleStorage = (event: StorageEvent) => {
       if (event.key !== 'auth_token' && event.key !== null) return;
       const token = localStorage.getItem('auth_token');
@@ -229,6 +244,7 @@ const App: React.FC = () => {
       else resetLogin({ message: '登录状态已在其他页面更新，请重新登录' });
     };
     window.addEventListener('auth:logout', handleLogout);
+    window.addEventListener('auth:password-change-required', handlePasswordRequired);
     window.addEventListener('storage', handleStorage);
     const token = localStorage.getItem('auth_token');
     if (token) check(token);
@@ -236,6 +252,7 @@ const App: React.FC = () => {
     return () => {
       disposed = true;
       window.removeEventListener('auth:logout', handleLogout);
+      window.removeEventListener('auth:password-change-required', handlePasswordRequired);
       window.removeEventListener('storage', handleStorage);
     };
   }, []);
@@ -268,6 +285,7 @@ const App: React.FC = () => {
           if (res.success && res.token) {
               localStorage.setItem('auth_token', res.token);
               setIsAdmin(Boolean(res.is_admin));
+              setMustChangePassword(Boolean(res.must_change_password));
               setIsLoggedIn(true);
               setPassword('');
               setLoginNotice('');
@@ -560,6 +578,8 @@ const App: React.FC = () => {
       </div>
     );
   }
+
+  if (mustChangePassword) return <PasswordInitialization />;
 
   return (
     <div className="flex min-h-screen bg-[var(--app-bg)] text-[var(--text)]">
