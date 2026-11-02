@@ -50,11 +50,11 @@ load_resources() {
 }
 run_owner() {
     local -a browser_env=()
-    [[ -z ${BROWSER_PATH:-} ]] || browser_env=("PLAYWRIGHT_BROWSERS_PATH=$BROWSER_PATH")
+    browser_env=("PLAYWRIGHT_BROWSERS_PATH=${BROWSER_PATH:-$RUN_HOME/.cache/ms-playwright}")
     if [[ $(id -un) == "$RUN_USER" ]]; then
-        env HOME="$RUN_HOME" "${browser_env[@]}" "$@"
+        env HOME="$RUN_HOME" XDG_CACHE_HOME="$ROOT/browser_data/runtime/cache" XDG_CONFIG_HOME="$ROOT/browser_data/runtime/config" "${browser_env[@]}" "$@"
     else
-        runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "${browser_env[@]}" "$@"
+        runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" XDG_CACHE_HOME="$ROOT/browser_data/runtime/cache" XDG_CONFIG_HOME="$ROOT/browser_data/runtime/config" "${browser_env[@]}" "$@"
     fi
 }
 project_git() {
@@ -281,6 +281,7 @@ prepare_browser() {
     local source=$1 platform
     local -a compatibility=()
     progress 5/6 "检查项目浏览器和本地渲染"
+    install -d -m 700 -o "$RUN_USER" "$ROOT/browser_data/runtime/cache" "$ROOT/browser_data/runtime/config"
     if logged run_owner "$NEXT_VENV/bin/python" "$source/scripts/playwright_doctor.py"; then
         logged run_owner xvfb-run -a "$NEXT_VENV/bin/python" "$HELPER" headed-check "$source"
         return
@@ -506,8 +507,15 @@ begin_deployment() {
     if [[ $RUN_USER == root && $ROOT == "$HOME"/* ]]; then
         RUN_USER=bygoofish
         RUN_HOME=/var/lib/bygoofish
-        chmod 711 "$HOME"
+        if ! runuser -u "$RUN_USER" -- test -x "$HOME"; then
+            if ! command -v setfacl >/dev/null; then
+                env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update
+                env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends acl
+            fi
+            setfacl -m "u:$RUN_USER:--x" "$HOME"
+        fi
     fi
+    BROWSER_PATH=${BROWSER_PATH:-$RUN_HOME/.cache/ms-playwright}
     install -d -m 700 -o "$RUN_USER" -g "$RUN_USER" "$ROOT/.local" "$ROOT/data" "$ROOT/logs" "$ROOT/browser_data" "$ROOT/static/uploads"
     chown -R "$RUN_USER:$RUN_USER" "$ROOT/.local" "$ROOT/data" "$ROOT/logs" "$ROOT/browser_data" "$ROOT/static/uploads"
     prepare_state

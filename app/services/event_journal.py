@@ -8,7 +8,7 @@ from app.notification_events import get_event
 
 ACCOUNT_EVENTS = frozenset(('login_verification_required', 'login_session_expired',
     'message_verification_required', 'credentials_invalid', 'login_failed',
-    'instance_restart_failed', 'transient_warning'))
+    'instance_restart_failed', 'transient_warning', 'browser_runtime_error'))
 ORDER_FAILURES = ('delivery_failed', 'delivery_timeout', 'delivery_confirm_failed',
                   'buyer_interaction_failed', 'buyer_info_incomplete')
 DEFAULT_LIMIT = 2

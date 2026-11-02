@@ -281,6 +281,7 @@ def quote_unit(value, specifiers=True):
 
 
 def write_service(root, directory, host, port, db, user, home, browsers, browser_path="", node_bin="", service_path=""):
+    browser_path = browser_path or str(Path(home) / '.cache/ms-playwright')
     runtime_path = service_path or SERVICE_PATH
     if node_bin:
         runtime_path = node_bin + ':' + ':'.join(part for part in runtime_path.split(':') if part != node_bin)
@@ -293,6 +294,8 @@ def write_service(root, directory, host, port, db, user, home, browsers, browser
     env = dict(API_HOST=host, API_PORT=port, DB_PATH=str(db), WEB_CONCURRENCY="1",
                MAX_CONCURRENT_BROWSERS=str(browsers), PYTHONDONTWRITEBYTECODE="1",
                SQL_LOG_ENABLED="false", HOME=home, TZ="Asia/Shanghai", PATH=runtime_path,
+               XDG_CACHE_HOME=str(root / 'browser_data/runtime/cache'),
+               XDG_CONFIG_HOME=str(root / 'browser_data/runtime/config'),
                BYGOOFISH_MASTER_KEY_FILE=str(private / 'master.key'))
     if browser_path:
         env["PLAYWRIGHT_BROWSERS_PATH"] = browser_path

@@ -19,6 +19,20 @@ from XianyuAutoAsync import XianyuLive, ConnectionState
 
 
 class RecoveryDatabaseTests(unittest.TestCase):
+    def test_local_browser_failure_is_actionable_and_does_not_clear_auth_pause(self):
+        from app.notification_events import get_event,normalize_event_types
+        self.assertTrue(get_event('browser_runtime_error')['default_subscribed'])
+        self.assertEqual(normalize_event_types(['buyer_message']),['buyer_message'])
+        for category in ('browser_error','browser_missing','browser_dependency_missing','browser_permission_denied','browser_launch_failed'):
+            state=recovery.set_state(self.db,'fixture-recovery','required',category)
+            self.assertEqual(state['event_type'],'browser_runtime_error')
+            self.assertEqual(state['severity'],'error')
+            self.assertTrue(state['auth_paused'])
+            self.assertFalse(state['requires_manual_verification'])
+            self.assertNotIn('自动重试',state['recommended_action'])
+        recovery.set_state(self.db,'fixture-recovery','recovered')
+        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM operational_incidents WHERE cookie_id='fixture-recovery' AND event_type='browser_runtime_error' AND resolved_at IS NULL").fetchone()[0],0)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.temp.name, 'recovery.db')

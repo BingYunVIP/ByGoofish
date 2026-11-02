@@ -75,6 +75,7 @@ class QRLoginSession:
         # 服务端打开的验证页任务。人脸验证必须由持有该页面的浏览器完成后续登录，
         # 手机只负责扫页面上的码、刷脸，登录态会落在这个浏览器里。
         self.verification_task = None
+        self.browser_failure = None
 
     def extend_for_verification(self) -> None:
         """进入手机验证后延长会话寿命，只延一次。"""
@@ -503,6 +504,8 @@ class QRLoginManager:
             'status': session.status,
             'session_id': session_id
         }
+        if session.status != 'success' and getattr(session, 'browser_failure', None):
+            return {**result, 'status':'error', **session.browser_failure}
         logger.debug(
             f"获取扫码会话状态: session={session_id}, status={session.status}, "
             f"cookie_count={len(session.cookies)}, has_unb={bool(session.unb)}"
@@ -538,6 +541,10 @@ class QRLoginManager:
     # ------------------------------------------------------------ 服务端验证页
 
     def _ensure_verification_task(self, session: QRLoginSession, restart: bool = False):
+        if session.browser_failure and not restart:
+            return
+        if restart:
+            session.browser_failure = None
         task = session.verification_task
         if task and not task.done():
             if not restart:
@@ -632,7 +639,10 @@ class QRLoginManager:
 
             logger.info(f"服务端打开扫码登录验证页: {session_id}")
             playwright = await async_playwright().start()
+            from utils.playwright_runtime import require_browser_binary
+            require_browser_binary(playwright)
             browser = await playwright.chromium.launch(
+                channel='chromium',
                 # 有 Xvfb 时用有头模式，降低被识别为自动化的概率
                 headless=not os.getenv('DISPLAY'),
                 **direct_browser_options({'args': [
@@ -691,7 +701,11 @@ class QRLoginManager:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"服务端验证页运行失败: {session_id}, {e}")
+            from utils.playwright_runtime import browser_failure
+            category, message = browser_failure(e)
+            if session:
+                session.browser_failure = {'failure_category':category, 'message':message}
+            logger.error(f"服务端验证页运行失败: {category}；{message}")
         finally:
             try:
                 if browser:

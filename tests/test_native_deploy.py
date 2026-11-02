@@ -109,7 +109,20 @@ class NativeHelpers(unittest.TestCase):
             self.assertIn('WEB_CONCURRENCY="1"', env)
             self.assertTrue(native.systemd_values(env)['PATH'].startswith(str(root / 'tools/node/bin') + ':'))
             self.assertNotIn('admin123', env + unit)
+            self.assertEqual(native.systemd_values(env)['PLAYWRIGHT_BROWSERS_PATH'],'/root/.cache/ms-playwright')
+            self.assertEqual(native.systemd_values(env)['XDG_CACHE_HOME'],str(root / 'browser_data/runtime/cache'))
             self.assertEqual((root / '.local/bygoofish/service.env').stat().st_mode & 0o777, 0o600)
+
+    def test_custom_browser_path_is_preserved_for_service_user(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            native.write_service(root,root/'unit','127.0.0.1','8080',root/'live.db','root','/fixture/service-home',1,
+                                 browser_path='/fixture/custom browser cache')
+            env=native.systemd_values((root/'.local/bygoofish/service.env').read_text())
+            self.assertEqual(env['PLAYWRIGHT_BROWSERS_PATH'],'/fixture/custom browser cache')
+            native.write_service(root,root/'unit','127.0.0.1','8080',root/'live.db','root','/fixture/service-home',1)
+            env=native.systemd_values((root/'.local/bygoofish/service.env').read_text())
+            self.assertEqual(env['PLAYWRIGHT_BROWSERS_PATH'],'/fixture/service-home/.cache/ms-playwright')
 
     @unittest.skipUnless(shutil.which('systemd-analyze'), 'systemd-analyze is unavailable')
     def test_generated_service_passes_real_systemd_parser_including_space_paths(self):

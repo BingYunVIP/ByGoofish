@@ -664,7 +664,14 @@ export interface DefaultReply {
   runtime?: { connected: boolean; paused_conversations: number; remaining_pause_seconds: number };
 }
 
+export interface BrowserRuntimeStatus {
+  ready: boolean | null;
+  failure_category: string;
+  message: string;
+}
+
 export interface AccountRecoveryStatus {
+  browser_runtime?: BrowserRuntimeStatus | null;
   cookie_id: string;
   blocked: boolean;
   remaining_seconds: number;
@@ -704,6 +711,7 @@ export interface CaptchaDiagnosticEntry {
 }
 
 export interface CaptchaDiagnostic {
+  browser_runtime?: BrowserRuntimeStatus | null;
   diagnostic_id: string;
   status: 'processing' | 'completed' | 'failed' | 'cancelled';
   stage: string;

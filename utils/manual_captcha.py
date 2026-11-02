@@ -247,6 +247,8 @@ async def open_manual_session(
         if diagnostic:
             diagnostic.stage('browser_start')
         playwright = await async_playwright().start()
+        from utils.playwright_runtime import require_browser_binary
+        require_browser_binary(playwright)
         browser = await browser_limit.launch_browser(
             playwright,
             {'headless': headless,
@@ -391,10 +393,17 @@ async def open_manual_session(
                 pass
         return result
     except Exception as exc:
+        from utils.playwright_runtime import browser_failure
+        category, message = browser_failure(exc)
+        if isinstance(exc, TimeoutError) and '等待浏览器' in str(exc):
+            category, message = 'queue_timeout', '本机验证浏览器名额等待超时，请稍后查看诊断'
         if diagnostic:
-            diagnostic.emit('error','browser_error',type(exc).__name__)
-        result["message"] = "人工验证会话异常，请查看风控日志中的错误分类"
-        result["failure_category"] = 'queue_timeout' if isinstance(exc, TimeoutError) and '等待浏览器' in str(exc) else 'browser_error'
+            diagnostic.emit('error', category, message)
+            if page is None:
+                # Capture sanitizes and bounds this; no platform page or request exists yet.
+                diagnostic.emit('error', 'browser_launch_detail', str(exc))
+        result["message"] = message
+        result["failure_category"] = category
         logger.error(f"【{cookie_id}】{result['message']}")
         return result
     finally:

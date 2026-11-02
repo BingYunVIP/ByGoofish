@@ -154,8 +154,9 @@ try:
         bundled_browsers = Path(sys.executable).parent / 'playwright'
         if bundled_browsers.is_dir():
             os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', str(bundled_browsers))
-    from utils.playwright_runtime import check_runtime, print_report
+    from utils.playwright_runtime import check_runtime, print_report, remember_runtime_report
     browser_report = check_runtime()
+    remember_runtime_report(browser_report)
     print_report(browser_report)
     if browser_report['errors']:
         print(f"{_WARN} 浏览器相关功能尚未就绪；二维码生成本身使用 HTTP API。")

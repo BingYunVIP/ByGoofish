@@ -77,6 +77,7 @@ export default function BrowserDiagnostics({ diagnosticId, defaultOpen = false, 
         {meta && <div className="flex flex-wrap items-center gap-2 text-xs text-gray-700">
           <span className="status-badge">{statusLabel[meta.status] || '会话已结束'}</span>
           {meta.error_code && <span>页面错误码：{meta.error_code}</span>}
+          {meta.browser_runtime?.message && <span className="basis-full">本机检查：{meta.browser_runtime.message}</span>}
           {meta.close_reason === 'cancelled' && meta.failure_category && <span>结束操作：已取消；保留首次错误</span>}
           <span>已记录 {meta.event_count} 条，超限截断 {meta.dropped_count} 条</span>
         </div>}

@@ -4,6 +4,7 @@ import secrets
 import time
 
 from app.notification_events import get_event
+from utils.playwright_runtime import RUNTIME_FAILURES, runtime_status
 
 PAUSED = frozenset(("required", "verifying", "checking"))
 MESSAGES = {"required":"待处理", "verifying":"处理中", "checking":"检查连接中", "recovered":"已恢复", "none":""}
@@ -50,16 +51,25 @@ FAILURE_EVENTS = {
     "verification_timeout":"transient_warning",
     "verification_failed":"transient_warning",
     "queue_timeout":"transient_warning",
-    "browser_error":"transient_warning",
+    "browser_error":"browser_runtime_error",
     "interrupted":"transient_warning",
     "cancelled":"transient_warning",
     "account_disabled":"transient_warning",
 }
+for _category in RUNTIME_FAILURES:
+    FAILURE_EVENTS[_category] = 'browser_runtime_error'
+    if _category != 'browser_error':
+        FAILURES[_category] = {
+            'browser_missing':'服务用户缺少匹配浏览器；需要先修复本机部署环境',
+            'browser_dependency_missing':'本机缺少浏览器系统依赖；需要先修复本机部署环境',
+            'browser_permission_denied':'浏览器或运行目录权限不足；需要修复服务用户访问权限',
+            'browser_launch_failed':'本机浏览器无法正常运行；请查看本地诊断和显示环境',
+        }[_category]
 CHECKABLE_FAILURES = frozenset((
     'connection_failed', 'registration_rejected', 'signing_token_missing', 'signing_token_expired',
     'token_probe_failed', 'challenge_request_failed', 'challenge_invalid_response', 'challenge_unavailable',
     'challenge_not_ready', 'queue_timeout', 'browser_error', 'verification_timeout', 'interrupted',
-))
+)) | RUNTIME_FAILURES
 
 
 def _event_for(category):
@@ -155,6 +165,7 @@ def get(db, cookie_id):
         "action_codes": action_codes,
         "recovery_message": (f"{event['label']}待处理" if state == "required" and event else MESSAGES.get(state, "")),
         "recovery_detail": FAILURES.get(category, "") if category else "",
+        "browser_runtime": runtime_status() if category in RUNTIME_FAILURES else None,
     }
 
 
@@ -197,7 +208,7 @@ def set_state(db, cookie_id, state, category="", expected_attempt=None, *, stage
                                 (category,cookie_id,new_event_id))
                 db.conn.commit()
         if state == 'recovered':
-            event_journal.resolve(db,cookie_id,('login_verification_required','login_session_expired','message_verification_required','credentials_invalid','transient_warning','account_offline'))
+            event_journal.resolve(db,cookie_id,('login_verification_required','login_session_expired','message_verification_required','credentials_invalid','transient_warning','account_offline','browser_runtime_error'))
         elif starts_incident and old_event_id and old_event_id != new_event_id:
             event_journal.resolve(db,cookie_id,(old_event_id,),superseded=True)
         if old["recovery_state"] == "checking" and state in ("required", "recovered"):

@@ -133,8 +133,10 @@ def read(db, diagnostic_id, owner_id, after_seq=0, limit=100):
                                  'WHERE diagnostic_id=? AND seq>? ORDER BY seq LIMIT ?',
                                  (diagnostic_id, max(0, after_seq), min(100, max(1, limit)))).fetchall()
     entries = [dict(seq=r[0], created_at=r[1], level=r[2], kind=r[3], message=sanitize(r[4], known)) for r in events]
+    from utils.playwright_runtime import RUNTIME_FAILURES, runtime_status
     return {'diagnostic_id':meta['id'], 'status':meta['status'], 'stage':meta['stage'],
             'failure_category':meta['failure_category'], 'error_code':sanitize(meta['error_code'], known),
+            'browser_runtime':runtime_status() if meta['failure_category'] in RUNTIME_FAILURES else None,
             'close_reason':meta['close_reason'], 'created_at':meta['created_at'],
             'dropped_count':meta['dropped_count'], 'event_count':meta['event_count'], 'entries':entries,
             'next_seq':entries[-1]['seq'] if entries else max(0, after_seq),

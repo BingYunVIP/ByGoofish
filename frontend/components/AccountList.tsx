@@ -737,6 +737,7 @@ const AccountList: React.FC = () => {
                     <p className="font-bold">{recoveryState.event_label || '认证问题'} · {recoveryState.severity === 'error' ? 'Error' : 'Warn'}</p>
                     {recoveryState.event_impact && <p className="mt-1">影响：{recoveryState.event_impact}</p>}
                     {recoveryState.recovery_detail && <p className="mt-1">原因：{recoveryState.recovery_detail}</p>}
+                    {recoveryState.browser_runtime?.message && <p className="mt-1">本机检查：{recoveryState.browser_runtime.message}</p>}
                     {recoveryState.recommended_action && <p className="mt-1">处理：{recoveryState.recommended_action}</p>}
                   </div>
                 )}

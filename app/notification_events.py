@@ -20,6 +20,9 @@ EVENT_DEFINITIONS: List[Dict[str, Any]] = [
     {"id":"credentials_invalid", "label":"凭证或令牌异常", "priority":"error", "severity":"error",
      "description":"凭证、签名令牌或账号数据检查失败，且未确认是人工验证", "impact":"认证或账号数据同步可能不可用",
      "action":"查看诊断详情；根据具体原因更新网页登录态或账号凭证", "actionable":True,"default_subscribed":True},
+    {"id":"browser_runtime_error", "label":"本机验证浏览器异常", "priority":"error", "severity":"error",
+     "description":"服务器浏览器缺失、系统库或权限异常，验证流程无法正常运行", "impact":"本机暂时无法打开验证页面；账号原认证问题仍未解决",
+     "action":"先通过服务器 ByGoofish.sh「首次部署」修复浏览器环境，再检查连接；不要反复扫码或等待自动恢复", "actionable":True,"default_subscribed":True},
     {"id":"account_offline", "label":"账号消息连接中断", "priority":"error", "severity":"error",
      "description":"消息服务持续断开超过观察期，且不是已分类的人工验证事件", "impact":"后台无法监听新消息或及时处理新订单",
      "action":"查看账号诊断并检查消息连接", "actionable":True,"default_subscribed":True},
@@ -61,6 +64,7 @@ LOG_EVENT_DEFINITIONS = {
     "buyer_info_incomplete": {"id":"buyer_info_incomplete", "label":"订单买家信息未完整获取", "severity":"warning", "action":"查看订单详情并确认平台返回的收件信息"},
 }
 EVENT_ACTIONS = {
+    "browser_runtime_error": ["view_diagnostic", "check_connection"],
     "login_verification_required": ["qr_login"],
     "login_session_expired": ["qr_login"],
     "message_verification_required": ["sync_web_session", "check_connection"],
