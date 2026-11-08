@@ -34,6 +34,8 @@ SCOPES = {
     'delivery_reconciliation_activation':'cookie_id','delivery_reconciliation_runs':'cookie_id',
     'operational_incidents':'cookie_id','operational_notices':'incident_id','operational_notice_attempts':'incident_id',
 }
+DELETE_ONLY_SCOPES = {'item_detail_accounts': 'cookie_id', 'item_detail_diagnostics': 'cookie_id'}
+
 RELATIONS = {'card_id':'cards', 'auto_card_id':'cards', 'channel_id':'notification_channels',
              'variant_id':'product_variants', 'import_id':'logistics_quote_route_imports'}
 
@@ -193,6 +195,9 @@ def delete_user_data(conn,user_id):
     for table,scope in reversed(list(SCOPES.items())):
         if table=='cookies' or not schema(conn,table):continue
         conn.execute(f'DELETE FROM {ident(table)} WHERE {condition(scope)}',(user_id,))
+    for table, scope in DELETE_ONLY_SCOPES.items():
+        if schema(conn, table):
+            conn.execute(f'DELETE FROM {ident(table)} WHERE {condition(scope)}', (user_id,))
     for table in ('auth_sessions','account_api_keys'):
         if schema(conn,table):conn.execute(f'DELETE FROM {ident(table)} WHERE user_id=?',(user_id,))
     conn.execute('DELETE FROM cookies WHERE user_id=?',(user_id,))
@@ -211,5 +216,8 @@ def delete_account_data(conn,cookie_id):
         columns={row[1] for row in schema(conn,table)}
         key='cookie_id' if 'cookie_id' in columns else ('account_id' if 'account_id' in columns else None)
         if key:conn.execute(f'DELETE FROM {ident(table)} WHERE {ident(key)}=?',(cookie_id,))
+    for table, scope in DELETE_ONLY_SCOPES.items():
+        if schema(conn, table):
+            conn.execute(f'DELETE FROM {ident(table)} WHERE {ident(scope)}=?', (cookie_id,))
     if schema(conn,'account_api_keys'):conn.execute('DELETE FROM account_api_keys WHERE cookie_id=?',(cookie_id,))
     conn.execute('DELETE FROM cookies WHERE id=?',(cookie_id,))

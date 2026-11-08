@@ -5914,6 +5914,8 @@ class DBManager:
 
                     item_info.pop('platform_metadata', None)
                     item_info['item_image'] = normalize_image_url(item_info.get('item_image'))
+                    from app.services.item_details import presentation
+                    item_info = presentation(self,item_info['cookie_id'],item_info)
 
                     return item_info
                 return None
@@ -6615,6 +6617,8 @@ class DBManager:
 
                     item_info.pop('platform_metadata', None)
                     item_info['item_image'] = normalize_image_url(item_info.get('item_image'))
+                    from app.services.item_details import presentation
+                    item_info = presentation(self,item_info['cookie_id'],item_info)
 
                     items.append(item_info)
 
@@ -6646,6 +6650,8 @@ class DBManager:
 
                     item_info.pop('platform_metadata', None)
                     item_info['item_image'] = normalize_image_url(item_info.get('item_image'))
+                    from app.services.item_details import presentation
+                    item_info = presentation(self,item_info['cookie_id'],item_info)
 
                     items.append(item_info)
 

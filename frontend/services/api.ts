@@ -1,4 +1,4 @@
-import type { AccountRecoveryStatus, CaptchaDiagnostic, CredentialResult } from '../types';
+import type { ProductDetailDiagnostic, AccountRecoveryStatus, CaptchaDiagnostic, CredentialResult } from '../types';
 import { get, post, put, del, patch } from '../lib/request';
 import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
@@ -607,6 +607,17 @@ export const createManualItem = async (data: {
 export const deleteItem = async (cookieId: string, itemId: string): Promise<any> => {
     return del(`/items/${cookieId}/${itemId}`);
 }
+
+export const getItem = async (cookieId: string, itemId: string): Promise<Item> => {
+  const result = await get<{ item: Item }>(`/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}`);
+  return result.item;
+};
+
+export const refreshItemDetail = (cookieId: string, itemId: string): Promise<{ success: boolean; requested: boolean; item: Item }> =>
+  post(`/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}/refresh-detail`, {}, { timeout: 100000 });
+
+export const getItemDetailDiagnostic = (cookieId: string, itemId: string): Promise<{ diagnostic: ProductDetailDiagnostic | null; message?: string }> =>
+  get(`/items/${encodeURIComponent(cookieId)}/${encodeURIComponent(itemId)}/detail-diagnostic`);
 
 export const updateItemDetail = async (cookieId: string, itemId: string, itemDetail: string): Promise<any> => {
     return put(`/items/${cookieId}/${itemId}`, { item_detail: itemDetail });

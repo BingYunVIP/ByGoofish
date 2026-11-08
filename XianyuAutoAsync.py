@@ -3123,49 +3123,100 @@ class XianyuLive:
             logger.error(f"更新商品详情异常: {self._safe_str(e)}")
             return False
 
-    async def fetch_item_detail_from_api(self, item_id: str) -> str:
-        """Acquire only missing platform prose, with persistent six-hour failure cooldown."""
+    async def fetch_item_detail_from_api(self, item_id: str, *, explicit=False) -> str:
+        if not hasattr(self, '_item_detail_fetch_lock'):
+            self._item_detail_fetch_lock = asyncio.Lock()
+        # Serialize all manual, scheduled and synchronization reads for this account.
+        async with self._item_detail_fetch_lock:
+            return await self._fetch_item_detail_from_api_locked(item_id, explicit=explicit)
+
+    async def _fetch_item_detail_from_api_locked(self, item_id, *, explicit=False):
         from app.db_manager import db_manager
         from app.services import item_details, auth_recovery
         from app.config import config
         if not config.get('ITEM_DETAIL', {}).get('auto_fetch', {}).get('enabled', True):
             return ''
         if auth_recovery.auth_paused(self.cookie_id):
-            item_details.failure(db_manager,self.cookie_id,item_id,'authentication_required')
             return ''
-        if not item_details.claim(db_manager,self.cookie_id,item_id):
-            return ''
+        with db_manager.lock:
+            gen = item_details.generation(db_manager, self.cookie_id)
+            if not item_details.claim(db_manager, self.cookie_id, item_id, explicit=explicit):
+                return ''
+        result = None
+        started = time.monotonic()
+        stage = 'api'
         try:
             result = await self.get_item_info(item_id)
             if result.get('error_code'):
                 raise item_details.DetailFetchError(result['error_code'])
+            if item_details.generation(db_manager, self.cookie_id) != gen:
+                return ''
+            stage = 'extraction'
             text = item_details.api_description(result, item_id)
             if not text:
-                current = db_manager.get_item_info(self.cookie_id,item_id) or {}
+                current = db_manager.get_item_info(self.cookie_id, item_id) or {}
                 if current.get('detail_browser_blocked'):
                     raise item_details.DetailFetchError('browser_authentication_required')
                 try:
+                    stage = 'browser'
                     text = await self._fetch_item_detail_from_browser(item_id)
-                except item_details.DetailFetchError as browser_error:
-                    if browser_error.category == 'authentication_required':
-                        item_details.block_browser(db_manager,self.cookie_id,item_id)
+                except item_details.DetailFetchError as exc:
+                    if exc.category == 'authentication_required':
+                        if item_details.generation(db_manager, self.cookie_id) == gen:
+                            item_details.block_browser(db_manager, self.cookie_id, item_id)
                         raise item_details.DetailFetchError('browser_authentication_required') from None
                     raise
             if not item_details.prose(text):
                 raise item_details.DetailFetchError('description_not_found')
-            # Recheck override in the atomic write: a user may have edited during navigation.
-            saved = await self.save_item_detail_only(item_id,text)
+            with db_manager.lock:
+                if item_details.generation(db_manager, self.cookie_id) != gen:
+                    return ''
+                saved = db_manager.update_item_detail(self.cookie_id, item_id, text, source='platform')
             return text if saved else ''
         except asyncio.CancelledError:
-            item_details.failure(db_manager,self.cookie_id,item_id,'interrupted')
+            item_details.failure(db_manager, self.cookie_id, item_id, 'interrupted', expected_generation=gen)
             raise
         except Exception as exc:
-            category = (exc.category if isinstance(exc, item_details.DetailFetchError) else
-                        'timeout' if isinstance(exc, TimeoutError) or type(exc).__name__ == 'TimeoutError' else
-                        'network_error' if 'net::ERR_' in str(exc) else 'browser_error')
-            item_details.failure(db_manager,self.cookie_id,item_id,category)
+            if isinstance(exc, item_details.DetailFetchError):
+                category = exc.category
+            elif isinstance(exc, TimeoutError):
+                category = 'timeout'
+            elif isinstance(exc, aiohttp.ClientError) or 'net::ERR_' in str(exc):
+                category = 'network_error'
+            else:
+                category = 'browser_error'
+            item_details.failure(db_manager, self.cookie_id, item_id, category, expected_generation=gen)
+            if not isinstance(result, dict) or not result.get('diagnostic_id'):
+                item_details.record_diagnostic(db_manager, self.cookie_id, item_id, gen, category, stage=stage, elapsed_ms=(time.monotonic() - started) * 1000)
             logger.warning(f'商品正文获取未完成: {item_id}; category={category}')
             return ''
+
+    async def refresh_item_detail(self, item_id):
+        from app.db_manager import db_manager
+        from app.services import item_details
+        before = db_manager.get_item_info(self.cookie_id, item_id)
+        if not before:
+            return {'success': False, 'item': None, 'requested': False}
+        previous = before.get('detail_last_attempt_at')
+        await self.fetch_item_detail_from_api(item_id, explicit=True)
+        item = db_manager.get_item_info(self.cookie_id, item_id)
+        return {'success': bool(item.get('item_detail')), 'item': item, 'requested': item.get('detail_last_attempt_at') != previous}
+
+    async def _resume_pending_item_details(self):
+        from app.db_manager import db_manager
+        from app.services import item_details, auth_recovery
+        if auth_recovery.auth_paused(self.cookie_id):
+            return
+        if not item_details.take_pending(db_manager, self.cookie_id):
+            return
+        rows = db_manager.get_items_by_cookie(self.cookie_id, listing_status='on_sale')
+        for row in rows:
+            if row.get('detail_source') == 'manual' or row.get('item_detail'):
+                continue
+            text = await self.fetch_item_detail_from_api(row['item_id'])
+            if not text:
+                break
+            await asyncio.sleep(1)
 
     async def _add_to_item_cache(self, item_id: str, detail: str):
         """添加商品详情到缓存，实现LRU策略和大小限制
@@ -3818,78 +3869,85 @@ class XianyuLive:
             text = await self.fetch_item_detail_from_api(item['item_id'])
             success_count += bool(text)
             current = db_manager.get_item_info(self.cookie_id,item['item_id']) or {}
-            if current.get('detail_failure') in ('authentication_required','browser_authentication_required'):
+            if current.get('detail_failure') in ('authentication_required','security_verification_required','login_expired','browser_authentication_required'):
                 break
         return success_count
 
     async def get_item_info(self, item_id, retry_count=0):
-        """Official PC detail read, once only. A challenge never triggers browser/login retries."""
-        from app.services import auth_recovery
+        """Bounded official detail read; diagnostics contain machine codes only."""
+        from app.services import auth_recovery, item_details
         from utils import risk_control
         from app.services.account_auth_client import save_cookie_delta
         from app.db_manager import db_manager
         guard = risk_control.registry.get(self.cookie_id)
+        gen = item_details.generation(db_manager, self.cookie_id)
+        started = time.monotonic()
+
+        async def failure(category, status=None, codes=()):
+            identity = item_details.record_diagnostic(db_manager, self.cookie_id, item_id, gen, category, http_status=status, codes=codes, elapsed_ms=(time.monotonic() - started) * 1000)
+            return {'error_code': category, 'diagnostic_id': identity}
         if auth_recovery.auth_paused(self.cookie_id):
-            return {'error_code': 'authentication_required'}
+            return await failure('account_auth_paused')
         if guard.is_blocked:
-            return {'error_code': 'rate_limited'}
-        expected_cookies = self.cookies_str
-        token = trans_cookies(expected_cookies).get('_m_h5_tk', '').split('_')[0]
-        if not token:
-            return {'error_code': 'credentials_missing'}
-        if not self.session:
-            await self.create_session()
-        payload = json.dumps({'itemId': str(item_id)}, separators=(',', ':'))
-        timestamp = str(int(time.time() * 1000))
-        params = {
-            'jsv': '2.7.3', 'appKey': '34839810', 't': timestamp,
-            'sign': generate_sign(timestamp, token, payload), 'v': '1.0',
-            'type': 'originaljson', 'accountSite': 'xianyu', 'dataType': 'json',
-            'timeout': '20000', 'api': 'mtop.taobao.idle.pc.detail',
-            'sessionOption': 'AutoLoginOnly', 'spm_cnt': 'a21ybx.item.0.0',
-        }
-        await guard.acquire()
-        logger.info(f'商品正文优先请求官方详情接口: {item_id}')
-        async with self.session.post(
-            'https://h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/1.0/',
-            params=params, data={'data': payload}, allow_redirects=False,
-            headers={'origin': 'https://www.goofish.com',
-                     'referer': f'https://www.goofish.com/item?id={item_id}'},
-            timeout=aiohttp.ClientTimeout(total=25),
-        ) as response:
-            if 300 <= response.status < 400 or response.status in (401, 403):
-                return {'error_code': 'authentication_required'}
-            if response.status == 429:
-                return {'error_code': 'rate_limited'}
-            if response.status >= 400:
-                return {'error_code': 'http_error'}
-            result = await response.json(content_type=None)
-            updates = {}
-            if 'set-cookie' in response.headers:
-                for header in response.headers.getall('set-cookie', []):
-                    first = header.split(';', 1)[0]
-                    if '=' in first:
-                        key, value = first.split('=', 1)
-                        updates[key.strip()] = value.strip()
-        if not isinstance(result, dict):
-            return {'error_code': 'invalid_response'}
-        ret = ';'.join(str(v) for v in result.get('ret', []))
-        if any(marker in ret.upper() for marker in ('USER_VALIDATE', 'CAPTCHA', 'SESSION_EXPIRED', 'NEED_LOGIN', 'LOGIN_REQUIRED')):
-            return {'error_code': 'authentication_required'}
-        if risk_control.is_risk_control_error(ret):
-            return {'error_code': 'rate_limited'}
-        if not any(str(v).startswith('SUCCESS') for v in result.get('ret', [])):
-            return {'error_code': 'platform_error'}
-        updates = {key: value for key, value in updates.items()
-                   if key in ('_m_h5_tk','_m_h5_tk_enc','cookie2','sgcookie','unb')}
-        if updates:
-            value = save_cookie_delta(db_manager,self.cookie_id,expected_cookies,updates)
-            latest = value or db_manager.get_cookie(self.cookie_id)
-            if latest:
-                self.cookies_str = latest
-                self.cookies = trans_cookies(latest)
-                self.session.headers['cookie'] = latest
-        return result
+            return await failure('rate_limited')
+        expected_cookies = db_manager.get_cookie(self.cookie_id) or self.cookies_str
+        for attempt in range(2):
+            token = trans_cookies(expected_cookies).get('_m_h5_tk', '').split('_')[0]
+            if not token or not trans_cookies(expected_cookies).get('_m_h5_tk_enc'):
+                return await failure('credentials_missing')
+            payload = json.dumps({'itemId': str(item_id)}, separators=(',', ':'))
+            timestamp = str(int(time.time() * 1000))
+            params = {'jsv': '2.7.3', 'appKey': '34839810', 't': timestamp, 'sign': generate_sign(timestamp, token, payload), 'v': '1.0', 'type': 'originaljson', 'accountSite': 'xianyu', 'dataType': 'json', 'timeout': '20000', 'api': 'mtop.taobao.idle.pc.detail', 'sessionOption': 'AutoLoginOnly', 'spm_cnt': 'a21ybx.item.0.0'}
+            await guard.acquire()
+            if item_details.generation(db_manager, self.cookie_id) != gen:
+                return await failure('interrupted')
+            # Isolated jar plus an explicit snapshot keep signature and Cookie identical.
+            headers = DEFAULT_HEADERS.copy()
+            headers.update(cookie=expected_cookies, origin='https://www.goofish.com', referer=f'https://www.goofish.com/item?id={item_id}')
+            try:
+                async with aiohttp.ClientSession(trust_env=False, cookie_jar=aiohttp.DummyCookieJar(), headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as session:
+                    async with session.post('https://h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/1.0/', params=params, data={'data': payload}, allow_redirects=False) as response:
+                        status = response.status
+                        try:
+                            result = await response.json(content_type=None)
+                        except (ValueError, aiohttp.ContentTypeError):
+                            result = None
+                        category, codes = item_details.classify(status, result, response.headers.get('location', ''))
+                        updates = {}
+                        for raw in response.headers.getall('set-cookie', []) if hasattr(response.headers, 'getall') else []:
+                            pair = raw.split(';', 1)[0]
+                            if '=' in pair:
+                                key, value = pair.split('=', 1)
+                                updates[key.strip()] = value.strip()
+            except (asyncio.TimeoutError, TimeoutError):
+                return await failure('timeout')
+            except aiohttp.ClientError:
+                return await failure('network_error')
+            safe = {k: v for k, v in updates.items() if k in ('_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 'sgcookie', 'unb')}
+            if category == 'signing_expired':
+                safe = {k: v for k, v in safe.items() if k in ('_m_h5_tk', '_m_h5_tk_enc')}
+                if set(safe) == {'_m_h5_tk', '_m_h5_tk_enc'} and safe['_m_h5_tk'].split('_')[0] != token and (attempt == 0):
+                    value = save_cookie_delta(db_manager, self.cookie_id, expected_cookies, safe)
+                    if value:
+                        self.cookies_str = value
+                        self.cookies = trans_cookies(value)
+                        if getattr(self, 'session', None) is not None and not getattr(self.session, 'closed', False):
+                            self.session.headers['cookie'] = value
+                        expected_cookies = value
+                        continue
+            if category:
+                return await failure(category, status, codes)
+            if safe:
+                value = save_cookie_delta(db_manager, self.cookie_id, expected_cookies, safe)
+                if not value:
+                    return await failure('interrupted', status, codes)
+                self.cookies_str = value
+                self.cookies = trans_cookies(value)
+                if getattr(self, 'session', None) is not None and not getattr(self.session, 'closed', False):
+                    self.session.headers['cookie'] = value
+            item_details.record_diagnostic(db_manager, self.cookie_id, item_id, gen, '', http_status=status, codes=codes, elapsed_ms=(time.monotonic() - started) * 1000)
+            return result
+        return await failure('signing_expired')
 
     def extract_item_id_from_message(self, message):
         from utils.message_identity import extract_item_id
@@ -6309,6 +6367,8 @@ class XianyuLive:
                         logger.info(f"【{self.cookie_id}】账号已禁用，停止商品同步循环")
                         break
 
+                    await self._resume_pending_item_details()
+
                     # 从数据库读取最新配置（支持动态更新）
                     from app.services.auth_recovery import auth_paused
                     if auth_paused(self.cookie_id):
@@ -8067,6 +8127,7 @@ class XianyuLive:
 
             self.session = aiohttp.ClientSession(
                 trust_env=False,
+                cookie_jar=aiohttp.DummyCookieJar(),
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30)
             )
@@ -9443,6 +9504,7 @@ class XianyuLive:
             await self.create_session()
 
         async def request_item_api(data):
+            from app.db_manager import db_manager
             params = {
                 'jsv': '2.7.2',
                 'appKey': '34839810',
@@ -9457,7 +9519,8 @@ class XianyuLive:
                 'sessionOption': 'AutoLoginOnly',
                 'spm_cnt': 'a21ybx.personal.0.0'
             }
-            cookie_dict = trans_cookies(self.cookies_str)
+            expected_cookies = self.cookies_str
+            cookie_dict = trans_cookies(expected_cookies)
             token_value = cookie_dict.get('_m_h5_tk', '')
             token = token_value.split('_')[0] if token_value else ''
             if not token:
@@ -9468,7 +9531,8 @@ class XianyuLive:
             async with self.session.post(
                 'https://h5api.m.goofish.com/h5/mtop.idle.web.xyh.item.list/1.0/',
                 params=params,
-                data={'data': data_val}
+                data={'data': data_val},
+                headers={'cookie':expected_cookies}, allow_redirects=False
             ) as response:
                 # 网关故障要当场认出来。502/503 返回的是 HTML 错误页，
                 # 直接 response.json() 要么抛解析异常、要么拿到不含 ret 的结构，
@@ -9480,29 +9544,26 @@ class XianyuLive:
                 try:
                     res_json = await response.json(content_type=None)
                 except Exception as parse_error:
-                    body = (await response.text())[:200]
                     raise ItemListTransientError(
-                        f"闲鱼接口响应无法解析（HTTP {response.status}）: {parse_error}；响应片段: {body}"
+                        f"闲鱼接口响应无法解析（HTTP {response.status}）"
                     )
                 if not isinstance(res_json, dict):
                     raise ItemListTransientError(
                         f"闲鱼接口响应结构异常（HTTP {response.status}）"
                     )
-                if 'set-cookie' in response.headers:
+                if any(str(code).startswith('SUCCESS::') for code in res_json.get('ret',[])) and 'set-cookie' in response.headers:
                     new_cookies = {}
                     for cookie in response.headers.getall('set-cookie', []):
                         if '=' in cookie:
                             name, value = cookie.split(';')[0].split('=', 1)
                             new_cookies[name.strip()] = value.strip()
                     if new_cookies:
-                        self.cookies.update(new_cookies)
-                        self.cookies_str = '; '.join(f"{key}={value}" for key, value in self.cookies.items())
-                        self.session.headers['cookie'] = self.cookies_str
-                        await self.update_config_cookies()
-                        logger.info(
-                            f"【{self.cookie_id}】商品同步响应更新了"
-                            f"{len(new_cookies)}个Cookie字段"
-                        )
+                        from app.services.account_auth_client import save_cookie_delta
+                        allowed={k:v for k,v in new_cookies.items() if k in ('_m_h5_tk','_m_h5_tk_enc','cookie2','sgcookie','unb')}
+                        value=save_cookie_delta(db_manager,self.cookie_id,expected_cookies,allowed) if allowed else None
+                        if value:
+                            self.cookies_str=value;self.cookies=trans_cookies(value)
+                            self.session.headers['cookie']=value
                 return res_json
 
         try:

@@ -187,6 +187,11 @@ export interface Item {
   detail_updated_at?: number | null;
   detail_retry_at?: number | null;
   detail_failure?: string;
+  detail_diagnostic_id?: string | null;
+  detail_failure_message?: string;
+  detail_last_attempt_at?: number | null;
+  detail_can_refresh?: boolean;
+  detail_actions?: string[];
   item_price?: string;
   item_image?: string; // Inferred from common usage, though not explicitly in list model sometimes
   item_category?: string;
@@ -731,4 +736,16 @@ export interface CaptchaDiagnostic {
   entries: CaptchaDiagnosticEntry[];
   next_seq: number;
   has_more: boolean;
+}
+
+export interface ProductDetailDiagnostic {
+  diagnostic_id: string;
+  cookie_id?: string;
+  item_id: string;
+  stage?: string;
+  failure_category?: string;
+  http_status?: number | null;
+  platform_codes?: string[];
+  elapsed_ms?: number;
+  created_at?: number;
 }

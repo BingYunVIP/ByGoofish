@@ -23,6 +23,7 @@ import {
   AccountDetail,
   Card,
   Item,
+  ProductDetailDiagnostic,
   ItemDeliveryConfigSummary,
   ShippingRule,
 } from '../types';
@@ -35,6 +36,9 @@ import {
   getItemDeliveryConfig,
   getItemDeliveryConfigs,
   getItems,
+  getItem,
+  refreshItemDetail,
+  getItemDetailDiagnostic,
   getShippingRules,
   saveItemDeliveryConfig,
   polishItems,
@@ -149,7 +153,7 @@ const Toggle: React.FC<{
   </button>
 );
 
-const ItemList: React.FC = () => {
+const ItemList: React.FC<{ onManageAccount?: () => void }> = ({ onManageAccount }) => {
   const [items, setItems] = useState<Item[]>([]);
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -172,6 +176,12 @@ const ItemList: React.FC = () => {
 
   const [detailItem, setDetailItem] = useState<Item | null>(null);
   const [itemDetail, setItemDetail] = useState('');
+  const detailSession = useRef({ key: '', serial: 0, dirty: false });
+  const [detailChecking, setDetailChecking] = useState(false);
+  const [detailFeedback, setDetailFeedback] = useState('');
+  const [detailDiagnostic, setDetailDiagnostic] = useState<ProductDetailDiagnostic | null>(null);
+  const [diagnosticOpen, setDiagnosticOpen] = useState(false);
+  const [diagnosticLoading, setDiagnosticLoading] = useState(false);
   const [deliveryItem, setDeliveryItem] = useState<Item | null>(null);
   const [deliveryLoading, setDeliveryLoading] = useState(false);
   const [deliveryForm, setDeliveryForm] = useState<DeliveryForm>({
@@ -411,14 +421,56 @@ const ItemList: React.FC = () => {
     }
   };
 
+  const closeDetail = () => {
+    detailSession.current = { key: '', serial: detailSession.current.serial + 1, dirty: false };
+    setDetailItem(null);
+  };
   const openDetail = (item: Item) => {
-    setDetailItem(item);
-    setItemDetail(item.item_detail || '');
+    detailSession.current = { key: itemKey(item), serial: detailSession.current.serial + 1, dirty: false };
+    setDetailItem(item); setItemDetail(item.item_detail || '');
+    setDetailChecking(false); setDetailFeedback(''); setDiagnosticOpen(false);
+    setDiagnosticLoading(false); setDetailDiagnostic(null);
+  };
+  const checkDetail = async () => {
+    if (!detailItem || detailChecking) return;
+    const session = detailSession.current;
+    const target = detailItem;
+    setDetailChecking(true);
+    setDetailFeedback('正在检查商品详情，消息连接状态不受此次检查影响。');
+    try {
+      await refreshItemDetail(target.cookie_id, target.item_id);
+      const item = await getItem(target.cookie_id, target.item_id);
+      if (detailSession.current !== session) return;
+      refreshSequence.current += 1;
+      setItems(current => current.map(row => itemKey(row) === session.key ? item : row));
+      setDetailItem(item);
+      if (!session.dirty) setItemDetail(item.item_detail || '');
+      setDiagnosticOpen(false);
+      setDetailFeedback(item.detail_source === 'manual' ? '已保留人工维护内容。' : item.detail_status === 'ready' && item.item_detail ? '已获取并保存平台商品说明。' : (item.detail_failure_message || '此次未取得商品说明，请查看诊断。'));
+    } catch (error) {
+      if (detailSession.current === session) setDetailFeedback(describeApiError(error, '检查结果未确认，请查看最新状态，不要连续重试。'));
+    } finally {
+      if (detailSession.current === session) setDetailChecking(false);
+    }
+  };
+  const showDetailDiagnostic = async () => {
+    if (!detailItem || diagnosticLoading) return;
+    const session = detailSession.current;
+    setDiagnosticOpen(true); setDiagnosticLoading(true);
+    try {
+      const result = await getItemDetailDiagnostic(detailItem.cookie_id, detailItem.item_id);
+      if (detailSession.current === session) setDetailDiagnostic(result.diagnostic);
+    } catch (error) {
+      if (detailSession.current === session) setDetailFeedback(describeApiError(error, '无法读取本地诊断'));
+    } finally {
+      if (detailSession.current === session) setDiagnosticLoading(false);
+    }
   };
 
   const handleSaveDetail = async () => {
     if (!detailItem) return;
     const key = itemKey(detailItem);
+    const session = detailSession.current;
     setSavingKey(key);
     try {
       await updateItemDetail(detailItem.cookie_id, detailItem.item_id, itemDetail);
@@ -426,7 +478,7 @@ const ItemList: React.FC = () => {
       setItems(current => current.map(item =>
         itemKey(item) === key ? { ...item, item_detail: itemDetail, detail_source: 'manual', detail_status: 'ready', detail_failure: '', detail_updated_at: Date.now() / 1000 } : item,
       ));
-      setDetailItem(null);
+      if (detailSession.current === session) closeDetail();
       setNotice({ type: 'success', message: '商品详情已保存' });
     } catch (error) {
       setNotice({ type: 'error', message: error instanceof Error ? error.message : '保存失败' });
@@ -1259,36 +1311,54 @@ const ItemList: React.FC = () => {
                 <h3 className="text-lg font-bold text-gray-900">编辑商品详情</h3>
                 <p className="mt-1 line-clamp-1 text-sm text-gray-500">{detailItem.item_title || detailItem.item_id}</p>
               </div>
-              <button type="button" onClick={() => setDetailItem(null)} className="rounded-md p-2 hover:bg-gray-100" aria-label="关闭">
+              <button type="button" onClick={closeDetail} className="rounded-md p-2 hover:bg-gray-100" aria-label="关闭">
                 <X className="h-5 w-5" />
               </button>
             </div>
             <div className="modal-body">
               <label className="mb-2 block text-sm font-bold text-gray-700" htmlFor="item-detail">本地商品详情</label>
-              {(detailItem.detail_status === 'failed' || detailItem.detail_status === 'blocked') && !detailItem.item_detail && (
-                <p className="mb-3 text-xs leading-5 text-amber-700" role="status">
-                  {detailItem.detail_failure === 'authentication_required'
-                    ? '平台要求登录或安全验证，已暂停自动获取。完成账号验证并检查连接后将自动补全。'
-                    : detailItem.detail_failure === 'browser_authentication_required'
-                      ? '官网商品页要求安全验证，已暂停浏览器补全；系统仍优先通过官方接口自动获取。'
-                      : '商品说明暂未自动获取，系统将在冷却后继续补全。'}
-                </p>
+              {(detailItem.detail_failure_message || detailFeedback) && (
+                <div className="mb-3 space-y-2 text-xs leading-5 text-[var(--text-muted)]" role="status">
+                  <p>{detailFeedback || detailItem.detail_failure_message}</p>
+                  {detailItem.detail_last_attempt_at && <p className="text-[var(--text-soft)]">最近检查：{new Date(detailItem.detail_last_attempt_at * 1000).toLocaleString()}</p>}
+                  {detailItem.detail_actions?.includes('sync_web_session') && <p>请在已登录的闲鱼官网打开对应商品，完成那里实际出现的验证，再到账号管理同步网页登录态；仅消息连接正常不能证明商品详情已通过验证。</p>}
+                  {detailItem.detail_retry_at && detailItem.detail_retry_at * 1000 > Date.now() && <p className="text-[var(--text-soft)]">最早可再次检查：{new Date(detailItem.detail_retry_at * 1000).toLocaleString()}；冷却结束不代表平台已解除限制。</p>}
+                </div>
               )}
+              {!detailItem.item_detail && detailItem.detail_source !== 'manual' && (
+                <div className="mb-3 flex flex-wrap gap-2">
+                  <button type="button" onClick={checkDetail} disabled={!detailItem.detail_can_refresh || detailChecking || Boolean(savingKey)} className="ios-btn-secondary inline-flex min-h-11 items-center gap-2 rounded-md px-3 py-2 text-xs disabled:opacity-50">
+                    {detailChecking ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}检查并获取
+                  </button>
+                  <button type="button" onClick={showDetailDiagnostic} disabled={diagnosticLoading} className="ios-btn-secondary min-h-11 rounded-md px-3 py-2 text-xs">查看诊断</button>
+                  {detailItem.detail_actions?.includes('sync_web_session') && onManageAccount && <button type="button" onClick={onManageAccount} className="ios-btn-secondary min-h-11 rounded-md px-3 py-2 text-xs">前往账号管理</button>}
+                </div>
+              )}
+              {diagnosticOpen && <div className="mb-3 rounded-md border border-[var(--border)] bg-[var(--surface)] p-3 text-xs leading-5 text-[var(--text-muted)]" aria-live="polite">
+                {diagnosticLoading ? '正在读取本地诊断…' : !detailDiagnostic ? '当时未采集详细诊断，历史原因未细分。' : <dl className="space-y-1 break-words">
+                  <div><dt className="inline font-bold">诊断 ID：</dt><dd className="inline">{detailDiagnostic.diagnostic_id}</dd></div>
+                  <div><dt className="inline font-bold">阶段：</dt><dd className="inline">{detailDiagnostic.stage || '未记录'}</dd></div>
+                  <div><dt className="inline font-bold">分类：</dt><dd className="inline">{detailDiagnostic.failure_category || '无异常'}</dd></div>
+                  <div><dt className="inline font-bold">HTTP：</dt><dd className="inline">{detailDiagnostic.http_status ?? '未发送请求'}</dd></div>
+                  <div><dt className="inline font-bold">平台错误码：</dt><dd className="inline">{detailDiagnostic.platform_codes?.join('、') || '未返回可记录的错误码'}</dd></div>
+                  <div><dt className="inline font-bold">耗时：</dt><dd className="inline">{detailDiagnostic.elapsed_ms ?? 0} ms</dd></div>
+                </dl>}
+              </div>}
               <AutoResizeTextarea
                 id="item-detail"
                 value={itemDetail}
-                onChange={event => setItemDetail(event.target.value)}
+                onChange={event => { detailSession.current.dirty = true; setItemDetail(event.target.value); }}
                 rows={3}
                 className="ios-input min-h-24 w-full resize-none overflow-hidden rounded-md p-3 text-sm"
                 placeholder="优先自动获取闲鱼商品说明；也可在此补充本地内容。"
               />
             </div>
             <div className="modal-footer flex justify-end gap-2">
-              <button type="button" onClick={() => setDetailItem(null)} className="ios-btn-secondary rounded-md px-4 py-2.5">取消</button>
+              <button type="button" onClick={closeDetail} className="ios-btn-secondary rounded-md px-4 py-2.5">取消</button>
               <button
                 type="button"
                 onClick={handleSaveDetail}
-                disabled={Boolean(savingKey)}
+                disabled={Boolean(savingKey) || detailChecking}
                 className="ios-btn-primary flex items-center gap-2 rounded-md px-4 py-2.5"
               >
                 {savingKey ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}

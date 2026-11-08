@@ -235,7 +235,11 @@ def begin_verification(db, cookie_id, check_only=False):
 def save_explicit_credentials(db, cookie_id, writer):
     with db.lock:
         paused = get(db, cookie_id)["auth_paused"]
+        previous = db.get_cookie(cookie_id)
         saved = writer()
+        if saved:
+            from app.services.item_details import credentials_changed
+            credentials_changed(db,cookie_id,previous,db.get_cookie(cookie_id))
         if saved and paused:
             set_state(db, cookie_id, "checking")
         return saved

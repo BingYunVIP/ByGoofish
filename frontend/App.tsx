@@ -633,7 +633,7 @@ const App: React.FC = () => {
             <Suspense fallback={activeTab === 'accounts' ? <PageLoader /> : null}><AccountList /></Suspense>
           </section>)}
           {activeTab === 'items' && (<section>
-            <Suspense fallback={activeTab === 'items' ? <PageLoader /> : null}><ItemList /></Suspense>
+            <Suspense fallback={activeTab === 'items' ? <PageLoader /> : null}><ItemList onManageAccount={() => setActiveTab('accounts')} /></Suspense>
           </section>)}
           {activeTab === 'product-automation' && (<section>
             <Suspense fallback={activeTab === 'product-automation' ? <PageLoader /> : null}><ProductAutomation /></Suspense>

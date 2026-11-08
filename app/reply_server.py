@@ -2022,7 +2022,10 @@ def add_cookie(item: CookieIn, current_user: Dict[str, Any] = Depends(get_curren
                 raise HTTPException(status_code=400, detail="该Cookie ID已被其他用户使用")
 
         # 保存到数据库时指定用户ID
+        previous_credentials = db_manager.get_cookie(item.id)
         db_manager.save_cookie(item.id, item.value, user_id)
+        from app.services.item_details import credentials_changed
+        credentials_changed(db_manager, item.id, previous_credentials, db_manager.get_cookie(item.id))
 
         # 添加到CookieManager，同时指定用户ID
         cookie_manager.manager.add_cookie(item.id, item.value, user_id=user_id)
@@ -6464,6 +6467,38 @@ def get_item_detail(cookie_id: str, item_id: str, current_user: Dict[str, Any] =
         raise HTTPException(status_code=500, detail=f"获取商品详情失败: {str(e)}")
 
 
+def _owned_detail_item(cookie_id, item_id, current_user):
+    if cookie_id not in db_manager.get_all_cookies(current_user['user_id']):
+        raise HTTPException(403, '无权访问该闲鱼账号')
+    item = db_manager.get_item_info(cookie_id, item_id)
+    if not item:
+        raise HTTPException(404, '商品不存在')
+    return item
+
+
+@app.get('/items/{cookie_id}/{item_id}/detail-diagnostic')
+def product_detail_diagnostic(cookie_id: str, item_id: str,
+                              current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Local diagnostic only: never fetch a platform page during a read."""
+    item = _owned_detail_item(cookie_id, item_id, current_user)
+    from app.services.item_details import diagnostic
+    entry = diagnostic(db_manager, item.get('detail_diagnostic_id'), cookie_id)
+    if not entry or str(entry.get('item_id')) != item_id:
+        return {'diagnostic': None, 'message': '当时未采集详细诊断，历史原因未细分'}
+    return {'diagnostic': entry}
+
+
+@app.post('/items/{cookie_id}/{item_id}/refresh-detail')
+async def refresh_product_detail(cookie_id: str, item_id: str,
+                                 current_user: Dict[str, Any] = Depends(get_current_user)):
+    item = _owned_detail_item(cookie_id, item_id, current_user)
+    if not item.get('detail_can_refresh'):
+        return {'success': False, 'requested': False, 'item': item}
+    async def operation(instance):
+        return await instance.refresh_item_detail(item_id)
+    return await _run_on_account_loop(cookie_id, operation, timeout=90)
+
+
 @app.post('/items/{cookie_id}/{item_id}/refresh-image')
 async def refresh_product_image(cookie_id: str, item_id: str,
                                 current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -9762,8 +9797,11 @@ async def start_manual_captcha(
                 auth_recovery.record_failure(db, cookie_id, 'interrupted', diagnostic.id)
                 return {'success': False, 'message': '凭证或验证状态已更新，请查看账号状态', 'session_id': cookie_id, 'diagnostic_id': diagnostic.id}
             new_cookies = drop_stale_captcha_challenge(result['cookies_str'])
+            previous_credentials = db.get_cookie(cookie_id)
             if not db.save_cookie(cookie_id, new_cookies, current_user['user_id']):
                 raise RuntimeError('验证后的凭证保存失败')
+            from app.services.item_details import credentials_changed
+            credentials_changed(db, cookie_id, previous_credentials, db.get_cookie(cookie_id))
             if manager:
                 manager.cookies[cookie_id] = new_cookies
                 live = manager.instances.get(cookie_id)

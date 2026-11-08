@@ -4,6 +4,11 @@ import json
 import tempfile
 import time
 import unittest
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def fake_detail_session(session):
+    yield session
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -117,6 +122,7 @@ class ItemDetailTests(unittest.IsolatedAsyncioTestCase):
     async def test_api_challenge_or_rate_limit_does_not_fall_back_or_retry(self):
         for category in ('authentication_required','rate_limited','http_error','credentials_missing'):
             self.db.conn.execute("UPDATE item_info SET detail_status='missing',detail_retry_at=NULL")
+            self.db.conn.execute('UPDATE item_detail_accounts SET blocked=0')
             self.db.conn.commit()
             live=self.live();live.get_item_info.return_value={'error_code':category}
             self.assertEqual(await live.fetch_item_detail_from_api('fixture-item'),'')
@@ -133,23 +139,27 @@ class ItemDetailTests(unittest.IsolatedAsyncioTestCase):
     async def test_official_detail_request_is_single_read_no_challenge_retry(self):
         from tests.test_item_sync_without_group import _FakeSession
         live=self.live()
-        live.cookies_str='unb=fixture; _m_h5_tk=fixture_1'
+        live.cookies_str='unb=fixture; _m_h5_tk=fixture_1; _m_h5_tk_enc=fixture-enc'
+        self.db.update_cookie_account_info('fixture-shop',cookie_value=live.cookies_str)
         live.session=_FakeSession([{'ret':['FAIL_SYS_USER_VALIDATE::请验证'],'data':{}}])
-        result=await XianyuLive.get_item_info(live,'fixture-item')
-        self.assertEqual(result['error_code'],'authentication_required')
+        with patch('aiohttp.ClientSession',return_value=fake_detail_session(live.session)):
+            result=await XianyuLive.get_item_info(live,'fixture-item')
+        self.assertEqual(result['error_code'],'security_verification_required')
         self.assertEqual(live.session.requests,[{'itemId':'fixture-item'}])
 
     async def test_failed_api_response_does_not_import_challenge_cookies(self):
         from tests.test_item_sync_without_group import _FakeResponse
         from multidict import CIMultiDict
         from types import SimpleNamespace
-        live=self.live();live.cookies_str='unb=fixture; _m_h5_tk=fixture_1'
+        live=self.live();live.cookies_str='unb=fixture; _m_h5_tk=fixture_1; _m_h5_tk_enc=fixture-enc'
+        self.db.update_cookie_account_info('fixture-shop',cookie_value=live.cookies_str)
         response=_FakeResponse({'ret':['FAIL_SYS_USER_VALIDATE::请验证']})
         response.headers=CIMultiDict({'set-cookie':'x5secdata=synthetic-challenge; Path=/'})
         live.session=SimpleNamespace(post=lambda *a,**kw:response)
         before=self.db.get_cookie('fixture-shop')
-        result=await XianyuLive.get_item_info(live,'fixture-item')
-        self.assertEqual(result['error_code'],'authentication_required')
+        with patch('aiohttp.ClientSession',return_value=fake_detail_session(live.session)):
+            result=await XianyuLive.get_item_info(live,'fixture-item')
+        self.assertEqual(result['error_code'],'security_verification_required')
         self.assertEqual(self.db.get_cookie('fixture-shop'),before)
 
     async def test_acquisition_preserves_newlines_and_persists_result(self):
@@ -210,6 +220,8 @@ class ItemDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(item_details.claim(self.db,'fixture-shop','next'))
         auth_recovery.set_state(self.db,'fixture-shop','checking')
         auth_recovery.set_state(self.db,'fixture-shop','recovered')
+        self.assertFalse(item_details.claim(self.db,'fixture-shop','next'))
+        item_details.credentials_changed(self.db,'fixture-shop','cookie2=before','cookie2=after')
         self.assertTrue(item_details.claim(self.db,'fixture-shop','next'))
 
     async def test_browser_restriction_does_not_block_official_api_and_never_reopens_browser(self):
@@ -228,7 +240,7 @@ class ItemDetailTests(unittest.IsolatedAsyncioTestCase):
         auth_recovery.set_state(self.db,'fixture-shop','required','message_verification_required')
         live=self.live();await live.fetch_item_detail_from_api('fixture-item')
         live._fetch_item_detail_from_browser.assert_not_awaited()
-        self.assertEqual(self.item()['detail_status'],'blocked')
+        self.assertEqual(self.item()['detail_status'],'missing')
 
     async def test_card_sync_saves_metadata_and_queues_missing_prose(self):
         live=self.live();live._fetch_missing_item_details=AsyncMock(return_value=0)
@@ -240,6 +252,205 @@ class ItemDetailTests(unittest.IsolatedAsyncioTestCase):
         live._fetch_missing_item_details.reset_mock()
         await live.save_items_list_to_db([dict(CARD,id='fixture-item')])
         live._fetch_missing_item_details.assert_not_awaited()
+
+    async def test_failure_classification_never_infers_validation_from_403(self):
+        classify=item_details.classify
+        self.assertEqual(classify(403,None)[0],'access_denied')
+        self.assertEqual(classify(302,None,'https://evil.invalid/login')[0],'access_denied')
+        self.assertEqual(classify(302,None,'https://login.taobao.com/login')[0],'login_expired')
+        for code,category in [('FAIL_SYS_USER_VALIDATE','security_verification_required'),('FAIL_SYS_SESSION_EXPIRED','login_expired'),('FAIL_SYS_TOKEN_EXOIRED','signing_expired'),('FAIL_BIZ_ITEM_NO_PERMISSION','item_unavailable')]:
+            self.assertEqual(classify(200,{'ret':[code+'::untrusted secret prose']})[0],category)
+
+    async def test_diagnostics_are_allowlisted_bounded_and_account_isolated(self):
+        identity=item_details.record_diagnostic(self.db,'fixture-shop','fixture-item',0,'access_denied',http_status=403,codes=['FAIL_SYS_ILLEGAL_ACCESS','cookie=synthetic-secret','https://evil.invalid/?sign=synthetic'])
+        result=item_details.diagnostic(self.db,identity,'fixture-shop')
+        self.assertEqual(result['platform_codes'],['FAIL_SYS_ILLEGAL_ACCESS'])
+        self.assertNotIn('synthetic',json.dumps(result))
+        self.assertIsNone(item_details.diagnostic(self.db,identity,'other-shop'))
+        self.db.conn.execute('UPDATE item_detail_diagnostics SET codes=?,category=?,stage=? WHERE id=?', ('[\"cookie=secret\",\"SUCCESS\"]','cookie=secret','https://secret.invalid',identity))
+        self.db.conn.commit()
+        self.assertNotIn('secret',json.dumps(item_details.diagnostic(self.db,identity,'fixture-shop')))
+        self.assertTrue(self.item()['detail_diagnostic_id'])
+
+    async def test_explicit_credential_generation_persists_and_deduplicates(self):
+        self.assertFalse(item_details.credentials_changed(self.db,'fixture-shop','same','same'))
+        self.assertTrue(item_details.credentials_changed(self.db,'fixture-shop','cookie2=old','cookie2=new'))
+        self.assertTrue(item_details.take_pending(self.db,'fixture-shop'))
+        self.assertFalse(item_details.take_pending(self.db,'fixture-shop'))
+        other=DBManager(self.path)
+        self.assertFalse(item_details.take_pending(other,'fixture-shop'))
+        self.assertEqual(item_details.generation(other,'fixture-shop'),1)
+        other.close()
+
+    async def test_old_inflight_result_cannot_overwrite_new_credentials(self):
+        live=self.live()
+        async def changed(_):
+            item_details.credentials_changed(self.db,'fixture-shop','cookie2=old','cookie2=new')
+            return 'old response'
+        live._fetch_item_detail_from_browser.side_effect=changed
+        self.assertEqual(await live.fetch_item_detail_from_api('fixture-item'),'')
+        self.assertEqual(self.item()['item_detail'],'')
+        item_details.failure(self.db,'fixture-shop','fixture-item','login_expired',expected_generation=0)
+        self.assertEqual(self.item()['detail_status'],'missing')
+
+    async def test_item_specific_denial_does_not_pause_other_products(self):
+        self.db.save_item_basic_info('fixture-shop','next',item_title='next')
+        item_details.failure(self.db,'fixture-shop','fixture-item','access_denied')
+        self.assertTrue(item_details.claim(self.db,'fixture-shop','next'))
+
+    async def test_legacy_probe_is_explicit_once_per_account(self):
+        self.db.conn.execute("UPDATE item_info SET detail_status='blocked',detail_failure='authentication_required',detail_retry_at=? WHERE cookie_id='fixture-shop'",(time.time()+21600,))
+        self.db.conn.commit()
+        self.assertFalse(item_details.claim(self.db,'fixture-shop','fixture-item'))
+        self.assertTrue(item_details.claim(self.db,'fixture-shop','fixture-item',explicit=True))
+        self.assertFalse(item_details.claim(self.db,'fixture-shop','fixture-item',explicit=True))
+
+    async def test_snapshot_request_rejects_challenge_cookie_pollution(self):
+        from tests.test_item_sync_without_group import _FakeResponse
+        from multidict import CIMultiDict
+        from types import SimpleNamespace
+        value='unb=fixture; _m_h5_tk=before_1; _m_h5_tk_enc=enc; cookie2=session'
+        self.db.update_cookie_account_info('fixture-shop',cookie_value=value)
+        live=self.live();live.cookies_str=value
+        response=_FakeResponse({'ret':['FAIL_SYS_USER_VALIDATE::do-not-save-body']})
+        response.status=403;response.headers=CIMultiDict({'set-cookie':'cookie2=attacker; Path=/'})
+        factory=SimpleNamespace(post=lambda *args,**kwargs:response)
+        with patch('aiohttp.ClientSession',return_value=fake_detail_session(factory)) as client:
+            result=await XianyuLive.get_item_info(live,'fixture-item')
+        self.assertEqual(result['error_code'],'security_verification_required')
+        self.assertEqual(self.db.get_cookie('fixture-shop'),value)
+        self.assertEqual(client.call_args.kwargs['headers']['cookie'],value)
+        self.assertFalse(client.call_args.kwargs['trust_env'])
+        self.assertEqual(item_details.diagnostic(self.db,result['diagnostic_id'],'fixture-shop')['http_status'],403)
+
+    async def test_signing_expired_retries_only_with_new_safe_pair(self):
+        from tests.test_item_sync_without_group import _FakeResponse
+        from multidict import CIMultiDict
+        from types import SimpleNamespace
+        value='unb=fixture; _m_h5_tk=before_1; _m_h5_tk_enc=enc; cookie2=session'
+        self.db.update_cookie_account_info('fixture-shop',cookie_value=value)
+        live=self.live();live.cookies_str=value
+        live.session=SimpleNamespace(headers={'cookie':value},closed=False)
+        first=_FakeResponse({'ret':['FAIL_SYS_TOKEN_EXOIRED::expired']})
+        first.headers=CIMultiDict([('set-cookie','_m_h5_tk=after_2; Path=/'),('set-cookie','_m_h5_tk_enc=new-enc; Path=/'),('set-cookie','cookie2=must-not-import; Path=/')])
+        second=_FakeResponse({'ret':['SUCCESS::ok'],'data':{'itemDO':{'desc':'正文'}}})
+        second.headers=CIMultiDict()
+        sessions=[SimpleNamespace(post=lambda *a,**k:first),SimpleNamespace(post=lambda *a,**k:second)]
+        with patch('aiohttp.ClientSession',side_effect=[fake_detail_session(v) for v in sessions]) as client:
+            result=await XianyuLive.get_item_info(live,'fixture-item')
+        self.assertEqual(client.call_count,2)
+        self.assertEqual(item_details.api_description(result,'fixture-item'),'正文')
+        self.assertIn('cookie2=session',self.db.get_cookie('fixture-shop'))
+        self.assertEqual(item_details.generation(self.db,'fixture-shop'),0)
+        self.assertEqual(live.session.headers['cookie'],self.db.get_cookie('fixture-shop'))
+
+    async def test_concurrent_refresh_singleflight_never_duplicates_network(self):
+        live=self.live()
+        async def read(_):
+            await asyncio.sleep(.01)
+            return {'data':{'itemDO':{'desc':'并发正文'}}}
+        live.get_item_info.side_effect=read
+        await asyncio.gather(live.refresh_item_detail('fixture-item'),live.refresh_item_detail('fixture-item'))
+        live.get_item_info.assert_awaited_once()
+        self.assertEqual(self.item()['item_detail'],'并发正文')
+
+    async def test_pending_resume_stops_after_failed_first_on_sale_item(self):
+        self.db.conn.execute("UPDATE item_info SET listing_status='on_sale',last_seen_at=CURRENT_TIMESTAMP WHERE cookie_id='fixture-shop'")
+        self.db.conn.commit()
+        item_details.credentials_changed(self.db,'fixture-shop','cookie2=old','cookie2=new')
+        live=self.live();live.get_item_info.return_value={'error_code':'security_verification_required'}
+        await live._resume_pending_item_details()
+        await live._resume_pending_item_details()
+        live.get_item_info.assert_awaited_once()
+        self.assertFalse(self.item()['detail_can_refresh'])
+
+    async def test_list_challenge_response_does_not_save_cookies(self):
+        from tests.test_item_sync_without_group import _FakeResponse
+        from multidict import CIMultiDict
+        from types import SimpleNamespace
+        live=self.live();live.cookies_str='unb=fixture; _m_h5_tk=old_1; _m_h5_tk_enc=enc';live.cookies={'unb':'fixture'};live.myid='fixture'
+        self.db.update_cookie_account_info('fixture-shop',cookie_value=live.cookies_str)
+        before=self.db.get_cookie('fixture-shop')
+        response=_FakeResponse({'ret':['FAIL_SYS_USER_VALIDATE::validation']})
+        response.headers=CIMultiDict({'set-cookie':'cookie2=must-not-save; Path=/'})
+        live.session=SimpleNamespace(post=lambda *args,**kwargs:response)
+        result=await XianyuLive.get_item_list_info(live)
+        self.assertIn('error',result)
+        self.assertEqual(before,self.db.get_cookie('fixture-shop'))
+        self.assertEqual(before,live.cookies_str)
+
+    async def test_missing_signing_pair_stops_before_network(self):
+        self.db.update_cookie_account_info('fixture-shop',cookie_value='unb=fixture; _m_h5_tk=old_1')
+        live=self.live();live.cookies_str=self.db.get_cookie('fixture-shop')
+        with patch('aiohttp.ClientSession') as factory:
+            result=await XianyuLive.get_item_info(live,'fixture-item')
+        factory.assert_not_called()
+        self.assertEqual(result['error_code'],'credentials_missing')
+
+    async def test_new_account_explicit_credentials_and_whitespace_are_safe(self):
+        self.assertTrue(item_details.credentials_changed(self.db,'fixture-shop',None,'cookie2=new'))
+        self.assertEqual(item_details.generation(self.db,'fixture-shop'),1)
+        self.assertFalse(item_details.credentials_changed(self.db,'fixture-shop','cookie2=new','  '))
+        self.assertFalse(item_details.credentials_changed(self.db,'fixture-shop','cookie2=new; unb=fixture','unb=fixture; cookie2=new'))
+
+    async def test_malformed_redirect_is_safe_and_batch_reason_visible(self):
+        self.assertEqual(item_details.classify(302,None,'https://[broken/login')[0],'invalid_response')
+        self.db.save_item_basic_info('fixture-shop','next',item_title='next')
+        item_details.failure(self.db,'fixture-shop','fixture-item','security_verification_required')
+        item=self.db.get_item_info('fixture-shop','next')
+        self.assertFalse(item['detail_can_refresh'])
+        self.assertIn('安全验证',item['detail_failure_message'])
+        self.assertIn('sync_web_session',item['detail_actions'])
+
+    async def test_diagnostics_backup_scope_and_account_cleanup(self):
+        from app.services.user_backup import export_user,delete_account_data
+        item_details.credentials_changed(self.db,'fixture-shop',None,'cookie2=new')
+        identity=item_details.record_diagnostic(self.db,'fixture-shop','fixture-item',1,'access_denied')
+        exported=export_user(self.db.conn,self.owner)
+        self.assertNotIn('item_detail_diagnostics',exported['data'])
+        self.assertNotIn('item_detail_accounts',exported['data'])
+        with self.db.conn:
+            delete_account_data(self.db.conn,'fixture-shop')
+        self.assertIsNone(item_details.diagnostic(self.db,identity,'fixture-shop'))
+        self.assertEqual(self.db.conn.execute('SELECT COUNT(*) FROM item_detail_accounts WHERE cookie_id=?',('fixture-shop',)).fetchone()[0],0)
+        self.assertTrue(self.db.create_user('other-owner','fixture-owner@example.invalid','FixturePass123'))
+        another=self.db.get_user_by_username('other-owner')['id']
+        self.db.save_cookie('fixture-shop','cookie2=readded',another)
+        self.assertIsNone(item_details.diagnostic(self.db,identity,'fixture-shop'))
+        self.assertEqual(item_details.account(self.db,'fixture-shop')[3],0)
+        self.assertNotIn('item_detail_diagnostics',export_user(self.db.conn,another)['data'])
+
+    async def test_shared_session_headers_follow_only_successful_cookie_cas(self):
+        from tests.test_item_sync_without_group import _FakeResponse
+        from multidict import CIMultiDict
+        from types import SimpleNamespace
+        value='unb=fixture; _m_h5_tk=old_1; _m_h5_tk_enc=enc; cookie2=session'
+        self.db.update_cookie_account_info('fixture-shop',cookie_value=value)
+        live=self.live();live.cookies_str=value
+        live.session=SimpleNamespace(headers={'cookie':value},closed=False)
+        response=_FakeResponse({'ret':['SUCCESS::ok'],'data':{'itemDO':{'desc':'正文'}}})
+        response.headers=CIMultiDict({'set-cookie':'_m_h5_tk=new_2; Path=/'})
+        factory=SimpleNamespace(post=lambda *args,**kwargs:response)
+        with patch('aiohttp.ClientSession',return_value=fake_detail_session(factory)):
+            result=await XianyuLive.get_item_info(live,'fixture-item')
+        self.assertNotIn('error_code',result)
+        self.assertEqual(live.session.headers['cookie'],self.db.get_cookie('fixture-shop'))
+        before=live.session.headers['cookie']
+        with patch('aiohttp.ClientSession',return_value=fake_detail_session(factory)),patch('app.services.account_auth_client.save_cookie_delta',return_value=None):
+            result=await XianyuLive.get_item_info(live,'fixture-item')
+        self.assertEqual(result['error_code'],'interrupted')
+        self.assertEqual(live.session.headers['cookie'],before)
+
+    async def test_browser_diagnostic_records_real_stage_and_elapsed(self):
+        live=self.live()
+        async def delayed_failure(_):
+            await asyncio.sleep(.01)
+            raise item_details.DetailFetchError('description_not_found')
+        live._fetch_item_detail_from_browser.side_effect=delayed_failure
+        await live.fetch_item_detail_from_api('fixture-item')
+        result=item_details.diagnostic(self.db,self.item()['detail_diagnostic_id'],'fixture-shop')
+        self.assertEqual(result['stage'],'browser')
+        self.assertGreaterEqual(result['elapsed_ms'],10)
 
     async def test_cross_owner_detail_access_denied(self):
         reply_server.app.dependency_overrides[get_current_user]=lambda:{'user_id':self.owner+100}
